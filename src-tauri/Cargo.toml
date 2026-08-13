@@ -22,4 +22,22 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "migrate"] }
+# default-features = false drops the `any` driver and `json`, which this app
+# never uses. `macros` stays on for query_as; `migrate` for sqlx::migrate!.
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+    "migrate",
+] }
+# std::fs::canonicalize returns `\\?\D:\Music` on Windows; dunce strips the
+# extended-length prefix when it is safe to do so.
+dunce = "1"
+walkdir = "2.5.0"
+tauri-plugin-store = "2"
+tauri-plugin-dialog = "2"
+lofty = "0.25.0"
+rodio = "0.22.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
