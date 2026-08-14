@@ -2368,6 +2368,7 @@ version = "0.1.0"
 dependencies = [
  "dunce",
  "lofty",
+ "rand",
  "rodio",
  "serde",
  "serde_json",

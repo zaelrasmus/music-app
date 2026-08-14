@@ -3,17 +3,24 @@
     import { Button } from "$components/ui/button";
     import { library } from "$lib/library.svelte";
     import { trackStore } from "$lib/tracks.svelte";
+    import { player } from "$lib/player.svelte";
     import FolderPlusIcon from "@lucide/svelte/icons/folder-plus";
     import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
     import Trash2Icon from "@lucide/svelte/icons/trash-2";
+    import PlayIcon from "@lucide/svelte/icons/play";
+    import PauseIcon from "@lucide/svelte/icons/pause";
 
     onMount(() => {
         library.load();
         trackStore.load();
+        player.restorePreferences();
 
-        const unlisten = trackStore.listenForScans();
+        const scans = trackStore.listenForScans();
+        const playback = player.listenForPlayer();
+
         return () => {
-            unlisten.then((off) => off());
+            scans.then((off) => off());
+            playback.then((off) => off());
         };
     });
 
@@ -29,6 +36,9 @@
     }
 
     const summary = $derived(trackStore.lastSummary);
+
+    /** The visible list is the queue, snapshotted at click time. */
+    const queueIds = $derived(trackStore.tracks.map((t) => t.id));
 </script>
 
 <main class="mx-auto flex max-w-2xl flex-col gap-6 p-6">
@@ -126,13 +136,35 @@
             </p>
         {:else}
             <ul class="flex flex-col">
-                {#each trackStore.tracks as track (track.id)}
+                {#each trackStore.tracks as track, index (track.id)}
+                    {@const isCurrent = player.isCurrent(track.id)}
+                    {@const isPlaying = isCurrent && player.state === "playing"}
                     <li
-                        class="flex items-baseline justify-between gap-3 border-b py-1.5 text-sm last:border-b-0"
+                        class="flex items-center gap-2 border-b py-1 text-sm last:border-b-0"
                         class:opacity-50={track.state === "missing"}
                     >
-                        <span class="truncate">
-                            {track.title}
+                        <Button
+                            variant="ghost"
+                            size="icon"
+                            aria-label={isPlaying
+                                ? `Pause ${track.title}`
+                                : `Play ${track.title}`}
+                            onclick={() =>
+                                isCurrent
+                                    ? player.togglePlayPause()
+                                    : player.playQueue(queueIds, index)}
+                        >
+                            {#if isPlaying}
+                                <PauseIcon />
+                            {:else}
+                                <PlayIcon />
+                            {/if}
+                        </Button>
+
+                        <span class="min-w-0 flex-1 truncate">
+                            <span class:font-medium={isCurrent}>
+                                {track.title}
+                            </span>
                             <span class="text-muted-foreground">
                                 — {track.artist ?? "Unknown artist"}
                             </span>
@@ -142,6 +174,7 @@
                                 </span>
                             {/if}
                         </span>
+
                         <span class="text-muted-foreground shrink-0 text-xs">
                             {formatDuration(track.durationSecs)}
                         </span>
