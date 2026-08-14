@@ -39,10 +39,32 @@ class PlaylistStore {
     }
   }
 
+  /**
+   * Filter applied *within* the opened playlist.
+   *
+   * Deliberately separate from the library's filter: narrowing a playlist and
+   * narrowing the library are different questions, and having one clobber the
+   * other when you navigate between them would be surprising.
+   */
+  query = $state("");
+  selectedTagIds = $state<number[]>([]);
+  mode = $state<"all" | "any">("all");
+
+  #debounce: ReturnType<typeof setTimeout> | undefined;
+
+  get filtering() {
+    return this.query.trim() !== "" || this.selectedTagIds.length > 0;
+  }
+
   async openPlaylist(playlistId: number) {
     this.loading = true;
     try {
-      this.open = await invoke<PlaylistDetail>("get_playlist", { playlistId });
+      this.open = await invoke<PlaylistDetail>("get_playlist", {
+        playlistId,
+        search: this.query.trim() === "" ? null : this.query,
+        tagIds: this.selectedTagIds,
+        mode: this.mode,
+      });
     } catch (e) {
       toast.error(String(e));
       this.open = null;
@@ -51,13 +73,51 @@ class PlaylistStore {
     }
   }
 
-  close() {
-    this.open = null;
+  setQuery(query: string) {
+    this.query = query;
+    clearTimeout(this.#debounce);
+    this.#debounce = setTimeout(() => this.reloadOpen(), 200);
   }
 
-  /** Refetches the opened playlist so the UI matches what the backend stored. */
-  private async refreshOpen() {
+  toggleTag(tagId: number) {
+    this.selectedTagIds = this.selectedTagIds.includes(tagId)
+      ? this.selectedTagIds.filter((id) => id !== tagId)
+      : [...this.selectedTagIds, tagId];
+    this.reloadOpen();
+  }
+
+  setMode(mode: "all" | "any") {
+    this.mode = mode;
+    if (this.selectedTagIds.length > 1) this.reloadOpen();
+  }
+
+  clearFilters() {
+    this.query = "";
+    this.selectedTagIds = [];
+    this.reloadOpen();
+  }
+
+  close() {
+    this.open = null;
+    // A filter left over from the last playlist would silently hide tracks in
+    // the next one.
+    this.query = "";
+    this.selectedTagIds = [];
+  }
+
+  /** Re-runs the opened playlist's query only. Used while filtering. */
+  private async reloadOpen() {
     if (this.open) await this.openPlaylist(this.open.playlist.id);
+  }
+
+  /**
+   * Re-runs the opened playlist *and* the list.
+   *
+   * For mutations only: adding or removing a track changes the counts shown in
+   * the list, which a filter keystroke does not.
+   */
+  private async refreshOpen() {
+    await this.reloadOpen();
     await this.load();
   }
 

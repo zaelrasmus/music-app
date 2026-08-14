@@ -36,7 +36,7 @@ const TRACK_COLUMNS: &str =
 ///
 /// Returns `None` when there is nothing searchable, so callers can distinguish
 /// "no query" from "query that matches nothing".
-fn to_fts_expression(input: &str) -> Option<String> {
+pub(crate) fn to_fts_expression(input: &str) -> Option<String> {
     let terms: Vec<String> = input
         // `is_alphanumeric` is Unicode-aware, so "canción" stays one term.
         .split(|c: char| !c.is_alphanumeric())

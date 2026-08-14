@@ -1,8 +1,9 @@
 use serde::Serialize;
-use sqlx::{FromRow, SqliteConnection};
+use sqlx::{FromRow, QueryBuilder, Sqlite, SqliteConnection};
 use tauri::State;
 
 use crate::db::Db;
+use crate::search::{to_fts_expression, TagMode};
 use crate::tracks::Track;
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -110,23 +111,81 @@ pub async fn list_playlists(db: State<'_, Db>) -> Result<Vec<Playlist>, String> 
     .map_err(|e| e.to_string())
 }
 
+/// A playlist's tracks, optionally narrowed by text and tags.
+///
+/// The filter narrows but never reorders. A playlist's order is curated by the
+/// user, so ranking its contents by search relevance -- which is right for the
+/// library -- would be wrong here: `playlist.trackCount` stays the real size
+/// while the returned list is what survived the filter.
 #[tauri::command]
-pub async fn get_playlist(db: State<'_, Db>, playlist_id: i64) -> Result<PlaylistDetail, String> {
+pub async fn get_playlist(
+    db: State<'_, Db>,
+    playlist_id: i64,
+    search: Option<String>,
+    tag_ids: Option<Vec<i64>>,
+    mode: Option<TagMode>,
+) -> Result<PlaylistDetail, String> {
     let playlist = load_playlist(&db.pool, playlist_id).await?;
 
-    // `added_at` breaks ties so the order is deterministic even if positions
-    // were ever to collide.
-    let tracks: Vec<Track> = sqlx::query_as(
+    let tag_ids = tag_ids.unwrap_or_default();
+    let mode = mode.unwrap_or_default();
+    let expression = search.as_deref().and_then(to_fts_expression);
+
+    // Typed, but nothing searchable survived sanitising.
+    if search.as_deref().is_some_and(|s| !s.trim().is_empty()) && expression.is_none() {
+        return Ok(PlaylistDetail {
+            playlist,
+            tracks: Vec::new(),
+        });
+    }
+
+    let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(
         "SELECT t.id, t.source, t.title, t.artist, t.album, t.duration_secs, t.state
          FROM playlist_tracks pt
-         JOIN tracks t ON t.id = pt.track_id
-         WHERE pt.playlist_id = ?
-         ORDER BY pt.position, pt.added_at, t.id",
-    )
-    .bind(playlist_id)
-    .fetch_all(&db.pool)
-    .await
-    .map_err(|e| e.to_string())?;
+         JOIN tracks t ON t.id = pt.track_id",
+    );
+
+    if expression.is_some() {
+        query.push(" JOIN tracks_fts ON tracks_fts.rowid = t.id");
+    }
+    if !tag_ids.is_empty() {
+        query.push(" JOIN track_tags tt ON tt.track_id = t.id");
+    }
+
+    query.push(" WHERE pt.playlist_id = ").push_bind(playlist_id);
+
+    if let Some(expression) = &expression {
+        query.push(" AND tracks_fts MATCH ").push_bind(expression);
+    }
+
+    if !tag_ids.is_empty() {
+        query.push(" AND tt.tag_id IN (");
+        let mut list = query.separated(", ");
+        for id in &tag_ids {
+            list.push_bind(id);
+        }
+        query.push(")");
+
+        // One playlist_tracks row per track, so grouping keeps `pt.position`
+        // unambiguous.
+        query.push(" GROUP BY t.id");
+
+        if mode == TagMode::All {
+            query
+                .push(" HAVING COUNT(DISTINCT tt.tag_id) = ")
+                .push_bind(tag_ids.len() as i64);
+        }
+    }
+
+    // Always playlist order. `added_at` breaks ties so it stays deterministic
+    // even if positions were ever to collide.
+    query.push(" ORDER BY pt.position, pt.added_at, t.id");
+
+    let tracks = query
+        .build_query_as::<Track>()
+        .fetch_all(&db.pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
     Ok(PlaylistDetail { playlist, tracks })
 }

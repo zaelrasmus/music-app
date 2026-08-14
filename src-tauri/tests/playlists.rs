@@ -347,3 +347,117 @@ async fn a_playlist_can_mix_local_downloaded_and_streamed_tracks() {
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Filtering a playlist narrows it without reordering it.
+///
+/// This is the difference from the library view: there, search ranks by
+/// relevance; here the user curated the order, so a filter must only remove
+/// rows. Ranking a playlist by bm25 would silently scramble it.
+#[tokio::test]
+async fn filtering_a_playlist_preserves_its_order() {
+    let (db, base) = fixture("filter-order").await;
+
+    // Deliberately inserted so that alphabetical, relevance and playlist order
+    // all disagree.
+    let zebra = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO tracks (source, title, artist, local_path, state)
+         VALUES ('local', 'Zebra Song', 'Bandit', 'D:\\z.mp3', 'present') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let apple = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO tracks (source, title, artist, local_path, state)
+         VALUES ('local', 'Apple Song', 'Bandit', 'D:\\a.mp3', 'present') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let other = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO tracks (source, title, artist, local_path, state)
+         VALUES ('local', 'Unrelated', 'Nobody', 'D:\\u.mp3', 'present') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let playlist = new_playlist(&db.pool).await;
+    add(&db.pool, playlist, &[zebra, other, apple]).await;
+
+    // The same shape `get_playlist` builds when searching.
+    let filtered: Vec<i64> = sqlx::query_scalar(
+        "SELECT t.id FROM playlist_tracks pt
+         JOIN tracks t ON t.id = pt.track_id
+         JOIN tracks_fts ON tracks_fts.rowid = t.id
+         WHERE pt.playlist_id = ? AND tracks_fts MATCH ?
+         ORDER BY pt.position, pt.added_at, t.id",
+    )
+    .bind(playlist)
+    .bind("\"song\"*")
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        filtered,
+        vec![zebra, apple],
+        "the unrelated track is dropped, but Zebra still precedes Apple"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Tag filtering inside a playlist must also respect playlist order.
+#[tokio::test]
+async fn tag_filtering_a_playlist_preserves_its_order() {
+    let (db, base) = fixture("filter-tags").await;
+    let tracks = seed_tracks(&db.pool, 4).await;
+
+    let tag: i64 = sqlx::query_scalar(
+        "INSERT INTO tags (name, name_key) VALUES ('Chill', 'chill') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    // Tag the third and first tracks, in that order, so insertion order and
+    // playlist order differ.
+    for track in [tracks[2], tracks[0]] {
+        sqlx::query("INSERT INTO track_tags (track_id, tag_id) VALUES (?, ?)")
+            .bind(track)
+            .bind(tag)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
+    let playlist = new_playlist(&db.pool).await;
+    add(&db.pool, playlist, &tracks).await;
+
+    let filtered: Vec<i64> = sqlx::query_scalar(
+        "SELECT t.id FROM playlist_tracks pt
+         JOIN tracks t ON t.id = pt.track_id
+         JOIN track_tags tt ON tt.track_id = t.id
+         WHERE pt.playlist_id = ? AND tt.tag_id IN (?)
+         GROUP BY t.id
+         HAVING COUNT(DISTINCT tt.tag_id) = 1
+         ORDER BY pt.position, pt.added_at, t.id",
+    )
+    .bind(playlist)
+    .bind(tag)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        filtered,
+        vec![tracks[0], tracks[2]],
+        "playlist order, not the order the tags were applied"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -2,13 +2,12 @@
     import { Button } from "$components/ui/button";
     import { Input } from "$components/ui/input";
     import TrackRow from "$components/track-row.svelte";
+    import TagFilter from "$components/tag-filter.svelte";
     import { libraryView } from "$lib/library-view.svelte";
-    import { tagStore } from "$lib/tags.svelte";
     import SearchIcon from "@lucide/svelte/icons/search";
     import LibraryIcon from "@lucide/svelte/icons/library";
     import UsersIcon from "@lucide/svelte/icons/users";
     import ListIcon from "@lucide/svelte/icons/list";
-    import XIcon from "@lucide/svelte/icons/x";
 
     /** Flat view: the visible list is the queue. */
     const flatIds = $derived(libraryView.results.map((t) => t.id));
@@ -80,50 +79,14 @@
             />
         </div>
 
-        {#if tagStore.tags.length > 0}
-            <div class="flex flex-wrap items-center gap-1">
-                {#each tagStore.tags as tag (tag.id)}
-                    {@const selected = libraryView.selectedTagIds.includes(tag.id)}
-                    <button
-                        type="button"
-                        class="rounded-full border px-2 py-0.5 text-xs"
-                        class:bg-primary={selected}
-                        class:text-primary-foreground={selected}
-                        class:border-primary={selected}
-                        class:text-muted-foreground={!selected}
-                        aria-pressed={selected}
-                        onclick={() => libraryView.toggleTag(tag.id)}
-                    >
-                        {tag.name}
-                        <span class="opacity-60">{tag.trackCount}</span>
-                    </button>
-                {/each}
-
-                {#if libraryView.selectedTagIds.length > 1}
-                    <button
-                        type="button"
-                        class="text-muted-foreground ml-1 text-xs underline"
-                        onclick={() =>
-                            libraryView.setMode(
-                                libraryView.mode === "all" ? "any" : "all",
-                            )}
-                    >
-                        {libraryView.mode === "all" ? "matching all" : "matching any"}
-                    </button>
-                {/if}
-
-                {#if libraryView.filtering}
-                    <Button
-                        variant="ghost"
-                        size="icon"
-                        aria-label="Clear filters"
-                        onclick={() => libraryView.clearFilters()}
-                    >
-                        <XIcon />
-                    </Button>
-                {/if}
-            </div>
-        {/if}
+        <TagFilter
+            selectedIds={libraryView.selectedTagIds}
+            mode={libraryView.mode}
+            active={libraryView.filtering}
+            onToggle={(id) => libraryView.toggleTag(id)}
+            onModeChange={(m) => libraryView.setMode(m)}
+            onClear={() => libraryView.clearFilters()}
+        />
     {/if}
 
     {#if libraryView.loading}

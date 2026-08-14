@@ -12,6 +12,8 @@
     import XIcon from "@lucide/svelte/icons/x";
     import ChevronLeftIcon from "@lucide/svelte/icons/chevron-left";
     import GripVerticalIcon from "@lucide/svelte/icons/grip-vertical";
+    import SearchIcon from "@lucide/svelte/icons/search";
+    import TagFilter from "$components/tag-filter.svelte";
 
     let newName = $state("");
     let renaming = $state(false);
@@ -42,13 +44,22 @@
         }
     }
 
+    /**
+     * Reordering is only meaningful on the unfiltered list.
+     *
+     * A displayed index equals a stored position only when every track is
+     * shown. Filter the list and index 2 might be position 17, so a drop would
+     * move the track somewhere the user did not point at.
+     */
+    const reorderable = $derived(!playlistStore.filtering);
+
     async function drop(toIndex: number) {
         const from = dragFrom;
         dragFrom = null;
         dragOver = null;
 
-        if (!detail || from === null || from === toIndex) return;
-        // Positions are dense, so a list index is the position.
+        if (!detail || !reorderable || from === null || from === toIndex) return;
+        // Unfiltered and positions are dense, so a list index is the position.
         await playlistStore.reorder(
             detail.playlist.id,
             detail.tracks[from].id,
@@ -179,11 +190,43 @@
             {/if}
         </div>
 
+        <!-- Filters this playlist only; the library keeps its own. -->
+        <div class="relative">
+            <SearchIcon
+                class="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2"
+            />
+            <Input
+                value={playlistStore.query}
+                placeholder="Filter this playlist…"
+                class="pl-9"
+                oninput={(e) => playlistStore.setQuery(e.currentTarget.value)}
+            />
+        </div>
+
+        <TagFilter
+            selectedIds={playlistStore.selectedTagIds}
+            mode={playlistStore.mode}
+            active={playlistStore.filtering}
+            onToggle={(id) => playlistStore.toggleTag(id)}
+            onModeChange={(m) => playlistStore.setMode(m)}
+            onClear={() => playlistStore.clearFilters()}
+            showCounts={false}
+        />
+
+        {#if playlistStore.filtering}
+            <p class="text-muted-foreground text-xs">
+                Showing {detail.tracks.length} of {detail.playlist.trackCount}.
+                Play uses the filtered list; reordering is off while filtered.
+            </p>
+        {/if}
+
         {#if detail.tracks.length === 0}
             <div
                 class="text-muted-foreground rounded-lg border border-dashed px-6 py-8 text-center text-sm"
             >
-                Empty. Add tracks from the library or a YouTube search.
+                {playlistStore.filtering
+                    ? "Nothing in this playlist matches."
+                    : "Empty. Add tracks from the library or a YouTube search."}
             </div>
         {:else}
             <ul class="flex flex-col">
@@ -194,7 +237,7 @@
                         class="flex items-center gap-2 border-b py-1 text-sm last:border-b-0"
                         class:opacity-50={unavailable(track.state)}
                         class:bg-muted={dragOver === index}
-                        draggable="true"
+                        draggable={reorderable}
                         ondragstart={() => (dragFrom = index)}
                         ondragover={(e) => {
                             e.preventDefault();
@@ -213,7 +256,9 @@
                         }}
                     >
                         <GripVerticalIcon
-                            class="text-muted-foreground size-4 shrink-0 cursor-grab"
+                            class="text-muted-foreground size-4 shrink-0 {reorderable
+                                ? 'cursor-grab'
+                                : 'opacity-30'}"
                         />
 
                         <Button
