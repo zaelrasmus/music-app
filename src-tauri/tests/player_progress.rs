@@ -85,7 +85,8 @@ async fn progress_reaches_the_ui_while_a_track_plays() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone());
+    // No ffmpeg: the fixture is a plain WAV, decoded natively by rodio.
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -110,6 +111,167 @@ async fn progress_reaches_the_ui_while_a_track_plays() {
         progress.iter().any(|p| *p > 0.0),
         "progress never advanced past zero (got {progress:?}); \
          the engine reports position but it is not reaching the UI"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The Part B acceptance criterion, end to end.
+///
+/// rodio has no Opus codec at all, so if this plays it can only be because the
+/// seam routed the file to ffmpeg and `FfmpegSource` fed real samples back
+/// through the ring buffer. A WAV would prove nothing -- rodio decodes those
+/// natively.
+#[tokio::test]
+async fn an_opus_file_plays_through_ffmpeg() {
+    let base = std::env::temp_dir().join("music-app-opus-playback");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let opus = base.join("tone.opus");
+
+    // Encode a real Opus file rather than faking one, so the codec path is
+    // genuinely exercised.
+    let encoded = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=3"])
+        .args(["-c:a", "libopus"])
+        .arg(&opus)
+        .status();
+
+    match encoded {
+        Ok(status) if status.success() => {}
+        _ => {
+            eprintln!("SKIP: ffmpeg is not available to build the fixture");
+            return;
+        }
+    }
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state) \
+         VALUES ('local', 'Opus Tone', ?, 'present')",
+    )
+    .bind(opus.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let track_id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        // Resolved off PATH; Command::new does the lookup.
+        Some(std::path::PathBuf::from("ffmpeg")),
+        // No yt-dlp: this fixture is a local file.
+        None,
+    );
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    let progress = recorder.0.progress.lock().unwrap().clone();
+    eprintln!("errors:   {errors:?}");
+    eprintln!("progress: {progress:?}");
+
+    if errors.iter().any(|e| e.contains("No audio output device")) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    assert!(
+        errors.is_empty(),
+        "opus playback should not report errors: {errors:?}"
+    );
+    assert!(
+        progress.iter().any(|p| *p > 0.0),
+        "opus never advanced past zero (got {progress:?}); \
+         rodio cannot decode opus, so this means ffmpeg audio never arrived"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The Part D acceptance criterion: a `saved` YouTube track, holding nothing
+/// but a video id, becomes audio.
+///
+/// Everything is real -- yt-dlp resolves a live stream URL, ffmpeg decodes it
+/// over the network, and rodio plays it. Nothing about this path can be faked
+/// convincingly, so it either works against YouTube or it does not work.
+#[tokio::test]
+async fn a_saved_youtube_track_streams() {
+    let base = std::env::temp_dir().join("music-app-youtube-stream");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    // Metadata only, exactly as `save_youtube_track` writes it: no local_path.
+    sqlx::query(
+        "INSERT INTO tracks (source, title, state, yt_video_id) \
+         VALUES ('youtube', 'Never Gonna Give You Up', 'saved', 'dQw4w9WgXcQ')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let track_id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        Some(std::path::PathBuf::from("ffmpeg")),
+        Some(std::path::PathBuf::from("yt-dlp")),
+    );
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+        })
+        .unwrap();
+
+    // Resolution alone takes ~7s, then ffmpeg has to buffer over the network.
+    tokio::time::sleep(Duration::from_secs(25)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    let progress = recorder.0.progress.lock().unwrap().clone();
+    eprintln!("errors:   {errors:?}");
+    eprintln!("progress: {progress:?}");
+
+    let skippable = |e: &String| {
+        e.contains("No audio output device")
+            || e.contains("internet connection")
+            || e.contains("Could not find yt-dlp")
+            || e.contains("Could not start")
+    };
+    if errors.iter().any(skippable) {
+        eprintln!("SKIP: environment cannot run this (no device, no network, or no tools)");
+        return;
+    }
+
+    assert!(errors.is_empty(), "streaming reported errors: {errors:?}");
+    assert!(
+        progress.iter().any(|p| *p > 0.0),
+        "the stream never advanced past zero (got {progress:?})"
     );
 
     db.pool.close().await;

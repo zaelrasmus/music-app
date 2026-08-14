@@ -5,7 +5,10 @@ mod playable;
 pub mod player;
 mod queue;
 mod scanner;
+mod sidecar;
+mod transcode;
 mod tracks;
+mod youtube;
 
 use tauri::Manager;
 
@@ -42,7 +45,20 @@ pub fn run() {
             // Coordinator (queue, repeat, shuffle, volume) plus the dumb audio
             // engine it drives. The engine thread owns the output device for
             // the whole process.
-            app.manage(player::spawn(app.handle().clone(), pool));
+            // Optional on purpose: without ffmpeg the app still plays every
+            // format rodio handles natively, and only Opus files report a
+            // clear "ffmpeg not found" instead of failing obscurely.
+            let ffmpeg = sidecar::resolve(app.handle(), sidecar::Tool::Ffmpeg)
+                .ok()
+                .map(|found| found.path);
+
+            // Resolved once: the coordinator needs it to turn a saved YouTube
+            // track into a playable stream.
+            let yt_dlp = sidecar::resolve(app.handle(), sidecar::Tool::YtDlp)
+                .ok()
+                .map(|found| found.path);
+
+            app.manage(player::spawn(app.handle().clone(), pool, ffmpeg, yt_dlp));
 
             Ok(())
         })
@@ -62,6 +78,10 @@ pub fn run() {
             player::set_repeat,
             player::set_shuffle,
             player::seek,
+            youtube::search_youtube,
+            youtube::save_youtube_track,
+            youtube::debug_yt_dlp_version,
+            youtube::debug_video_metadata,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

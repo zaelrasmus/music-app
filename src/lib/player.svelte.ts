@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { toast } from "svelte-sonner";
 import { readSetting, writeSetting } from "$lib/settings.svelte";
 
-export type PlaybackState = "playing" | "paused" | "stopped";
+export type PlaybackState = "loading" | "playing" | "paused" | "stopped";
 export type RepeatMode = "off" | "all" | "one";
 
 /** The consolidated snapshot the coordinator emits on every change. */

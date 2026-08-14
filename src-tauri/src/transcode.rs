@@ -1,0 +1,388 @@
+use std::io::Read;
+use std::path::Path;
+use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use rodio::{ChannelCount, Sample, SampleRate, Source};
+use rtrb::{Consumer, Producer, PushError, RingBuffer};
+
+/// What we ask ffmpeg to produce. Matching rodio's native sample type means the
+/// bytes off the pipe are already the samples we hand to the mixer -- no
+/// conversion, no allocation.
+const OUTPUT_RATE: u32 = 44_100;
+const OUTPUT_CHANNELS: u16 = 2;
+
+const SAMPLES_PER_SECOND: usize = OUTPUT_RATE as usize * OUTPUT_CHANNELS as usize;
+
+/// Roughly five seconds of slack between ffmpeg and the speakers.
+const BUFFER_SAMPLES: usize = SAMPLES_PER_SECOND * 5;
+
+/// Filled before playback starts so the opening moments cannot underrun.
+const PREFILL_SAMPLES: usize = SAMPLES_PER_SECOND / 2;
+
+/// How long to wait for ffmpeg to produce that first half second.
+const PREFILL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Enough of ffmpeg's stderr to explain a failure, and no more.
+const MAX_STDERR: usize = 4096;
+
+/// Audio decoded by ffmpeg, presented to rodio as an ordinary [`Source`].
+///
+/// This exists because rodio's own `Decoder` requires `Read + Seek`, and a pipe
+/// is not seekable -- so ffmpeg's output can never be handed to it. Instead
+/// ffmpeg does the demuxing and decoding, emits raw `f32` samples, and this
+/// type is the `Source` rodio actually plays. That covers every format rodio
+/// lacks a codec for (Opus above all) with one mechanism.
+pub struct FfmpegSource {
+    consumer: Consumer<Sample>,
+    /// Set by the reader thread once ffmpeg's output ends.
+    finished: Arc<AtomicBool>,
+    child: Child,
+}
+
+/// What ffmpeg should read.
+///
+/// The distinction matters because a network source needs reconnect options
+/// that are meaningless -- and rejected -- for a file.
+#[derive(Debug, Clone, Copy)]
+pub enum FfmpegInput<'a> {
+    File(&'a Path),
+    Url(&'a str),
+}
+
+impl FfmpegSource {
+    /// Starts ffmpeg on `input` and waits for enough audio to begin smoothly.
+    pub fn open(ffmpeg: &Path, input: FfmpegInput<'_>) -> Result<Self, String> {
+        let mut command = Command::new(ffmpeg);
+        command.arg("-hide_banner").args(["-loglevel", "error"]);
+
+        if let FfmpegInput::Url(_) = input {
+            // A dropped connection mid-song should be retried, not fatal.
+            // These are HTTP-protocol options and must precede `-i`.
+            command
+                .args(["-reconnect", "1"])
+                .args(["-reconnect_streamed", "1"])
+                .args(["-reconnect_delay_max", "5"]);
+        }
+
+        command.arg("-i");
+        match input {
+            FfmpegInput::File(path) => command.arg(path),
+            FfmpegInput::Url(url) => command.arg(url),
+        };
+
+        let mut child = command
+            // Drop any cover art, then emit bare interleaved f32.
+            .args(["-vn", "-f", "f32le", "-acodec", "pcm_f32le"])
+            .args(["-ar", &OUTPUT_RATE.to_string()])
+            .args(["-ac", &OUTPUT_CHANNELS.to_string()])
+            .arg("-")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Could not start ffmpeg: {e}"))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("ffmpeg produced no output stream.")?;
+        let stderr = child.stderr.take();
+
+        let (producer, consumer) = RingBuffer::<Sample>::new(BUFFER_SAMPLES);
+        let finished = Arc::new(AtomicBool::new(false));
+
+        spawn_reader(stdout, producer, finished.clone());
+        let errors = stderr.map(spawn_stderr_drain);
+
+        let source = Self {
+            consumer,
+            finished,
+            child,
+        };
+
+        source.wait_for_prefill()?;
+
+        // Nothing arrived and ffmpeg is done: it rejected the input. Its stderr
+        // is the only thing that explains why.
+        if source.consumer.slots() == 0 && source.finished.load(Ordering::Acquire) {
+            let detail = errors
+                .and_then(|e| e.lock().ok().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "ffmpeg produced no audio.".to_string());
+
+            return Err(format!("Could not decode this file: {detail}"));
+        }
+
+        Ok(source)
+    }
+
+    fn wait_for_prefill(&self) -> Result<(), String> {
+        let deadline = Instant::now() + PREFILL_TIMEOUT;
+
+        while self.consumer.slots() < PREFILL_SAMPLES {
+            if self.finished.load(Ordering::Acquire) {
+                // Ended early -- either a decode failure or a very short file.
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("ffmpeg did not produce audio in time.".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        Ok(())
+    }
+}
+
+/// Moves ffmpeg's bytes into the ring buffer.
+///
+/// Runs on its own thread precisely so that [`Iterator::next`] -- which rodio
+/// polls from the audio callback -- never has to touch a pipe.
+fn spawn_reader(mut stdout: ChildStdout, mut producer: Producer<Sample>, finished: Arc<AtomicBool>) {
+    let _ = std::thread::Builder::new()
+        .name("ffmpeg-reader".to_string())
+        .spawn(move || {
+            let mut buffer = [0u8; 8192];
+            // A read can split an f32 across two chunks; hold the remainder.
+            let mut partial: Vec<u8> = Vec::with_capacity(4);
+
+            loop {
+                let read = match stdout.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+
+                partial.extend_from_slice(&buffer[..read]);
+                let whole = partial.len() - (partial.len() % 4);
+
+                for frame in partial[..whole].chunks_exact(4) {
+                    let sample =
+                        f32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]) as Sample;
+
+                    if push_blocking(&mut producer, sample).is_err() {
+                        // The source was dropped; stop feeding a dead buffer.
+                        finished.store(true, Ordering::Release);
+                        return;
+                    }
+                }
+
+                partial.drain(..whole);
+            }
+
+            finished.store(true, Ordering::Release);
+        });
+}
+
+/// Waits for room rather than dropping samples. Errors only if the consumer is
+/// gone, which means playback stopped.
+fn push_blocking(producer: &mut Producer<Sample>, sample: Sample) -> Result<(), ()> {
+    let mut pending = sample;
+
+    loop {
+        match producer.push(pending) {
+            Ok(()) => return Ok(()),
+            Err(PushError::Full(returned)) => {
+                if producer.is_abandoned() {
+                    return Err(());
+                }
+                pending = returned;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+/// Keeps ffmpeg's stderr drained so it can never fill its pipe and block.
+fn spawn_stderr_drain(mut stderr: ChildStderr) -> Arc<Mutex<String>> {
+    let collected = Arc::new(Mutex::new(String::new()));
+    let sink = collected.clone();
+
+    let _ = std::thread::Builder::new()
+        .name("ffmpeg-stderr".to_string())
+        .spawn(move || {
+            let mut buffer = [0u8; 1024];
+            while let Ok(read) = stderr.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                if let Ok(mut text) = sink.lock() {
+                    if text.len() < MAX_STDERR {
+                        text.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                    }
+                }
+            }
+        });
+
+    collected
+}
+
+impl Iterator for FfmpegSource {
+    type Item = Sample;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.consumer.pop() {
+            Ok(sample) => Some(sample),
+            Err(_) if self.finished.load(Ordering::Acquire) => None,
+            // Underrun: ffmpeg has not kept up. A moment of silence beats
+            // ending the track, which is what returning None would do.
+            Err(_) => Some(0.0),
+        }
+    }
+}
+
+impl Source for FfmpegSource {
+    fn current_span_len(&self) -> Option<usize> {
+        // Rate and channel count are fixed by the ffmpeg arguments above, so
+        // they never change mid-stream.
+        None
+    }
+
+    fn channels(&self) -> ChannelCount {
+        ChannelCount::new(OUTPUT_CHANNELS).expect("channel count is a non-zero constant")
+    }
+
+    fn sample_rate(&self) -> SampleRate {
+        SampleRate::new(OUTPUT_RATE).expect("sample rate is a non-zero constant")
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        // Raw PCM carries no duration. The UI takes it from `tracks`, which
+        // lofty already filled in during the scan.
+        None
+    }
+
+    // `try_seek` keeps its default of `SeekError::NotSupported`. Seeking would
+    // mean restarting ffmpeg with `-ss`, and rodio drives seeks from the audio
+    // callback thread, where spawning a process would stall playback. Doing it
+    // at the engine level instead is the follow-up.
+}
+
+impl Drop for FfmpegSource {
+    fn drop(&mut self) {
+        // Without this, ffmpeg lives on writing into a pipe nobody reads.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Whether a file needs ffmpeg, based on what rodio can actually decode.
+///
+/// rodio's enabled codecs are mp3, flac, wav, AAC/ALAC in mp4, and Vorbis in
+/// Ogg. Opus has no symphonia codec at all, so anything carrying it must go
+/// through ffmpeg.
+pub fn needs_transcode(path: &Path) -> bool {
+    let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+        // No extension: let rodio try, and fall back if it cannot cope.
+        return false;
+    };
+
+    match extension.to_lowercase().as_str() {
+        // Always Opus, or a container rodio has no demuxer for.
+        "opus" | "webm" | "weba" | "mka" | "mkv" => true,
+        // Ogg carries Vorbis (native) or Opus (not) -- the extension alone
+        // cannot say which, so look inside.
+        "ogg" | "oga" => is_opus_stream(path),
+        _ => false,
+    }
+}
+
+/// Reads the head of an Ogg file to identify its codec.
+///
+/// An Ogg stream announces itself in the first page: an Opus stream's first
+/// packet begins with the magic `OpusHead`, a Vorbis stream's with `\x01vorbis`.
+/// Checking the bytes is both cheaper and more honest than trusting `.ogg`.
+fn is_opus_stream(path: &Path) -> bool {
+    use std::fs::File;
+
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+
+    // The identification header sits in the first page, well inside 4 KiB.
+    let mut head = [0u8; 4096];
+    let Ok(read) = file.read(&mut head) else {
+        return false;
+    };
+
+    contains(&head[..read], b"OpusHead")
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("music-app-transcode-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn formats_rodio_handles_natively_are_left_alone() {
+        assert!(!needs_transcode(Path::new("a.mp3")));
+        assert!(!needs_transcode(Path::new("a.flac")));
+        assert!(!needs_transcode(Path::new("a.wav")));
+        assert!(!needs_transcode(Path::new("a.m4a")));
+        assert!(!needs_transcode(Path::new("a.M4A")));
+    }
+
+    #[test]
+    fn opus_and_matroska_always_need_ffmpeg() {
+        assert!(needs_transcode(Path::new("a.opus")));
+        assert!(needs_transcode(Path::new("a.OPUS")));
+        assert!(needs_transcode(Path::new("a.webm")));
+        assert!(needs_transcode(Path::new("a.mka")));
+    }
+
+    #[test]
+    fn an_extensionless_file_is_left_for_rodio_to_attempt() {
+        assert!(!needs_transcode(Path::new("mystery")));
+    }
+
+    /// The whole point of sniffing: two files with the same extension, only one
+    /// of which rodio can decode.
+    #[test]
+    fn ogg_is_decided_by_its_contents_not_its_extension() {
+        let dir = temp_dir("ogg-sniff");
+
+        let opus = dir.join("opus.ogg");
+        let mut page = vec![0u8; 28];
+        page.splice(0..4, *b"OggS");
+        page.extend_from_slice(b"OpusHead");
+        page.extend_from_slice(&[0u8; 64]);
+        std::fs::File::create(&opus).unwrap().write_all(&page).unwrap();
+
+        let vorbis = dir.join("vorbis.ogg");
+        let mut page = vec![0u8; 28];
+        page.splice(0..4, *b"OggS");
+        page.extend_from_slice(b"\x01vorbis");
+        page.extend_from_slice(&[0u8; 64]);
+        std::fs::File::create(&vorbis)
+            .unwrap()
+            .write_all(&page)
+            .unwrap();
+
+        assert!(needs_transcode(&opus), "Opus in Ogg needs ffmpeg");
+        assert!(!needs_transcode(&vorbis), "Vorbis in Ogg is native");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_ogg_file_does_not_panic() {
+        assert!(!needs_transcode(Path::new("nope.ogg")));
+    }
+}

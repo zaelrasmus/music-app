@@ -40,6 +40,9 @@ lofty = "0.25.0"
 rodio = "0.22.2"
 # Shuffle only. Was already present transitively; promoted to a direct dep.
 rand = "0.10"
+# Lock-free ring buffer between the ffmpeg reader thread and the audio
+# callback thread, which must never block.
+rtrb = "0.3"
 # Channels and `select!` for the coordinator. Tauri already runs on tokio;
 # this only makes the crate nameable.
 tokio = { version = "1", features = ["sync", "macros"] }

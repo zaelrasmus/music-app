@@ -13,6 +13,7 @@
     import Volume2Icon from "@lucide/svelte/icons/volume-2";
     import Volume1Icon from "@lucide/svelte/icons/volume-1";
     import VolumeXIcon from "@lucide/svelte/icons/volume-x";
+    import LoaderIcon from "@lucide/svelte/icons/loader-circle";
 
     const nowPlaying = $derived(
         trackStore.tracks.find((t) => t.id === player.trackId) ?? null,
@@ -21,7 +22,11 @@
     // Total comes from the scanned tag, not from rodio, whose total_duration
     // is None for several formats.
     const totalSecs = $derived(nowPlaying?.durationSecs ?? 0);
-    const seekable = $derived(totalSecs > 0 && player.state !== "stopped");
+    const loading = $derived(player.state === "loading");
+    // Nothing to seek within until audio is actually flowing.
+    const seekable = $derived(
+        totalSecs > 0 && player.state !== "stopped" && !loading,
+    );
 
     // Kept within [0, max] so the slider never has to snap a value back at us.
     // On VBR files the real position can drift past the tag-reported duration.
@@ -82,7 +87,7 @@
                 {#if nowPlaying}
                     <span class="truncate font-medium">{nowPlaying.title}</span>
                     <span class="text-muted-foreground truncate text-xs">
-                        {nowPlaying.artist ?? "Unknown artist"}
+                        {loading ? "Loading…" : (nowPlaying.artist ?? "Unknown artist")}
                     </span>
                 {:else}
                     <span class="text-muted-foreground">Nothing playing</span>
@@ -111,10 +116,13 @@
                 <Button
                     variant="ghost"
                     size="icon"
-                    aria-label={player.state === "playing" ? "Pause" : "Play"}
+                    aria-label={loading ? "Loading" : player.state === "playing" ? "Pause" : "Play"}
+                    disabled={loading}
                     onclick={() => player.togglePlayPause()}
                 >
-                    {#if player.state === "playing"}
+                    {#if loading}
+                        <LoaderIcon class="animate-spin" />
+                    {:else if player.state === "playing"}
                         <PauseIcon />
                     {:else}
                         <PlayIcon />

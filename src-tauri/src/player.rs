@@ -40,6 +40,8 @@ fn slider_to_linear(slider: f32, muted: bool) -> f32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlaybackState {
+    /// Resolving a source. Only YouTube streams stay here long enough to see.
+    Loading,
     Playing,
     Paused,
     Stopped,
@@ -145,13 +147,21 @@ struct Coordinator<E: PlayerEvents> {
     epoch: u64,
     engine: AudioEngine,
     pool: SqlitePool,
+    /// Handed in at startup: the coordinator has no `AppHandle` to resolve it
+    /// from, and doing so per play would repeat the lookup needlessly.
+    yt_dlp: Option<std::path::PathBuf>,
     events: E,
 }
 
 /// Starts the engine thread and the coordinator task.
-pub fn spawn<E: PlayerEvents>(events: E, pool: SqlitePool) -> PlayerHandle {
+pub fn spawn<E: PlayerEvents>(
+    events: E,
+    pool: SqlitePool,
+    ffmpeg: Option<std::path::PathBuf>,
+    yt_dlp: Option<std::path::PathBuf>,
+) -> PlayerHandle {
     let (engine_tx, engine_rx) = mpsc::unbounded_channel();
-    let engine = engine::spawn(engine_tx);
+    let engine = engine::spawn(engine_tx, ffmpeg);
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
 
@@ -164,6 +174,7 @@ pub fn spawn<E: PlayerEvents>(events: E, pool: SqlitePool) -> PlayerHandle {
             epoch: 0,
             engine,
             pool,
+            yt_dlp,
             events,
         }
         .run(command_rx, engine_rx)
@@ -209,8 +220,10 @@ impl<E: PlayerEvents> Coordinator<E> {
                         self.state = PlaybackState::Playing;
                     }
                 }
-                // Nothing loaded: start wherever the cursor is.
-                PlaybackState::Stopped => self.start_current().await,
+                // Nothing loaded, or still resolving: start from the cursor.
+                PlaybackState::Stopped | PlaybackState::Loading => {
+                    self.start_current().await
+                }
             },
 
             PlayerCommand::Next => {
@@ -310,13 +323,24 @@ impl<E: PlayerEvents> Coordinator<E> {
     /// must be bounded or a queue of entirely missing tracks would spin
     /// forever -- with repeat on, `next_manual` never returns `None`.
     async fn start_current(&mut self) {
-        let attempts_allowed = self.queue.len().max(1);
+        // Bounded far below the queue length on purpose. A local file fails
+        // instantly, but resolving a YouTube stream takes ~7 seconds, so
+        // walking a long queue of dead links would freeze playback for
+        // minutes with no explanation.
+        const MAX_ATTEMPTS: usize = 3;
+
+        let attempts_allowed = self.queue.len().clamp(1, MAX_ATTEMPTS);
         let mut last_error = None;
 
         for _ in 0..attempts_allowed {
             let Some(track_id) = self.queue.current() else {
                 break;
             };
+
+            // Resolution can take seconds; without this the UI would sit on
+            // "stopped" and look broken while a stream is being fetched.
+            self.state = PlaybackState::Loading;
+            self.emit_state();
 
             match self.resolve(track_id).await {
                 Ok(source) => {
@@ -349,18 +373,24 @@ impl<E: PlayerEvents> Coordinator<E> {
     }
 
     async fn resolve(&self, track_id: i64) -> Result<crate::playable::PlayableSource, String> {
-        let row = sqlx::query("SELECT source, state, local_path FROM tracks WHERE id = ?")
-            .bind(track_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or("That track no longer exists.")?;
+        let row =
+            sqlx::query("SELECT source, state, local_path, yt_video_id FROM tracks WHERE id = ?")
+                .bind(track_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("That track no longer exists.")?;
 
-        get_playable_source(&PlayableTrack {
-            source: row.get("source"),
-            state: row.get("state"),
-            local_path: row.get("local_path"),
-        })
+        get_playable_source(
+            &PlayableTrack {
+                source: row.get("source"),
+                state: row.get("state"),
+                local_path: row.get("local_path"),
+                yt_video_id: row.get("yt_video_id"),
+            },
+            self.yt_dlp.as_deref(),
+        )
+        .await
     }
 
     fn halt(&mut self) {

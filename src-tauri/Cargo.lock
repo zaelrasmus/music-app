@@ -2370,6 +2370,7 @@ dependencies = [
  "lofty",
  "rand",
  "rodio",
+ "rtrb",
  "serde",
  "serde_json",
  "sqlx",

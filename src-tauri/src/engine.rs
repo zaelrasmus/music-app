@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -8,6 +9,7 @@ use rodio::{Decoder, Player};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::playable::PlayableSource;
+use crate::transcode::{FfmpegInput, FfmpegSource};
 
 /// How often the thread wakes to notice a track finished on its own. Also the
 /// upper bound on how late `Finished` can be.
@@ -125,17 +127,17 @@ impl AudioEngine {
     }
 }
 
-pub fn spawn(events: UnboundedSender<EngineEvent>) -> AudioEngine {
+pub fn spawn(events: UnboundedSender<EngineEvent>, ffmpeg: Option<PathBuf>) -> AudioEngine {
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("audio".to_string())
-        .spawn(move || run(rx, events))
+        .spawn(move || run(rx, events, ffmpeg))
         .expect("audio thread should spawn");
 
     AudioEngine { tx: Mutex::new(tx) }
 }
 
-fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>) {
+fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Option<PathBuf>) {
     // Opened once. If there is no device we keep the error and fail every play
     // with it, rather than killing the thread and making every later command
     // report "not running".
@@ -162,7 +164,7 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>) {
                 reply,
             }) => {
                 let result = match &device {
-                    Ok(sink) => start(sink, &source, volume),
+                    Ok(sink) => start(sink, &source, volume, ffmpeg.as_deref()),
                     Err(e) => Err(e.clone()),
                 };
 
@@ -249,18 +251,46 @@ fn start(
     sink: &rodio::MixerDeviceSink,
     source: &PlayableSource,
     volume: f32,
+    ffmpeg: Option<&Path>,
 ) -> Result<Player, String> {
-    let PlayableSource::LocalFile(path) = source;
-
-    let file = File::open(path).map_err(|e| format!("Could not open the file: {e}"))?;
-    let decoder =
-        Decoder::try_from(file).map_err(|e| format!("Could not decode the audio: {e}"))?;
-
     let player = Player::connect_new(sink.mixer());
     player.set_volume(volume);
-    player.append(decoder);
+
+    match source {
+        PlayableSource::LocalFile(path) => match native_decoder(path) {
+            Ok(decoder) => player.append(decoder),
+            // The seam's guess was wrong, or the file is something neither of
+            // us anticipated. ffmpeg understands far more formats than rodio,
+            // so it is worth one attempt before giving up.
+            Err(native_error) => {
+                let ffmpeg = ffmpeg.ok_or(native_error)?;
+                player.append(FfmpegSource::open(ffmpeg, FfmpegInput::File(path))?);
+            }
+        },
+
+        PlayableSource::Transcoded(path) => {
+            let ffmpeg = ffmpeg.ok_or(
+                "This file needs ffmpeg to play, and ffmpeg was not found. \
+                 See src-tauri/binaries/README.md.",
+            )?;
+            player.append(FfmpegSource::open(ffmpeg, FfmpegInput::File(path))?);
+        }
+
+        PlayableSource::Stream(url) => {
+            let ffmpeg = ffmpeg.ok_or(
+                "Streaming needs ffmpeg, and ffmpeg was not found. \
+                 See src-tauri/binaries/README.md.",
+            )?;
+            player.append(FfmpegSource::open(ffmpeg, FfmpegInput::Url(url))?);
+        }
+    }
 
     Ok(player)
+}
+
+fn native_decoder(path: &Path) -> Result<Decoder<std::io::BufReader<File>>, String> {
+    let file = File::open(path).map_err(|e| format!("Could not open the file: {e}"))?;
+    Decoder::try_from(file).map_err(|e| format!("Could not decode the audio: {e}"))
 }
 
 #[cfg(test)]
@@ -299,7 +329,8 @@ mod tests {
         write_wav(&wav, 3);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = spawn(tx);
+        // No ffmpeg needed: this test plays a plain WAV, which rodio decodes.
+        let engine = spawn(tx, None);
 
         let played = engine.play(PlayableSource::LocalFile(wav), 1);
         if let Err(e) = &played {

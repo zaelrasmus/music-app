@@ -4,6 +4,7 @@
     import { library } from "$lib/library.svelte";
     import { trackStore } from "$lib/tracks.svelte";
     import { player } from "$lib/player.svelte";
+    import YoutubeSearch from "$components/youtube-search.svelte";
     import FolderPlusIcon from "@lucide/svelte/icons/folder-plus";
     import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
     import Trash2Icon from "@lucide/svelte/icons/trash-2";
@@ -120,6 +121,8 @@
             {/if}
         </p>
     {/if}
+
+    <YoutubeSearch />
 
     <!-- Deliberately bare: the polished track view is the next task. -->
     <section class="flex flex-col gap-2">
