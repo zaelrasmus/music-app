@@ -71,7 +71,7 @@ async fn run_at(yt_dlp: std::path::PathBuf, args: Vec<String>) -> Result<String,
 /// Raw stderr is long, noisy, and mentions flags the user never typed, so the
 /// common failures get a plain sentence and everything else falls back to the
 /// last meaningful line.
-fn explain(stderr: &str) -> String {
+pub(crate) fn explain(stderr: &str) -> String {
     let lowered = stderr.to_lowercase();
 
     if lowered.contains("sign in to confirm your age") || lowered.contains("age-restricted") {

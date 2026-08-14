@@ -218,6 +218,12 @@ async fn scan_folder(
 
             // DO UPDATE deliberately omits date_added, play_count and
             // last_played: a rescan must never reset the user's history.
+            //
+            // The `WHERE tracks.source = 'local'` guard matters if a downloaded
+            // YouTube file ever ends up under a library folder: without it this
+            // would set `state='present'` on a YouTube row and claim it as a
+            // local track. The schema now rejects that outright, so the guard
+            // is what turns a hard error into simply leaving the row alone.
             sqlx::query(
                 "INSERT INTO tracks (
                      source, title, artist, album, duration_secs,
@@ -234,7 +240,8 @@ async fn scan_folder(
                      file_size      = excluded.file_size,
                      folder_id      = excluded.folder_id,
                      last_seen_scan = excluded.last_seen_scan,
-                     state          = 'present'",
+                     state          = 'present'
+                 WHERE tracks.source = 'local'",
             )
             .bind(&metadata.title)
             .bind(&metadata.artist)

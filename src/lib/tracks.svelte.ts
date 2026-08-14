@@ -1,8 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { toast } from "svelte-sonner";
 
 export type Track = {
   id: number;
+  source: "local" | "youtube";
   title: string;
   artist: string | null;
   album: string | null;
@@ -64,6 +66,55 @@ class TrackStore {
       this.error = String(e);
     } finally {
       this.scanning = false;
+    }
+  }
+
+  // --- offline downloads and metadata ---------------------------------
+
+  /** Track ids with a download in flight, so each row can show progress. */
+  downloading = $state<number[]>([]);
+
+  isDownloading(trackId: number) {
+    return this.downloading.includes(trackId);
+  }
+
+  /** Fetches a saved YouTube track for offline play. */
+  async download(trackId: number) {
+    if (this.isDownloading(trackId)) return;
+    this.downloading.push(trackId);
+
+    try {
+      await invoke("download_track", { trackId });
+      await this.load();
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      this.downloading = this.downloading.filter((id) => id !== trackId);
+    }
+  }
+
+  /** Removes the downloaded file, returning the track to `saved`. */
+  async deleteDownload(trackId: number) {
+    try {
+      await invoke("delete_download", { trackId });
+      await this.load();
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
+  /**
+   * Renames a track for display. The original YouTube title and channel are
+   * kept separately by the backend and are not touched.
+   */
+  async updateMetadata(trackId: number, title: string, artist: string | null) {
+    try {
+      await invoke("update_track_metadata", { trackId, title, artist });
+      await this.load();
+      return true;
+    } catch (e) {
+      toast.error(String(e));
+      return false;
     }
   }
 }

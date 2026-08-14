@@ -95,10 +95,28 @@ fn is_inside(child: &str, parent: &str) -> bool {
 /// overlapping roots would make the next task's scanner walk the same files
 /// twice.
 #[tauri::command]
-pub async fn add_library_folder(path: String, db: State<'_, Db>) -> Result<LibraryFolder, String> {
+pub async fn add_library_folder(
+    app: tauri::AppHandle,
+    path: String,
+    db: State<'_, Db>,
+) -> Result<LibraryFolder, String> {
     let candidate = tauri::async_runtime::spawn_blocking(move || LibraryPath::parse(&path))
         .await
         .map_err(|e| e.to_string())??;
+
+    // Downloaded YouTube audio lives in the app's own folder. Scanning it would
+    // have the scanner try to claim those files as separate local tracks, so
+    // adding it -- or anything containing it -- is refused up front.
+    if let Ok(downloads) = crate::download::downloads_dir(&app) {
+        if let Some(downloads_key) = downloads.to_str().map(comparison_key) {
+            if candidate.key == downloads_key || is_inside(&downloads_key, &candidate.key) {
+                return Err(
+                    "That folder holds the app's own downloads. Pick a different one."
+                        .to_string(),
+                );
+            }
+        }
+    }
 
     let existing: Vec<FolderKey> = sqlx::query_as("SELECT path, path_key FROM library_folders")
         .fetch_all(&db.pool)

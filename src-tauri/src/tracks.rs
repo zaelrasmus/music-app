@@ -13,6 +13,8 @@ pub const SCAN_FINISHED_EVENT: &str = "scan-finished";
 #[serde(rename_all = "camelCase")]
 pub struct Track {
     pub id: i64,
+    /// "local" or "youtube" -- the UI offers different actions for each.
+    pub source: String,
     pub title: String,
     pub artist: Option<String>,
     pub album: Option<String>,
@@ -23,7 +25,7 @@ pub struct Track {
 #[tauri::command]
 pub async fn list_tracks(db: State<'_, Db>) -> Result<Vec<Track>, String> {
     sqlx::query_as(
-        "SELECT id, title, artist, album, duration_secs, state \
+        "SELECT id, source, title, artist, album, duration_secs, state \
          FROM tracks ORDER BY artist, album, title",
     )
     .fetch_all(&db.pool)
@@ -48,4 +50,45 @@ pub async fn rescan_library(
     }
 
     Ok(summary)
+}
+
+/// Renames a track for display, leaving its provenance untouched.
+///
+/// YouTube metadata is dirty by nature -- a slowed+reverb upload has no clean
+/// artist tag -- so `title`/`artist` are the editable copy while
+/// `yt_original_title`/`yt_channel` keep what was actually uploaded. Those are
+/// deliberately not writable here.
+#[tauri::command]
+pub async fn update_track_metadata(
+    db: State<'_, Db>,
+    track_id: i64,
+    title: String,
+    artist: Option<String>,
+) -> Result<(), String> {
+    let title = title.trim();
+    if title.is_empty() {
+        // The column is NOT NULL, and a blank title would leave a row nothing
+        // can display.
+        return Err("A title is required.".to_string());
+    }
+
+    // An empty artist box means "unknown", which is NULL rather than "".
+    let artist = artist
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty());
+
+    let affected = sqlx::query("UPDATE tracks SET title = ?, artist = ? WHERE id = ?")
+        .bind(title)
+        .bind(&artist)
+        .bind(track_id)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .rows_affected();
+
+    if affected == 0 {
+        return Err("That track no longer exists.".to_string());
+    }
+
+    Ok(())
 }

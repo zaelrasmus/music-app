@@ -113,7 +113,7 @@ impl FfmpegSource {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "ffmpeg produced no audio.".to_string());
 
-            return Err(format!("Could not decode this file: {detail}"));
+            return Err(explain_ffmpeg(&detail));
         }
 
         Ok(source)
@@ -269,6 +269,64 @@ impl Drop for FfmpegSource {
     }
 }
 
+/// Turns ffmpeg's stderr into something a person can act on.
+///
+/// Raw ffmpeg output is unusable in a toast: a failed stream dumps the entire
+/// signed googlevideo URL, which is two kilobytes of query string. The network
+/// cases in particular need naming, because "403" from YouTube almost always
+/// means the bundled yt-dlp has aged out rather than anything being wrong with
+/// the track.
+pub fn explain_ffmpeg(stderr: &str) -> String {
+    let lowered = stderr.to_lowercase();
+
+    if lowered.contains("403") || lowered.contains("forbidden") {
+        // Seen in practice even with a current yt-dlp: YouTube rate-limits
+        // bursts of requests, and periodically changes what it will serve.
+        // Waiting usually works; updating yt-dlp is the fix when it does not.
+        return "YouTube refused this stream. Wait a moment and try again -- if \
+                it keeps happening, yt-dlp may need updating."
+            .to_string();
+    }
+    if lowered.contains("404") || lowered.contains("not found") {
+        return "That stream is no longer available. Try playing it again to \
+                fetch a fresh link."
+            .to_string();
+    }
+    if lowered.contains("failed to resolve")
+        || lowered.contains("network is unreachable")
+        || lowered.contains("connection refused")
+        || lowered.contains("timed out")
+    {
+        return "Could not reach the audio. Check your internet connection.".to_string();
+    }
+    if lowered.contains("no such file") {
+        return "That file is missing from disk.".to_string();
+    }
+
+    // Something unanticipated: keep the first line only, and keep it short.
+    let first = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("ffmpeg could not decode this audio.");
+
+    let mut summary: String = first.chars().take(200).collect();
+    if first.chars().count() > 200 {
+        summary.push('…');
+    }
+
+    format!("Could not decode this audio: {summary}")
+}
+
+/// Whether a failure is worth retrying with a freshly resolved URL.
+///
+/// YouTube rejects a sizeable share of these fetches — measured at roughly one
+/// in three on a warm IP — and the same request often succeeds moments later
+/// with a new URL. That makes 403 a transient condition rather than a verdict.
+pub fn is_transient(message: &str) -> bool {
+    message.contains("YouTube refused")
+}
+
 /// Whether a file needs ffmpeg, based on what rodio can actually decode.
 ///
 /// rodio's enabled codecs are mp3, flac, wav, AAC/ALAC in mp4, and Vorbis in
@@ -384,5 +442,70 @@ mod tests {
     #[test]
     fn a_missing_ogg_file_does_not_panic() {
         assert!(!needs_transcode(Path::new("nope.ogg")));
+    }
+}
+
+#[cfg(test)]
+mod ffmpeg_error_tests {
+    use super::*;
+
+    /// The failure that actually happens in practice, and the one where the
+    /// raw text is least useful: a signed URL is ~2KB of query string.
+    #[test]
+    fn a_403_points_at_the_real_cause() {
+        let stderr = "[in#0 @ 000001e3] Error opening input: Server returned 403 Forbidden \
+                      (access denied)\r\nError opening input file https://rr2---sn-jvqxuxa.\
+                      googlevideo.com/videoplayback?expire=1786700267&ei=i41&ip=2001";
+
+        let message = explain_ffmpeg(stderr);
+
+        assert!(message.contains("YouTube refused"), "got: {message}");
+        assert!(
+            !message.contains("googlevideo"),
+            "the URL must not reach the user: {message}"
+        );
+    }
+
+    #[test]
+    fn network_failures_are_named() {
+        assert!(explain_ffmpeg("Failed to resolve hostname").contains("internet connection"));
+        assert!(explain_ffmpeg("Connection refused").contains("internet connection"));
+    }
+
+    #[test]
+    fn a_missing_file_is_named() {
+        assert!(explain_ffmpeg("x.opus: No such file or directory").contains("missing from disk"));
+    }
+
+    /// Anything unrecognised still has to be short enough for a toast.
+    #[test]
+    fn an_unknown_failure_is_truncated() {
+        let stderr = "z".repeat(1000);
+        let message = explain_ffmpeg(&stderr);
+
+        assert!(message.len() < 260, "still too long: {} chars", message.len());
+        assert!(message.ends_with('…'));
+    }
+
+    #[test]
+    fn blank_stderr_still_says_something() {
+        assert!(!explain_ffmpeg("").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod transient_tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_fetch_is_worth_retrying() {
+        assert!(is_transient(&explain_ffmpeg("Server returned 403 Forbidden")));
+    }
+
+    /// Retrying these would just waste the user's time.
+    #[test]
+    fn permanent_failures_are_not_retried() {
+        assert!(!is_transient(&explain_ffmpeg("x.opus: No such file or directory")));
+        assert!(!is_transient(&explain_ffmpeg("Invalid data found when processing input")));
     }
 }

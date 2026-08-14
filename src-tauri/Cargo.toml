@@ -45,7 +45,7 @@ rand = "0.10"
 rtrb = "0.3"
 # Channels and `select!` for the coordinator. Tauri already runs on tokio;
 # this only makes the crate nameable.
-tokio = { version = "1", features = ["sync", "macros"] }
+tokio = { version = "1", features = ["sync", "macros", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

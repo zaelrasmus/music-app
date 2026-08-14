@@ -10,6 +10,13 @@
     import Trash2Icon from "@lucide/svelte/icons/trash-2";
     import PlayIcon from "@lucide/svelte/icons/play";
     import PauseIcon from "@lucide/svelte/icons/pause";
+    import PencilIcon from "@lucide/svelte/icons/pencil";
+    import CheckIcon from "@lucide/svelte/icons/check";
+    import XIcon from "@lucide/svelte/icons/x";
+    import DownloadIcon from "@lucide/svelte/icons/download";
+    import LoaderIcon from "@lucide/svelte/icons/loader-circle";
+    import { Input } from "$components/ui/input";
+    import type { Track } from "$lib/tracks.svelte";
 
     onMount(() => {
         library.load();
@@ -40,6 +47,28 @@
 
     /** The visible list is the queue, snapshotted at click time. */
     const queueIds = $derived(trackStore.tracks.map((t) => t.id));
+
+    // Inline metadata editing. Only one row is editable at a time.
+    let editingId = $state<number | null>(null);
+    let editTitle = $state("");
+    let editArtist = $state("");
+
+    function startEdit(track: Track) {
+        editingId = track.id;
+        editTitle = track.title;
+        editArtist = track.artist ?? "";
+    }
+
+    function cancelEdit() {
+        editingId = null;
+    }
+
+    async function saveEdit(trackId: number) {
+        // An empty artist means "unknown", which the backend stores as NULL.
+        const artist = editArtist.trim() === "" ? null : editArtist;
+        const saved = await trackStore.updateMetadata(trackId, editTitle, artist);
+        if (saved) editingId = null;
+    }
 </script>
 
 <main class="mx-auto flex max-w-2xl flex-col gap-6 p-6">
@@ -164,23 +193,115 @@
                             {/if}
                         </Button>
 
-                        <span class="min-w-0 flex-1 truncate">
-                            <span class:font-medium={isCurrent}>
-                                {track.title}
-                            </span>
-                            <span class="text-muted-foreground">
-                                — {track.artist ?? "Unknown artist"}
-                            </span>
-                            {#if track.state === "missing"}
-                                <span class="text-muted-foreground text-xs">
-                                    (missing)
+                        {#if editingId === track.id}
+                            <!-- Inline rather than a dialog: two fields do not
+                                 justify a modal. -->
+                            <div class="flex min-w-0 flex-1 items-center gap-2">
+                                <Input
+                                    bind:value={editTitle}
+                                    placeholder="Title"
+                                    class="h-8"
+                                    onkeydown={(e) => {
+                                        if (e.key === "Enter") saveEdit(track.id);
+                                        if (e.key === "Escape") cancelEdit();
+                                    }}
+                                />
+                                <Input
+                                    bind:value={editArtist}
+                                    placeholder="Artist"
+                                    class="h-8"
+                                    onkeydown={(e) => {
+                                        if (e.key === "Enter") saveEdit(track.id);
+                                        if (e.key === "Escape") cancelEdit();
+                                    }}
+                                />
+                                <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    aria-label="Save"
+                                    onclick={() => saveEdit(track.id)}
+                                >
+                                    <CheckIcon />
+                                </Button>
+                                <Button
+                                    variant="ghost"
+                                    size="icon"
+                                    aria-label="Cancel"
+                                    onclick={cancelEdit}
+                                >
+                                    <XIcon />
+                                </Button>
+                            </div>
+                        {:else}
+                            <span class="min-w-0 flex-1 truncate">
+                                <span class:font-medium={isCurrent}>
+                                    {track.title}
                                 </span>
-                            {/if}
-                        </span>
+                                <span class="text-muted-foreground">
+                                    — {track.artist ?? "Unknown artist"}
+                                </span>
+                                {#if track.state === "missing"}
+                                    <span class="text-muted-foreground text-xs">
+                                        (missing)
+                                    </span>
+                                {:else if track.state === "saved"}
+                                    <span
+                                        class="text-muted-foreground border-muted-foreground/40 ml-1 rounded border px-1 text-[10px]"
+                                        title="Streams from YouTube; needs internet"
+                                    >
+                                        streaming
+                                    </span>
+                                {:else if track.state === "downloaded"}
+                                    <span
+                                        class="text-primary border-primary/40 ml-1 rounded border px-1 text-[10px]"
+                                        title="Saved to disk; plays offline"
+                                    >
+                                        offline
+                                    </span>
+                                {/if}
+                            </span>
 
-                        <span class="text-muted-foreground shrink-0 text-xs">
-                            {formatDuration(track.durationSecs)}
-                        </span>
+                            <span class="text-muted-foreground shrink-0 text-xs">
+                                {formatDuration(track.durationSecs)}
+                            </span>
+
+                            <Button
+                                variant="ghost"
+                                size="icon"
+                                aria-label="Edit {track.title}"
+                                onclick={() => startEdit(track)}
+                            >
+                                <PencilIcon />
+                            </Button>
+
+                            {#if track.source === "youtube"}
+                                {#if track.state === "saved"}
+                                    <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        aria-label="Download {track.title}"
+                                        disabled={trackStore.isDownloading(track.id)}
+                                        onclick={() => trackStore.download(track.id)}
+                                    >
+                                        {#if trackStore.isDownloading(track.id)}
+                                            <LoaderIcon class="animate-spin" />
+                                        {:else}
+                                            <DownloadIcon />
+                                        {/if}
+                                    </Button>
+                                {:else}
+                                    <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        aria-label="Delete download of {track.title}"
+                                        onclick={() =>
+                                            trackStore.deleteDownload(track.id)}
+                                    >
+                                        <Trash2Icon />
+                                    </Button>
+                                {/if}
+                            {/if}
+                        {/if}
                     </li>
                 {/each}
             </ul>

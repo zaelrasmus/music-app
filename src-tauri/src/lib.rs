@@ -1,4 +1,5 @@
 pub mod db;
+mod download;
 mod engine;
 mod library;
 mod playable;
@@ -41,6 +42,7 @@ pub fn run() {
             let pool = db.pool.clone();
             app.manage(db);
             app.manage(scanner::ScanLock::new());
+            app.manage(download::DownloadLock::new());
 
             // Coordinator (queue, repeat, shuffle, volume) plus the dumb audio
             // engine it drives. The engine thread owns the output device for
@@ -68,6 +70,9 @@ pub fn run() {
             library::remove_library_folder,
             tracks::list_tracks,
             tracks::rescan_library,
+            tracks::update_track_metadata,
+            download::download_track,
+            download::delete_download,
             player::play_queue,
             player::toggle_play_pause,
             player::next_track,
