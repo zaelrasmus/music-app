@@ -368,3 +368,173 @@ async fn a_saved_soundcloud_track_streams() {
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Seeking inside a stream, which rodio cannot do at all.
+///
+/// `FfmpegSource` reads a pipe, so `try_seek` is `NotSupported` by
+/// construction. The engine restarts the decode with `-ss` instead and adds
+/// the offset back on. Both halves are load-bearing and both are invisible
+/// from the command API: if the offset were dropped, seeking would still
+/// "work" while the progress bar snapped back to zero and the coordinator
+/// thought the track had restarted.
+#[tokio::test]
+async fn a_stream_can_be_seeked_and_reports_the_real_position() {
+    const TARGET_SECS: f64 = 100.0;
+
+    let base = std::env::temp_dir().join("music-app-stream-seek");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, state, remote_id, remote_url) \
+         VALUES ('youtube', 'Never Gonna Give You Up', 'saved', 'dQw4w9WgXcQ', \
+                 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let track_id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        Some(std::path::PathBuf::from("ffmpeg")),
+        Some(std::path::PathBuf::from("yt-dlp")),
+    );
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Resolution alone takes ~7s, then ffmpeg buffers over the network.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    let skippable = |e: &String| {
+        e.contains("No audio output device")
+            || e.contains("internet connection")
+            || e.contains("Could not find yt-dlp")
+            || e.contains("Could not start")
+            || e.contains("YouTube refused")
+            || e.contains("no longer available")
+    };
+    let early_errors = recorder.0.errors.lock().unwrap().clone();
+    if early_errors.iter().any(skippable) {
+        eprintln!("SKIP: upstream/environment condition ({early_errors:?})");
+        return;
+    }
+
+    let before = recorder.0.progress.lock().unwrap().last().copied();
+    eprintln!("position before the seek: {before:?}");
+    assert!(
+        before.is_some_and(|p| p < TARGET_SECS),
+        "the track should still be near its start, got {before:?}"
+    );
+
+    recorder.0.progress.lock().unwrap().clear();
+    handle.send(PlayerCommand::Seek(TARGET_SECS)).unwrap();
+
+    // The restart costs about half a second for YouTube; allow for a slow
+    // network, then a few ticks to confirm it keeps counting up from there.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    let after = recorder.0.progress.lock().unwrap().clone();
+    eprintln!("errors after seek: {errors:?}");
+    eprintln!("positions after seek: {after:?}");
+
+    if errors.iter().any(skippable) {
+        eprintln!("SKIP: upstream/environment condition ({errors:?})");
+        return;
+    }
+    assert!(errors.is_empty(), "seeking a stream reported errors: {errors:?}");
+
+    assert!(
+        after.iter().any(|p| *p >= TARGET_SECS),
+        "position never reached the seek target; the offset is being dropped \
+         and the bar would snap back to zero (got {after:?})"
+    );
+    assert!(
+        after.iter().all(|p| *p >= TARGET_SECS - 1.0),
+        "position fell back below the seek target (got {after:?})"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The native path must keep working: a local file seeks in place, with no
+/// process restart and therefore no offset.
+#[tokio::test]
+async fn a_local_file_still_seeks_natively() {
+    let base = std::env::temp_dir().join("music-app-local-seek");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let wav = base.join("tone.wav");
+    write_wav(&wav);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state) \
+         VALUES ('local', 'Tone', ?, 'present')",
+    )
+    .bind(wav.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let track_id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None);
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    if recorder
+        .0
+        .errors
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.contains("No audio output device"))
+    {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    recorder.0.progress.lock().unwrap().clear();
+    handle.send(PlayerCommand::Seek(2.0)).unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let after = recorder.0.progress.lock().unwrap().clone();
+    eprintln!("positions after seek: {after:?}");
+
+    assert!(
+        after.iter().any(|p| *p >= 2.0),
+        "a local seek should land at the target (got {after:?})"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}

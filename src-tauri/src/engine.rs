@@ -16,7 +16,19 @@ use crate::transcode::{FfmpegInput, FfmpegSource};
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Ceiling on how long a caller waits for the thread to answer.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Must exceed `transcode::PREFILL_TIMEOUT`: opening a stream legitimately
+/// blocks the thread for that long, and a shorter ceiling here would report
+/// "the audio thread did not respond" for a track that then starts playing
+/// perfectly well.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(20);
+
+// Enforced rather than trusted to a comment: shortening one of these without
+// the other reintroduces exactly that bug.
+const _: () = assert!(
+    REPLY_TIMEOUT.as_secs() > crate::transcode::PREFILL_TIMEOUT.as_secs(),
+    "a caller must not give up before a stream is allowed to start"
+);
 
 /// What the engine reports upwards. It never decides anything -- the
 /// coordinator owns every policy question.
@@ -155,6 +167,8 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
     // must be remembered here and re-applied on every start. Otherwise it
     // silently resets to full on each queue advance.
     let mut volume = 1.0f32;
+    // What is loaded, kept so a seek can rebuild the decode from a new offset.
+    let mut loaded: Option<Loaded> = None;
 
     loop {
         match rx.recv_timeout(POLL_INTERVAL) {
@@ -164,7 +178,9 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                 reply,
             }) => {
                 let result = match &device {
-                    Ok(sink) => start(sink, &source, volume, ffmpeg.as_deref()),
+                    Ok(sink) => {
+                        start(sink, &source, volume, ffmpeg.as_deref(), Duration::ZERO)
+                    }
                     Err(e) => Err(e.clone()),
                 };
 
@@ -175,6 +191,10 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                         // `append` alone would queue the new track behind it.
                         player = Some(new_player);
                         epoch = Some(new_epoch);
+                        loaded = Some(Loaded {
+                            source,
+                            offset: Duration::ZERO,
+                        });
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
@@ -200,6 +220,7 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                 // mistake a deliberate stop for a track finishing.
                 epoch = None;
                 player = None;
+                loaded = None;
             }
 
             Ok(Command::SetVolume(linear)) => {
@@ -210,17 +231,18 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
             }
 
             Ok(Command::Position { reply }) => {
-                let position = player.as_ref().map_or(Duration::ZERO, |p| p.get_pos());
-                let _ = reply.send(position);
+                let _ = reply.send(position_of(&player, &loaded));
             }
 
             Ok(Command::Seek { position, reply }) => {
-                let result = match &player {
-                    Some(p) => p
-                        .try_seek(position)
-                        .map_err(|e| format!("Could not seek in this track: {e}")),
-                    None => Err("Nothing is playing.".to_string()),
-                };
+                let result = seek(
+                    device.as_ref(),
+                    &mut player,
+                    &mut loaded,
+                    position,
+                    volume,
+                    ffmpeg.as_deref(),
+                );
                 let _ = reply.send(result);
             }
 
@@ -235,7 +257,7 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                     } else if !p.is_paused() {
                         let _ = events.send(EngineEvent::Progress {
                             epoch: current,
-                            position: p.get_pos(),
+                            position: position_of(&player, &loaded),
                         });
                     }
                 }
@@ -247,17 +269,107 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
     }
 }
 
+/// What the thread is currently playing, retained so a seek can rebuild it.
+struct Loaded {
+    source: PlayableSource,
+    /// Where the current decode was started from.
+    ///
+    /// A restarted ffmpeg reports its own position from zero, so this is what
+    /// keeps the position the *track's*, not the process's.
+    offset: Duration,
+}
+
+/// Position within the track, as opposed to within the current decode.
+fn position_of(player: &Option<Player>, loaded: &Option<Loaded>) -> Duration {
+    let within = player.as_ref().map_or(Duration::ZERO, |p| p.get_pos());
+    let offset = loaded.as_ref().map_or(Duration::ZERO, |l| l.offset);
+    offset + within
+}
+
+/// Jumps to `position`, restarting the decoder when the source cannot seek.
+///
+/// Local files seek natively and instantly. Everything ffmpeg decodes -- Opus
+/// files, and every remote stream -- cannot: `FfmpegSource` reads a pipe, and
+/// rodio would drive `try_seek` from the audio callback thread where spawning
+/// a process is not allowed. So the decode is restarted here instead, on the
+/// engine thread, against the URL already in hand. Re-resolving through yt-dlp
+/// would add seconds; reusing the resolved URL costs about 0.4s for YouTube
+/// and 2s for SoundCloud's HLS.
+fn seek(
+    device: Result<&rodio::MixerDeviceSink, &String>,
+    player: &mut Option<Player>,
+    loaded: &mut Option<Loaded>,
+    position: Duration,
+    volume: f32,
+    ffmpeg: Option<&Path>,
+) -> Result<(), String> {
+    if player.is_none() {
+        return Err("Nothing is playing.".to_string());
+    }
+
+    // Native seek first: a local file rewinds in place with no process work,
+    // and this is the overwhelmingly common case.
+    if let Some(p) = player.as_ref() {
+        if p.try_seek(position).is_ok() {
+            if let Some(l) = loaded.as_mut() {
+                l.offset = Duration::ZERO;
+            }
+            return Ok(());
+        }
+    }
+
+    // Not seekable in place, so rebuild the decode from the new offset.
+    let Some(l) = loaded.as_mut() else {
+        return Err("Nothing is playing.".to_string());
+    };
+    let sink = device.map_err(|e| e.clone())?;
+
+    // Pause rather than drop: if the rebuild fails, the track is still loaded
+    // and can simply resume. Dropping first would turn a failed seek into
+    // silence with nothing to recover.
+    let was_paused = player.as_ref().is_some_and(|p| p.is_paused());
+    if let Some(p) = player.as_ref() {
+        p.pause();
+    }
+
+    match start(sink, &l.source, volume, ffmpeg, position) {
+        Ok(replacement) => {
+            // Seeking while paused must not start playback.
+            if was_paused {
+                replacement.pause();
+            }
+            // Assigning drops the old player, so the two are never audible at
+            // once -- the old one has been silent since the pause above.
+            *player = Some(replacement);
+            l.offset = position;
+            Ok(())
+        }
+        Err(e) => {
+            if !was_paused {
+                if let Some(p) = player.as_ref() {
+                    p.play();
+                }
+            }
+            Err(e)
+        }
+    }
+}
+
 fn start(
     sink: &rodio::MixerDeviceSink,
     source: &PlayableSource,
     volume: f32,
     ffmpeg: Option<&Path>,
+    start_at: Duration,
 ) -> Result<Player, String> {
     let player = Player::connect_new(sink.mixer());
     player.set_volume(volume);
 
     match source {
-        PlayableSource::LocalFile(path) => match native_decoder(path) {
+        // A non-zero start means rodio's own seek was unavailable, so skip the
+        // native decoder -- it can only begin at zero -- and let ffmpeg start
+        // wherever it was asked to.
+        PlayableSource::LocalFile(path) if start_at.is_zero() => match native_decoder(path) {
             Ok(decoder) => player.append(decoder),
             // The seam's guess was wrong, or the file is something neither of
             // us anticipated. ffmpeg understands far more formats than rodio,
@@ -268,12 +380,16 @@ fn start(
             }
         },
 
-        PlayableSource::Transcoded(path) => {
+        PlayableSource::LocalFile(path) | PlayableSource::Transcoded(path) => {
             let ffmpeg = ffmpeg.ok_or(
                 "This file needs ffmpeg to play, and ffmpeg was not found. \
                  See src-tauri/binaries/README.md.",
             )?;
-            player.append(FfmpegSource::open(ffmpeg, FfmpegInput::File(path))?);
+            player.append(FfmpegSource::open_at(
+                ffmpeg,
+                FfmpegInput::File(path),
+                start_at,
+            )?);
         }
 
         PlayableSource::Stream(url) => {
@@ -281,7 +397,11 @@ fn start(
                 "Streaming needs ffmpeg, and ffmpeg was not found. \
                  See src-tauri/binaries/README.md.",
             )?;
-            player.append(FfmpegSource::open(ffmpeg, FfmpegInput::Url(url))?);
+            player.append(FfmpegSource::open_at(
+                ffmpeg,
+                FfmpegInput::Url(url),
+                start_at,
+            )?);
         }
     }
 

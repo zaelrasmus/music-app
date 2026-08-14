@@ -388,13 +388,25 @@ impl<E: PlayerEvents> Coordinator<E> {
             PlayerCommand::Seek(seconds) => {
                 if self.state != PlaybackState::Stopped {
                     let position = Duration::from_secs_f64(seconds.max(0.0));
+
+                    // A local file seeks in place, but anything ffmpeg decodes
+                    // has its decode restarted -- about 0.4s for a YouTube
+                    // stream, 2s for SoundCloud's HLS. Saying so beats leaving
+                    // the bar sitting on the old position looking frozen.
+                    // Pausing must survive the round trip, hence restoring the
+                    // previous state rather than assuming Playing.
+                    let resume_to = self.state;
+                    self.state = PlaybackState::Loading;
+                    self.emit_state();
+                    self.state = resume_to;
+
                     match self.engine.seek(position) {
                         // Echo the new position straight away rather than
                         // leaving the bar stale until the next tick.
                         Ok(()) => self.emit_progress(position),
                         Err(e) => {
-                            // Seeking is genuinely unsupported for some
-                            // sources; say so and carry on playing.
+                            // Some sources genuinely cannot be restarted --
+                            // say so and carry on playing from where we were.
                             self.events.error(e);
                         }
                     }

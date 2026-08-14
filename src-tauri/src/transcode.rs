@@ -23,7 +23,7 @@ const BUFFER_SAMPLES: usize = SAMPLES_PER_SECOND * 5;
 const PREFILL_SAMPLES: usize = SAMPLES_PER_SECOND / 2;
 
 /// How long to wait for ffmpeg to produce that first half second.
-const PREFILL_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const PREFILL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Enough of ffmpeg's stderr to explain a failure, and no more.
 const MAX_STDERR: usize = 4096;
@@ -55,6 +55,20 @@ pub enum FfmpegInput<'a> {
 impl FfmpegSource {
     /// Starts ffmpeg on `input` and waits for enough audio to begin smoothly.
     pub fn open(ffmpeg: &Path, input: FfmpegInput<'_>) -> Result<Self, String> {
+        Self::open_at(ffmpeg, input, Duration::ZERO)
+    }
+
+    /// Same, but beginning `start` into the audio.
+    ///
+    /// This is how seeking works for anything ffmpeg decodes. rodio drives
+    /// `try_seek` from the audio callback thread, where spawning a process
+    /// would stall playback, so the engine restarts the decode here instead
+    /// and tracks the offset itself.
+    pub fn open_at(
+        ffmpeg: &Path,
+        input: FfmpegInput<'_>,
+        start: Duration,
+    ) -> Result<Self, String> {
         let mut command = Command::new(ffmpeg);
         command.arg("-hide_banner").args(["-loglevel", "error"]);
 
@@ -65,6 +79,14 @@ impl FfmpegSource {
                 .args(["-reconnect", "1"])
                 .args(["-reconnect_streamed", "1"])
                 .args(["-reconnect_delay_max", "5"]);
+        }
+
+        if !start.is_zero() {
+            // Before `-i`, which makes this an *input* seek: ffmpeg jumps
+            // there via a range request or the container index. After `-i` it
+            // would instead decode and discard everything up to that point --
+            // correct, but many seconds of work for a four-minute seek.
+            command.args(["-ss", &format!("{:.3}", start.as_secs_f64())]);
         }
 
         command.arg("-i");
