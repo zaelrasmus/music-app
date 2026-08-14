@@ -24,10 +24,14 @@ use tauri::Manager;
 // DONE: queue, repeat, shuffle, volume/mute. The engine stays dumb; every
 //       policy decision lives in the coordinator, which is the sole owner of
 //       the queue.
+// DONE: seek + progress ticks + the real player bar.
+// DONE: playlists, tags, group-by-artist, FTS search, in-playlist filtering.
+// DONE: two-tier queue -- a consumed manual queue that outranks the context
+//       queue. Shuffle and repeat act on the context alone.
 //
-// TODO (7b): seek + progress ticks + the real player bar.
 // TODO: cover art extraction into `tracks.cover_path` (column already exists).
-// TODO: the polished, reactive track view -- grouping, tags, search.
+// TODO: removing tracks from the context preview (the permutation makes this
+//       more work than it looks; the preview is read-only for now).
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -93,6 +97,12 @@ pub fn run() {
             download::download_track,
             download::delete_download,
             player::play_queue,
+            player::play_next,
+            player::add_to_queue,
+            player::remove_from_queue,
+            player::reorder_queue,
+            player::clear_queue,
+            player::request_queue_state,
             player::toggle_play_pause,
             player::next_track,
             player::previous_track,

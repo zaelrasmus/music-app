@@ -74,7 +74,7 @@ class YoutubeSearchStore {
       await trackStore.load();
       // Resolving the stream takes seconds; the player reports `loading`
       // until audio actually starts.
-      await player.playQueue([trackId], 0);
+      await player.playQueue([trackId], 0, "YouTube search");
     } catch (e) {
       toast.error(String(e));
     } finally {

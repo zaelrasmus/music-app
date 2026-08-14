@@ -14,6 +14,7 @@
     import GripVerticalIcon from "@lucide/svelte/icons/grip-vertical";
     import SearchIcon from "@lucide/svelte/icons/search";
     import TagFilter from "$components/tag-filter.svelte";
+    import TrackActions from "$components/track-actions.svelte";
 
     let newName = $state("");
     let renaming = $state(false);
@@ -306,6 +307,11 @@
                         <span class="text-muted-foreground shrink-0 text-xs">
                             {formatDuration(track.durationSecs)}
                         </span>
+
+                        <TrackActions
+                            resolveTrackId={async () => track.id}
+                            label="Queue {track.title}"
+                        />
 
                         <Button
                             variant="ghost"

@@ -1,21 +1,30 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::Serialize;
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, SqlitePool};
 use tauri::{AppHandle, Emitter, Runtime, State};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::engine::{self, AudioEngine, EngineEvent};
 use crate::playable::{get_playable_source, PlayableTrack};
-use crate::queue::{Queue, RepeatMode};
+use crate::queue::{PlayerQueue, RepeatMode};
 
 pub const PLAYER_STATE_EVENT: &str = "player-state";
 pub const PLAYER_ERROR_EVENT: &str = "player-error";
 pub const PLAYER_PROGRESS_EVENT: &str = "player-progress";
+pub const PLAYER_QUEUE_EVENT: &str = "player-queue";
 
 /// Below this, Previous goes to the previous track; above it, Previous
 /// restarts the current one. Matches what every other player does.
 const RESTART_THRESHOLD: Duration = Duration::from_secs(3);
+
+/// How many upcoming context tracks the preview carries.
+///
+/// Capped because the context is often the whole library: shipping thousands
+/// of rows over IPC on every queue change to render a list nobody scrolls to
+/// the bottom of would be pure waste.
+const PREVIEW_LIMIT: usize = 50;
 
 /// Slider 0.0 maps to silence; everything above maps into this dB range.
 ///
@@ -59,8 +68,13 @@ pub struct PlayerStatus {
     /// The slider position (0..=1), not the amplitude sent to rodio.
     pub volume: f32,
     pub muted: bool,
-    pub queue_length: usize,
-    pub queue_position: usize,
+    /// Deliberately the *context*, not the total. The manual queue is not
+    /// positional -- "3 of 12" would be a lie the moment anything is queued.
+    pub context_length: usize,
+    pub context_position: usize,
+    /// Enough for a badge on the queue button without subscribing to the
+    /// heavier queue event.
+    pub manual_length: usize,
 }
 
 /// Sent frequently while playing, so it is deliberately small and separate
@@ -75,12 +89,59 @@ pub struct PlayerProgress {
     pub position_secs: f64,
 }
 
+/// A row in the queue panel, hydrated from the database.
+///
+/// The panel cannot look these up itself: a queued YouTube result may have
+/// been saved seconds ago and is not in whatever list the frontend has loaded.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueEntry {
+    /// Present only for manual entries -- they are the only removable,
+    /// reorderable rows, and this is what addresses them.
+    pub entry_id: Option<u64>,
+    pub track_id: i64,
+    pub title: String,
+    pub artist: Option<String>,
+    pub duration_secs: Option<i64>,
+    /// "present" / "missing" / "saved" / "downloaded", as in the library.
+    pub state: String,
+    pub source: String,
+}
+
+/// The whole "Up Next" panel in one payload.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueState {
+    pub current: Option<QueueEntry>,
+    /// Tracks the user explicitly queued, in play order.
+    pub manual: Vec<QueueEntry>,
+    /// Preview of the context continuation, capped at `PREVIEW_LIMIT`.
+    pub up_next: Vec<QueueEntry>,
+    pub context_name: Option<String>,
+    /// Context tracks beyond the preview, so the UI can say "and N more".
+    pub context_remaining: usize,
+}
+
 #[derive(Debug)]
 pub enum PlayerCommand {
     PlayQueue {
         track_ids: Vec<i64>,
         start_index: usize,
+        /// Shown as "Next from …". `None` leaves the heading generic.
+        context_name: Option<String>,
     },
+    /// Queue to the front — plays after the current track.
+    PlayNext(i64),
+    /// Queue to the back.
+    AddToQueue(i64),
+    RemoveFromQueue(u64),
+    ReorderQueue {
+        entry_id: u64,
+        to_index: usize,
+    },
+    ClearQueue,
+    /// Asks for a `player-queue` event, for a panel that just mounted.
+    RequestQueueState,
     TogglePlayPause,
     Next,
     Previous,
@@ -90,6 +151,20 @@ pub enum PlayerCommand {
     SetRepeat(RepeatMode),
     SetShuffle(bool),
     Seek(f64),
+}
+
+impl PlayerCommand {
+    /// Whether handling this can change what the queue panel shows.
+    ///
+    /// Volume and seek arrive per pixel of slider travel, and rebuilding the
+    /// queue payload costs a database round trip, so they are excluded rather
+    /// than emitting on everything.
+    fn affects_queue(&self) -> bool {
+        !matches!(
+            self,
+            PlayerCommand::SetVolume(_) | PlayerCommand::SetMuted(_) | PlayerCommand::Seek(_)
+        )
+    }
 }
 
 /// Where the coordinator reports to.
@@ -102,6 +177,7 @@ pub trait PlayerEvents: Send + Sync + 'static {
     fn state(&self, status: PlayerStatus);
     fn progress(&self, progress: PlayerProgress);
     fn error(&self, message: String);
+    fn queue(&self, queue: QueueState);
 }
 
 impl<R: Runtime> PlayerEvents for AppHandle<R> {
@@ -115,6 +191,10 @@ impl<R: Runtime> PlayerEvents for AppHandle<R> {
 
     fn error(&self, message: String) {
         let _ = self.emit(PLAYER_ERROR_EVENT, message);
+    }
+
+    fn queue(&self, queue: QueueState) {
+        let _ = self.emit(PLAYER_QUEUE_EVENT, queue);
     }
 }
 
@@ -138,8 +218,12 @@ impl PlayerHandle {
 /// frontend sends commands, but only this task mutates the queue, so a track
 /// ending at the same moment the user presses Next cannot advance twice.
 struct Coordinator<E: PlayerEvents> {
-    queue: Queue,
+    queue: PlayerQueue,
     state: PlaybackState,
+    /// The track the engine actually holds decoded, which is not always
+    /// `queue.current()` -- during resolution the queue has already moved on.
+    /// Only equality with this makes a rewind safe instead of a reload.
+    loaded: Option<i64>,
     volume: f32,
     muted: bool,
     /// Incremented on every start. The engine echoes it back so a `Finished`
@@ -167,8 +251,9 @@ pub fn spawn<E: PlayerEvents>(
 
     tauri::async_runtime::spawn(async move {
         Coordinator {
-            queue: Queue::default(),
+            queue: PlayerQueue::default(),
             state: PlaybackState::Stopped,
+            loaded: None,
             volume: 1.0,
             muted: false,
             epoch: 0,
@@ -200,14 +285,42 @@ impl<E: PlayerEvents> Coordinator<E> {
     }
 
     async fn handle_command(&mut self, command: PlayerCommand) {
+        let affects_queue = command.affects_queue();
+
         match command {
             PlayerCommand::PlayQueue {
                 track_ids,
                 start_index,
+                context_name,
             } => {
-                self.queue.set(track_ids, start_index);
-                self.start_current().await;
+                // Deliberately does not clear the manual queue: tracks the
+                // user interposed are a separate intention from "play this
+                // playlist".
+                let target = self.queue.set_context(track_ids, start_index, context_name);
+                self.start(target).await;
             }
+
+            PlayerCommand::PlayNext(track_id) => {
+                self.queue.enqueue_next(track_id);
+                self.start_if_idle().await;
+            }
+
+            PlayerCommand::AddToQueue(track_id) => {
+                self.queue.enqueue_last(track_id);
+                self.start_if_idle().await;
+            }
+
+            PlayerCommand::RemoveFromQueue(entry_id) => {
+                self.queue.remove_manual(entry_id);
+            }
+
+            PlayerCommand::ReorderQueue { entry_id, to_index } => {
+                self.queue.reorder_manual(entry_id, to_index);
+            }
+
+            PlayerCommand::ClearQueue => self.queue.clear_manual(),
+
+            PlayerCommand::RequestQueueState => {}
 
             PlayerCommand::TogglePlayPause => match self.state {
                 PlaybackState::Playing => {
@@ -222,15 +335,17 @@ impl<E: PlayerEvents> Coordinator<E> {
                 }
                 // Nothing loaded, or still resolving: start from the cursor.
                 PlaybackState::Stopped | PlaybackState::Loading => {
-                    self.start_current().await
+                    let target = self.queue.current();
+                    self.start(target).await;
                 }
             },
 
             PlayerCommand::Next => {
-                if self.queue.next_manual().is_some() {
-                    self.start_current().await;
-                } else {
-                    self.halt();
+                // The same call the natural end uses, so pressing Next and
+                // letting a track run out cannot disagree about what is next.
+                match self.queue.on_next() {
+                    Some(track_id) => self.start(Some(track_id)).await,
+                    None => self.halt(),
                 }
             }
 
@@ -240,10 +355,13 @@ impl<E: PlayerEvents> Coordinator<E> {
                 let restart = self.state != PlaybackState::Stopped
                     && self.engine.position() > RESTART_THRESHOLD;
 
-                if !restart {
-                    self.queue.previous_manual();
-                }
-                self.start_current().await;
+                let target = if restart {
+                    self.queue.current()
+                } else {
+                    self.queue.on_previous()
+                };
+
+                self.rewind_or_start(target).await;
             }
 
             PlayerCommand::Stop => self.halt(),
@@ -263,8 +381,8 @@ impl<E: PlayerEvents> Coordinator<E> {
                 self.apply_volume();
             }
 
+            // Both change the preview, so both re-emit the queue.
             PlayerCommand::SetRepeat(mode) => self.queue.set_repeat(mode),
-
             PlayerCommand::SetShuffle(on) => self.queue.set_shuffle(on),
 
             PlayerCommand::Seek(seconds) => {
@@ -285,6 +403,9 @@ impl<E: PlayerEvents> Coordinator<E> {
         }
 
         self.emit_state();
+        if affects_queue {
+            self.emit_queue().await;
+        }
     }
 
     async fn handle_engine_event(&mut self, event: EngineEvent) {
@@ -297,13 +418,17 @@ impl<E: PlayerEvents> Coordinator<E> {
                     return;
                 }
 
-                if self.queue.advance_natural().is_some() {
-                    self.start_current().await;
-                } else {
-                    self.halt();
+                // The engine dropped its player, so nothing is decoded any
+                // more; a rewind is not available even for repeat-one.
+                self.loaded = None;
+
+                match self.queue.on_finished() {
+                    Some(track_id) => self.start(Some(track_id)).await,
+                    None => self.halt(),
                 }
 
                 self.emit_state();
+                self.emit_queue().await;
             }
 
             EngineEvent::Progress { epoch, position } => {
@@ -316,24 +441,63 @@ impl<E: PlayerEvents> Coordinator<E> {
         }
     }
 
-    /// Plays the track at the cursor, skipping over ones that will not resolve.
+    /// Queueing something while nothing is playing should start playing it.
+    ///
+    /// Without this, "add to queue" on a fresh launch appears to do nothing:
+    /// there is no context to advance into, so nothing would ever pick the
+    /// entry up.
+    async fn start_if_idle(&mut self) {
+        if self.state != PlaybackState::Stopped {
+            return;
+        }
+        if let Some(track_id) = self.queue.on_next() {
+            self.start(Some(track_id)).await;
+        }
+    }
+
+    /// Restarts `target` if it is already decoded, otherwise loads it.
+    ///
+    /// Reloading to go back to the start of a track costs a full resolve --
+    /// for a YouTube track that is another yt-dlp round trip, seconds of
+    /// silence to rewind something already in hand.
+    async fn rewind_or_start(&mut self, target: Option<i64>) {
+        let already_loaded =
+            target.is_some() && target == self.loaded && self.state != PlaybackState::Stopped;
+
+        if already_loaded {
+            match self.engine.seek(Duration::ZERO) {
+                Ok(()) => {
+                    self.emit_progress(Duration::ZERO);
+                    return;
+                }
+                // Streams cannot seek at all -- `FfmpegSource` has no
+                // `try_seek` -- so for them reloading *is* the rewind. Falling
+                // through is the whole point of not reporting this error.
+                Err(_) => {}
+            }
+        }
+
+        self.start(target).await;
+    }
+
+    /// Plays `first`, skipping over tracks that will not resolve.
     ///
     /// A queue can contain tracks whose files vanished since the last scan.
     /// Stopping dead on the first would be worse than skipping, but skipping
     /// must be bounded or a queue of entirely missing tracks would spin
-    /// forever -- with repeat on, `next_manual` never returns `None`.
-    async fn start_current(&mut self) {
+    /// forever -- with repeat on, the context never runs out.
+    async fn start(&mut self, first: Option<i64>) {
         // Bounded far below the queue length on purpose. A local file fails
         // instantly, but resolving a YouTube stream takes ~7 seconds, so
         // walking a long queue of dead links would freeze playback for
         // minutes with no explanation.
         const MAX_ATTEMPTS: usize = 3;
 
-        let attempts_allowed = self.queue.len().clamp(1, MAX_ATTEMPTS);
+        let mut candidate = first;
         let mut last_error = None;
 
-        for _ in 0..attempts_allowed {
-            let Some(track_id) = self.queue.current() else {
+        for _ in 0..MAX_ATTEMPTS {
+            let Some(track_id) = candidate else {
                 break;
             };
 
@@ -347,6 +511,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                     self.epoch += 1;
                     match self.engine.play(source, self.epoch) {
                         Ok(()) => {
+                            self.loaded = Some(track_id);
                             self.state = PlaybackState::Playing;
                             self.apply_volume();
                             // Reset the bar immediately; the first tick is up
@@ -360,9 +525,10 @@ impl<E: PlayerEvents> Coordinator<E> {
                 Err(e) => last_error = Some(e),
             }
 
-            if self.queue.next_manual().is_none() {
-                break;
-            }
+            // Skipping a dead track goes through the same priority rule as a
+            // natural end, so an unplayable context track cannot swallow the
+            // tracks the user queued behind it.
+            candidate = self.queue.on_next();
         }
 
         self.halt();
@@ -398,6 +564,7 @@ impl<E: PlayerEvents> Coordinator<E> {
         // discarded rather than triggering an advance.
         self.epoch += 1;
         self.state = PlaybackState::Stopped;
+        self.loaded = None;
         self.report(self.engine.stop());
     }
 
@@ -427,14 +594,129 @@ impl<E: PlayerEvents> Coordinator<E> {
     fn emit_state(&self) {
         self.events.state(PlayerStatus {
             state: self.state,
-            track_id: self.queue.current().filter(|_| !self.queue.is_empty()),
+            track_id: self.queue.current(),
             repeat: self.queue.repeat(),
             shuffle: self.queue.is_shuffled(),
             volume: self.volume,
             muted: self.muted,
-            queue_length: self.queue.len(),
-            queue_position: self.queue.position(),
+            context_length: self.queue.context_len(),
+            context_position: self.queue.context_position(),
+            manual_length: self.queue.manual_len(),
         });
+    }
+
+    async fn emit_queue(&self) {
+        self.events.queue(self.queue_state().await);
+    }
+
+    /// Builds the panel payload, hydrating titles in one query.
+    async fn queue_state(&self) -> QueueState {
+        let manual: Vec<(Option<u64>, i64)> = self
+            .queue
+            .manual()
+            .map(|entry| (Some(entry.entry_id), entry.track_id))
+            .collect();
+        let up_next = self.queue.context_upcoming(PREVIEW_LIMIT);
+        let current = self.queue.current();
+
+        let mut ids: Vec<i64> = manual.iter().map(|(_, id)| *id).collect();
+        ids.extend(up_next.iter().copied());
+        ids.extend(current);
+        ids.sort_unstable();
+        ids.dedup();
+
+        let details = self.load_details(&ids).await;
+
+        QueueState {
+            current: current.map(|id| entry_for(&details, None, id)),
+            manual: manual
+                .into_iter()
+                .map(|(entry_id, id)| entry_for(&details, entry_id, id))
+                .collect(),
+            up_next: up_next
+                .iter()
+                .map(|&id| entry_for(&details, None, id))
+                .collect(),
+            context_name: self.queue.context_name().map(str::to_owned),
+            context_remaining: self
+                .queue
+                .context_upcoming_total()
+                .saturating_sub(up_next.len()),
+        }
+    }
+
+    async fn load_details(&self, ids: &[i64]) -> HashMap<i64, TrackDetail> {
+        if ids.is_empty() {
+            return HashMap::new();
+        }
+
+        let mut builder = QueryBuilder::new(
+            "SELECT id, source, title, artist, duration_secs, state FROM tracks WHERE id IN (",
+        );
+        let mut separated = builder.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+        builder.push(")");
+
+        let rows = match builder.build().fetch_all(&self.pool).await {
+            Ok(rows) => rows,
+            // The panel is cosmetic; a failed lookup should not take playback
+            // down with it. Every row falls back to its placeholder.
+            Err(_) => return HashMap::new(),
+        };
+
+        rows.into_iter()
+            .map(|row| {
+                let id: i64 = row.get("id");
+                (
+                    id,
+                    TrackDetail {
+                        source: row.get("source"),
+                        title: row.get("title"),
+                        artist: row.get("artist"),
+                        duration_secs: row.get("duration_secs"),
+                        state: row.get("state"),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+struct TrackDetail {
+    source: String,
+    title: String,
+    artist: Option<String>,
+    duration_secs: Option<i64>,
+    state: String,
+}
+
+/// Turns an id into a row, keeping deleted tracks visible.
+///
+/// A queued track whose row has since been deleted still occupies a slot in
+/// the queue, and silently dropping it would leave the panel disagreeing with
+/// what actually plays.
+fn entry_for(details: &HashMap<i64, TrackDetail>, entry_id: Option<u64>, track_id: i64) -> QueueEntry {
+    match details.get(&track_id) {
+        Some(detail) => QueueEntry {
+            entry_id,
+            track_id,
+            title: detail.title.clone(),
+            artist: detail.artist.clone(),
+            duration_secs: detail.duration_secs,
+            state: detail.state.clone(),
+            source: detail.source.clone(),
+        },
+        None => QueueEntry {
+            entry_id,
+            track_id,
+            title: "Unavailable".to_string(),
+            artist: None,
+            duration_secs: None,
+            state: "missing".to_string(),
+            source: "local".to_string(),
+        },
     }
 }
 
@@ -448,12 +730,52 @@ impl<E: PlayerEvents> Coordinator<E> {
 pub async fn play_queue(
     track_ids: Vec<i64>,
     start_index: usize,
+    context_name: Option<String>,
     player: State<'_, PlayerHandle>,
 ) -> Result<(), String> {
     player.send(PlayerCommand::PlayQueue {
         track_ids,
         start_index,
+        context_name,
     })
+}
+
+#[tauri::command]
+pub async fn play_next(track_id: i64, player: State<'_, PlayerHandle>) -> Result<(), String> {
+    player.send(PlayerCommand::PlayNext(track_id))
+}
+
+#[tauri::command]
+pub async fn add_to_queue(track_id: i64, player: State<'_, PlayerHandle>) -> Result<(), String> {
+    player.send(PlayerCommand::AddToQueue(track_id))
+}
+
+#[tauri::command]
+pub async fn remove_from_queue(entry_id: u64, player: State<'_, PlayerHandle>) -> Result<(), String> {
+    player.send(PlayerCommand::RemoveFromQueue(entry_id))
+}
+
+#[tauri::command]
+pub async fn reorder_queue(
+    entry_id: u64,
+    to_index: usize,
+    player: State<'_, PlayerHandle>,
+) -> Result<(), String> {
+    player.send(PlayerCommand::ReorderQueue { entry_id, to_index })
+}
+
+#[tauri::command]
+pub async fn clear_queue(player: State<'_, PlayerHandle>) -> Result<(), String> {
+    player.send(PlayerCommand::ClearQueue)
+}
+
+/// Asks the coordinator to re-emit `player-queue`.
+///
+/// Deliberately not a return value: the panel already listens for the event,
+/// and having two ways to learn the same thing is how they drift apart.
+#[tauri::command]
+pub async fn request_queue_state(player: State<'_, PlayerHandle>) -> Result<(), String> {
+    player.send(PlayerCommand::RequestQueueState)
 }
 
 #[tauri::command]
@@ -537,5 +859,22 @@ mod tests {
             assert!(value > previous, "volume must never dip as the slider rises");
             previous = value;
         }
+    }
+
+    #[test]
+    fn the_high_frequency_commands_do_not_rebuild_the_queue_payload() {
+        // Volume arrives per pixel of slider travel; rebuilding the panel
+        // payload costs a database round trip each time.
+        assert!(!PlayerCommand::SetVolume(0.5).affects_queue());
+        assert!(!PlayerCommand::SetMuted(true).affects_queue());
+        assert!(!PlayerCommand::Seek(12.0).affects_queue());
+    }
+
+    #[test]
+    fn shuffle_and_repeat_do_rebuild_it() {
+        // Both change what the "Next from …" preview should show.
+        assert!(PlayerCommand::SetShuffle(true).affects_queue());
+        assert!(PlayerCommand::SetRepeat(RepeatMode::All).affects_queue());
+        assert!(PlayerCommand::AddToQueue(1).affects_queue());
     }
 }

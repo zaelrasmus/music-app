@@ -2,7 +2,9 @@
     import { Button } from "$components/ui/button";
     import { Slider } from "$components/ui/slider";
     import { player } from "$lib/player.svelte";
+    import { queueStore } from "$lib/queue.svelte";
     import { trackStore } from "$lib/tracks.svelte";
+    import ListMusicIcon from "@lucide/svelte/icons/list-music";
     import PlayIcon from "@lucide/svelte/icons/play";
     import PauseIcon from "@lucide/svelte/icons/pause";
     import SkipBackIcon from "@lucide/svelte/icons/skip-back";
@@ -15,8 +17,16 @@
     import VolumeXIcon from "@lucide/svelte/icons/volume-x";
     import LoaderIcon from "@lucide/svelte/icons/loader-circle";
 
+    /**
+     * The backend hydrates the queue payload itself, so it knows about a
+     * YouTube result saved seconds ago that the library list has not reloaded
+     * yet. `trackStore` is the fallback for the moment before the first queue
+     * event arrives.
+     */
     const nowPlaying = $derived(
-        trackStore.tracks.find((t) => t.id === player.trackId) ?? null,
+        queueStore.current ??
+            trackStore.tracks.find((t) => t.id === player.trackId) ??
+            null,
     );
 
     // Total comes from the scanned tag, not from rodio, whose total_duration
@@ -179,13 +189,35 @@
                 />
             </div>
 
-            {#if player.queueLength > 0}
-                <span
-                    class="text-muted-foreground w-12 shrink-0 text-right text-xs tabular-nums"
+            <div class="flex shrink-0 items-center gap-1">
+                <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Up next"
+                    title="Up next"
+                    aria-pressed={queueStore.open}
+                    class={queueStore.open ? "text-primary" : ""}
+                    onclick={() => queueStore.toggle()}
                 >
-                    {player.queuePosition + 1}/{player.queueLength}
-                </span>
-            {/if}
+                    <ListMusicIcon />
+                </Button>
+
+                {#if player.manualLength > 0}
+                    <!-- The queue is the thing worth a badge; the context
+                         position is not, and would read as a total. -->
+                    <span
+                        class="bg-primary text-primary-foreground rounded-full px-1.5 text-[10px] tabular-nums"
+                    >
+                        {player.manualLength}
+                    </span>
+                {:else if player.contextLength > 0}
+                    <span
+                        class="text-muted-foreground w-12 text-right text-xs tabular-nums"
+                    >
+                        {player.contextPosition + 1}/{player.contextLength}
+                    </span>
+                {/if}
+            </div>
         </div>
     </div>
 </div>

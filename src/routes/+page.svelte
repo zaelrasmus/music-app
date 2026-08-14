@@ -10,6 +10,7 @@
     import { playlistStore } from "$lib/playlists.svelte";
     import { tagStore } from "$lib/tags.svelte";
     import { libraryView } from "$lib/library-view.svelte";
+    import { queueStore } from "$lib/queue.svelte";
     import FolderPlusIcon from "@lucide/svelte/icons/folder-plus";
     import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
     import Trash2Icon from "@lucide/svelte/icons/trash-2";
@@ -24,10 +25,12 @@
 
         const scans = trackStore.listenForScans();
         const playback = player.listenForPlayer();
+        const queue = queueStore.listenForQueue();
 
         return () => {
             scans.then((off) => off());
             playback.then((off) => off());
+            queue.then((off) => off());
         };
     });
 

@@ -6,6 +6,7 @@
     import PlayIcon from "@lucide/svelte/icons/play";
     import LoaderIcon from "@lucide/svelte/icons/loader-circle";
     import AddToPlaylist from "$components/add-to-playlist.svelte";
+    import TrackActions from "$components/track-actions.svelte";
 
     /** Whole minutes and seconds; hours only when there are hours. */
     function formatDuration(secs: number | null) {
@@ -118,6 +119,13 @@
                             {/if}
                         </span>
                     </div>
+
+                    <!-- Queueing saves the result first: the queue holds track
+                         ids, and a search result is not a track yet. -->
+                    <TrackActions
+                        resolveTrackId={() => youtubeSearch.saveResult(result)}
+                        label="Queue {result.title}"
+                    />
 
                     <AddToPlaylist
                         resolveTrackId={() => youtubeSearch.saveResult(result)}

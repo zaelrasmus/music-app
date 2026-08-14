@@ -8,13 +8,16 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use music_app_lib::player::{self, PlayerCommand, PlayerEvents, PlayerProgress, PlayerStatus};
+use music_app_lib::player::{
+    self, PlayerCommand, PlayerEvents, PlayerProgress, PlayerStatus, QueueState,
+};
 
 #[derive(Default)]
 struct Captured {
     progress: Mutex<Vec<f64>>,
     states: Mutex<Vec<PlayerStatus>>,
     errors: Mutex<Vec<String>>,
+    queues: Mutex<Vec<QueueState>>,
 }
 
 /// Newtype so the impl is local (orphan rule).
@@ -32,6 +35,10 @@ impl PlayerEvents for Recorder {
 
     fn error(&self, message: String) {
         self.0.errors.lock().unwrap().push(message);
+    }
+
+    fn queue(&self, queue: QueueState) {
+        self.0.queues.lock().unwrap().push(queue);
     }
 }
 
@@ -92,6 +99,7 @@ async fn progress_reaches_the_ui_while_a_track_plays() {
         .send(PlayerCommand::PlayQueue {
             track_ids: vec![track_id],
             start_index: 0,
+            context_name: None,
         })
         .unwrap();
 
@@ -177,6 +185,7 @@ async fn an_opus_file_plays_through_ffmpeg() {
         .send(PlayerCommand::PlayQueue {
             track_ids: vec![track_id],
             start_index: 0,
+            context_name: None,
         })
         .unwrap();
 
@@ -246,6 +255,7 @@ async fn a_saved_youtube_track_streams() {
         .send(PlayerCommand::PlayQueue {
             track_ids: vec![track_id],
             start_index: 0,
+            context_name: None,
         })
         .unwrap();
 

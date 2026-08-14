@@ -2,6 +2,7 @@
 	import './layout.css';
 	import { Toaster } from "$components/ui/sonner/index.js";
 	import PlayerBar from "$components/player-bar.svelte";
+	import QueuePanel from "$components/queue-panel.svelte";
 
 	const { children } = $props();
 </script>
@@ -13,4 +14,6 @@
 	{@render children()}
 </div>
 
+<!-- Both are fixed to the viewport; the panel sits above the bar. -->
+<QueuePanel />
 <PlayerBar />

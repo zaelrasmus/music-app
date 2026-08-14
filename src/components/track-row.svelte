@@ -2,6 +2,7 @@
     import { Button } from "$components/ui/button";
     import { Input } from "$components/ui/input";
     import AddToPlaylist from "$components/add-to-playlist.svelte";
+    import TrackActions from "$components/track-actions.svelte";
     import { player } from "$lib/player.svelte";
     import { trackStore, type Track } from "$lib/tracks.svelte";
     import { tagStore } from "$lib/tags.svelte";
@@ -17,12 +18,19 @@
 
     interface Props {
         track: Track;
-        /** Ids forming the queue when this row is played, in display order. */
+        /** Ids forming the context when this row is played, in display order. */
         queueIds: number[];
         index: number;
+        /** Shown as "Next from …" in the queue panel. */
+        contextName?: string;
     }
 
-    let { track, queueIds, index }: Props = $props();
+    let {
+        track,
+        queueIds,
+        index,
+        contextName = "your library",
+    }: Props = $props();
 
     const isCurrent = $derived(player.isCurrent(track.id));
     const isPlaying = $derived(isCurrent && player.state === "playing");
@@ -79,7 +87,7 @@
             onclick={() =>
                 isCurrent
                     ? player.togglePlayPause()
-                    : player.playQueue(queueIds, index)}
+                    : player.playQueue(queueIds, index, contextName)}
         >
             {#if isPlaying}
                 <PauseIcon />
@@ -157,6 +165,11 @@
             >
                 <TagIcon />
             </Button>
+
+            <TrackActions
+                resolveTrackId={async () => track.id}
+                label="Queue {track.title}"
+            />
 
             <AddToPlaylist
                 resolveTrackId={async () => track.id}

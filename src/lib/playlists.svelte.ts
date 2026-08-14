@@ -211,6 +211,7 @@ class PlaylistStore {
     await player.playQueue(
       this.open.tracks.map((t) => t.id),
       startIndex,
+      this.open.playlist.name,
     );
   }
 }

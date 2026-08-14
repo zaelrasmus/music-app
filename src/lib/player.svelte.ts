@@ -14,8 +14,13 @@ export type PlayerStatus = {
   shuffle: boolean;
   volume: number;
   muted: boolean;
-  queueLength: number;
-  queuePosition: number;
+  /**
+   * The *context* queue, not the total. The manual queue is not positional,
+   * so "3 of 12" would be a lie the moment anything is queued.
+   */
+  contextLength: number;
+  contextPosition: number;
+  manualLength: number;
 };
 
 export type PlayerProgress = {
@@ -41,8 +46,9 @@ class PlayerStore {
   shuffle = $state(false);
   volume = $state(1);
   muted = $state(false);
-  queueLength = $state(0);
-  queuePosition = $state(0);
+  contextLength = $state(0);
+  contextPosition = $state(0);
+  manualLength = $state(0);
 
   /** Authoritative position from the backend, in seconds. */
   positionSecs = $state(0);
@@ -79,8 +85,9 @@ class PlayerStore {
       this.shuffle = s.shuffle;
       this.volume = s.volume;
       this.muted = s.muted;
-      this.queueLength = s.queueLength;
-      this.queuePosition = s.queuePosition;
+      this.contextLength = s.contextLength;
+      this.contextPosition = s.contextPosition;
+      this.manualLength = s.manualLength;
 
       if (s.state === "stopped") this.positionSecs = 0;
     });
@@ -138,9 +145,31 @@ class PlayerStore {
     }
   }
 
-  /** Plays `trackIds` as the queue, starting at `startIndex`. */
-  async playQueue(trackIds: number[], startIndex: number) {
-    await this.run("play_queue", { trackIds, startIndex });
+  /**
+   * Replaces the *context* queue and starts playing at `startIndex`.
+   *
+   * Deliberately leaves the manual queue alone — tracks the user queued are a
+   * separate intention from "play this playlist", and losing them because
+   * they clicked something else is the behaviour people notice.
+   *
+   * `contextName` is the "Next from …" heading.
+   */
+  async playQueue(trackIds: number[], startIndex: number, contextName?: string) {
+    await this.run("play_queue", {
+      trackIds,
+      startIndex,
+      contextName: contextName ?? null,
+    });
+  }
+
+  /** Queues `trackId` to play right after the current track. */
+  async playNext(trackId: number) {
+    await this.run("play_next", { trackId });
+  }
+
+  /** Queues `trackId` behind everything already queued. */
+  async addToQueue(trackId: number) {
+    await this.run("add_to_queue", { trackId });
   }
 
   async togglePlayPause() {
