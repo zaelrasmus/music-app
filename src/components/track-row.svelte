@@ -3,6 +3,7 @@
     import { Input } from "$components/ui/input";
     import AddToPlaylist from "$components/add-to-playlist.svelte";
     import TrackActions from "$components/track-actions.svelte";
+    import SourceBadge from "$components/source-badge.svelte";
     import { player } from "$lib/player.svelte";
     import { trackStore, type Track } from "$lib/tracks.svelte";
     import { tagStore } from "$lib/tags.svelte";
@@ -134,23 +135,11 @@
                 <span class="text-muted-foreground">
                     — {track.artist ?? "Unknown artist"}
                 </span>
-                {#if track.state === "missing"}
-                    <span class="text-muted-foreground text-xs">(missing)</span>
-                {:else if track.state === "saved"}
-                    <span
-                        class="text-muted-foreground border-muted-foreground/40 ml-1 rounded border px-1 text-[10px]"
-                        title="Streams from YouTube; needs internet"
-                    >
-                        streaming
-                    </span>
-                {:else if track.state === "downloaded"}
-                    <span
-                        class="text-primary border-primary/40 ml-1 rounded border px-1 text-[10px]"
-                        title="Saved to disk; plays offline"
-                    >
-                        offline
-                    </span>
-                {/if}
+                <SourceBadge
+                    source={track.source}
+                    state={track.state}
+                    durationSecs={track.durationSecs}
+                />
             </span>
 
             <span class="text-muted-foreground shrink-0 text-xs">
@@ -185,7 +174,9 @@
                 <PencilIcon />
             </Button>
 
-            {#if track.source === "youtube"}
+            <!-- Any provider track can be downloaded for offline playback;
+                 only local files have nothing to fetch. -->
+            {#if track.source !== "local"}
                 {#if track.state === "saved"}
                     <Button
                         variant="ghost"

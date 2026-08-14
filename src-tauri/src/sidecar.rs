@@ -7,9 +7,8 @@ use tauri::{AppHandle, Manager};
 pub enum Tool {
     /// Search and stream/download resolution.
     YtDlp,
-    /// Decoding anything rodio cannot handle natively (Opus, chiefly).
-    /// Wired up in Part B; declared here so resolution has one home.
-    #[allow(dead_code)]
+    /// Decoding anything rodio cannot handle natively: Opus files, and every
+    /// remote stream.
     Ffmpeg,
 }
 
@@ -27,23 +26,9 @@ const EXE_SUFFIX: &str = ".exe";
 #[cfg(not(windows))]
 const EXE_SUFFIX: &str = "";
 
-/// Where a tool was found. Useful in errors -- "yt-dlp is missing" is much less
-/// helpful than knowing which locations were tried.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Origin {
-    /// A newer copy the user (or the app) dropped in app data.
-    AppData,
-    /// The copy bundled with the app.
-    Bundled,
-    /// Found on PATH. Convenient in development; not something a shipped app
-    /// should rely on, since the version is unknown.
-    Path,
-}
-
 #[derive(Debug, Clone)]
 pub struct Resolved {
     pub path: PathBuf,
-    pub origin: Origin,
 }
 
 /// Finds `tool`, preferring the most up-to-date copy.
@@ -65,27 +50,18 @@ pub fn resolve(app: &AppHandle, tool: Tool) -> Result<Resolved, String> {
     if let Ok(dir) = app.path().app_data_dir() {
         let candidate = dir.join("bin").join(&file_name);
         if is_executable_file(&candidate) {
-            return Ok(Resolved {
-                path: candidate,
-                origin: Origin::AppData,
-            });
+            return Ok(Resolved { path: candidate });
         }
     }
 
     for candidate in bundled_candidates(tool, &file_name) {
         if is_executable_file(&candidate) {
-            return Ok(Resolved {
-                path: candidate,
-                origin: Origin::Bundled,
-            });
+            return Ok(Resolved { path: candidate });
         }
     }
 
     if let Some(candidate) = find_on_path(&file_name) {
-        return Ok(Resolved {
-            path: candidate,
-            origin: Origin::Path,
-        });
+        return Ok(Resolved { path: candidate });
     }
 
     Err(format!(

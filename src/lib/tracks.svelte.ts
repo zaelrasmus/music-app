@@ -5,7 +5,7 @@ import { libraryView } from "$lib/library-view.svelte";
 
 export type Track = {
   id: number;
-  source: "local" | "youtube";
+  source: "local" | "youtube" | "soundcloud";
   title: string;
   artist: string | null;
   album: string | null;

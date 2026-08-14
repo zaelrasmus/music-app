@@ -3,8 +3,22 @@ import { toast } from "svelte-sonner";
 import { player } from "$lib/player.svelte";
 import { trackStore } from "$lib/tracks.svelte";
 
+export type Provider = "youtube" | "soundcloud";
+
+/** One entry in the provider picker, as the backend lists them. */
+export type ProviderInfo = {
+  id: Provider;
+  name: string;
+};
+
 export type SearchResult = {
-  videoId: string;
+  provider: Provider;
+  remoteId: string;
+  /**
+   * The provider's page. Stored, not derived — SoundCloud URLs embed the
+   * uploader's handle and cannot be rebuilt from the numeric id.
+   */
+  remoteUrl: string;
   title: string;
   channel: string | null;
   durationSecs: number | null;
@@ -20,7 +34,25 @@ export type SearchResult = {
  */
 const DEBOUNCE_MS = 450;
 
-class YoutubeSearchStore {
+/**
+ * SoundCloud hands back a 30-second snippet for Go+ gated uploads, and reports
+ * the *snippet's* length as the duration.
+ *
+ * There is a definitive signal — the resolved format id ends in `_preview` —
+ * but reading it costs a full per-track lookup, seconds each, which would make
+ * a 15-result search unusable. So this infers from the duration instead, and
+ * the badge says "likely" rather than asserting: a genuinely 30-second upload
+ * would look identical here.
+ */
+export function looksLikePreview(result: SearchResult) {
+  return result.provider === "soundcloud" && result.durationSecs === 30;
+}
+
+class ProviderSearchStore {
+  /** Filled from the backend so the enum stays the single source of truth. */
+  providers = $state<ProviderInfo[]>([]);
+  provider = $state<Provider>("youtube");
+
   query = $state("");
   results = $state<SearchResult[]>([]);
   searching = $state(false);
@@ -35,6 +67,41 @@ class YoutubeSearchStore {
    */
   #latestRequest = 0;
   #debounce: ReturnType<typeof setTimeout> | undefined;
+
+  async loadProviders() {
+    try {
+      this.providers = await invoke<ProviderInfo[]>("list_providers");
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
+  get providerName() {
+    return (
+      this.providers.find((p) => p.id === this.provider)?.name ?? "YouTube"
+    );
+  }
+
+  /**
+   * Switches service and re-runs the current query.
+   *
+   * Results are cleared first: they belong to the old provider, and leaving
+   * them on screen under the new one's label for the several seconds a search
+   * takes would be actively misleading.
+   */
+  async setProvider(provider: Provider) {
+    if (provider === this.provider) return;
+
+    this.provider = provider;
+    this.results = [];
+    this.searched = false;
+    this.error = null;
+
+    if (this.query.trim() !== "") {
+      clearTimeout(this.#debounce);
+      await this.search(this.query);
+    }
+  }
 
   /** Called on every keystroke. */
   queueSearch(query: string) {
@@ -61,20 +128,20 @@ class YoutubeSearchStore {
   /**
    * Saves a result as a `saved` track and plays it.
    *
-   * Saving is idempotent by video id, so picking the same result twice reuses
+   * Saving is idempotent per provider, so picking the same result twice reuses
    * the existing track rather than duplicating it — which also means play
    * counts and any edited title survive.
    */
   async playResult(result: SearchResult) {
-    this.saving = result.videoId;
+    this.saving = result.remoteId;
 
     try {
-      const trackId = await invoke<number>("save_youtube_track", { result });
+      const trackId = await invoke<number>("save_remote_track", { result });
       // It is a library track now, so the list below should show it.
       await trackStore.load();
       // Resolving the stream takes seconds; the player reports `loading`
       // until audio actually starts.
-      await player.playQueue([trackId], 0, "YouTube search");
+      await player.playQueue([trackId], 0, `${this.providerName} search`);
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -85,14 +152,14 @@ class YoutubeSearchStore {
   /**
    * Saves a result as a track without playing it, returning its id.
    *
-   * This is what makes "add a YouTube result to a playlist" work: the result
-   * becomes an ordinary track first, and from then on nothing downstream can
-   * tell it apart from a local one.
+   * This is what makes "queue a search result" and "add one to a playlist"
+   * work: the result becomes an ordinary track first, and from then on nothing
+   * downstream can tell it apart from a local one.
    */
   async saveResult(result: SearchResult): Promise<number | null> {
-    this.saving = result.videoId;
+    this.saving = result.remoteId;
     try {
-      const trackId = await invoke<number>("save_youtube_track", { result });
+      const trackId = await invoke<number>("save_remote_track", { result });
       await trackStore.load();
       return trackId;
     } catch (e) {
@@ -116,7 +183,8 @@ class YoutubeSearchStore {
     this.error = null;
 
     try {
-      const results = await invoke<SearchResult[]>("search_youtube", {
+      const results = await invoke<SearchResult[]>("search_provider", {
+        provider: this.provider,
         query,
         limit: 15,
       });
@@ -136,4 +204,4 @@ class YoutubeSearchStore {
   }
 }
 
-export const youtubeSearch = new YoutubeSearchStore();
+export const providerSearch = new ProviderSearchStore();

@@ -229,10 +229,11 @@ async fn a_saved_youtube_track_streams() {
 
     let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
 
-    // Metadata only, exactly as `save_youtube_track` writes it: no local_path.
+    // Metadata only, exactly as `save_remote_track` writes it: no local_path.
     sqlx::query(
-        "INSERT INTO tracks (source, title, state, yt_video_id) \
-         VALUES ('youtube', 'Never Gonna Give You Up', 'saved', 'dQw4w9WgXcQ')",
+        "INSERT INTO tracks (source, title, state, remote_id, remote_url) \
+         VALUES ('youtube', 'Never Gonna Give You Up', 'saved', 'dQw4w9WgXcQ', \
+                 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')",
     )
     .execute(&db.pool)
     .await
@@ -288,6 +289,80 @@ async fn a_saved_youtube_track_streams() {
     assert!(
         progress.iter().any(|p| *p > 0.0),
         "the stream never advanced past zero (got {progress:?})"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The Part A acceptance criterion: a `saved` SoundCloud track becomes audio.
+///
+/// Nothing here is YouTube-shaped -- a numeric id, a stored page URL that
+/// could not have been derived from it, and `source = 'soundcloud'`. If this
+/// plays, the generalised schema and the provider-driven seam are both real.
+#[tokio::test]
+async fn a_saved_soundcloud_track_streams() {
+    let base = std::env::temp_dir().join("music-app-soundcloud-stream");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO tracks (source, title, state, remote_id, remote_url) \
+         VALUES ('soundcloud', 'One More Time', 'saved', '199428706', \
+                 'https://soundcloud.com/daft-punk-id/daft-punk-one-more-time')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let track_id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        Some(std::path::PathBuf::from("ffmpeg")),
+        Some(std::path::PathBuf::from("yt-dlp")),
+    );
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // SoundCloud hands back an HLS playlist, so ffmpeg has segments to pull
+    // before any audio flows.
+    tokio::time::sleep(Duration::from_secs(25)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    let progress = recorder.0.progress.lock().unwrap().clone();
+    eprintln!("errors:   {errors:?}");
+    eprintln!("progress: {progress:?}");
+
+    let skippable = |e: &String| {
+        e.contains("No audio output device")
+            || e.contains("internet connection")
+            || e.contains("Could not find yt-dlp")
+            || e.contains("Could not start")
+            || e.contains("no longer available")
+    };
+    if errors.iter().any(skippable) {
+        eprintln!("SKIP: upstream/environment condition, not a pipeline failure");
+        return;
+    }
+
+    assert!(errors.is_empty(), "streaming reported errors: {errors:?}");
+    assert!(
+        progress.iter().any(|p| *p > 0.0),
+        "the SoundCloud stream never advanced past zero (got {progress:?})"
     );
 
     db.pool.close().await;

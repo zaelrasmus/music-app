@@ -540,7 +540,7 @@ impl<E: PlayerEvents> Coordinator<E> {
 
     async fn resolve(&self, track_id: i64) -> Result<crate::playable::PlayableSource, String> {
         let row =
-            sqlx::query("SELECT source, state, local_path, yt_video_id FROM tracks WHERE id = ?")
+            sqlx::query("SELECT source, state, local_path, remote_url FROM tracks WHERE id = ?")
                 .bind(track_id)
                 .fetch_optional(&self.pool)
                 .await
@@ -552,7 +552,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                 source: row.get("source"),
                 state: row.get("state"),
                 local_path: row.get("local_path"),
-                yt_video_id: row.get("yt_video_id"),
+                remote_url: row.get("remote_url"),
             },
             self.yt_dlp.as_deref(),
         )

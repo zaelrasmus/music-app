@@ -5,6 +5,7 @@ mod library;
 mod playable;
 mod playlists;
 pub mod player;
+mod providers;
 mod queue;
 mod scanner;
 mod search;
@@ -112,10 +113,9 @@ pub fn run() {
             player::set_repeat,
             player::set_shuffle,
             player::seek,
-            youtube::search_youtube,
-            youtube::save_youtube_track,
-            youtube::debug_yt_dlp_version,
-            youtube::debug_video_metadata,
+            providers::list_providers,
+            youtube::search_provider,
+            youtube::save_remote_track,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

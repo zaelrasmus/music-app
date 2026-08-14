@@ -1,6 +1,7 @@
 <script lang="ts">
     import { Button } from "$components/ui/button";
-    import { queueStore } from "$lib/queue.svelte";
+    import { queueStore, type QueueEntry } from "$lib/queue.svelte";
+    import SourceBadge from "$components/source-badge.svelte";
     import { player } from "$lib/player.svelte";
     import XIcon from "@lucide/svelte/icons/x";
     import GripVerticalIcon from "@lucide/svelte/icons/grip-vertical";
@@ -40,26 +41,15 @@
     );
 </script>
 
-{#snippet badge(state: string)}
-    <!-- Unavailable tracks stay listed, marked. Hiding them would make the
-         panel disagree with what actually plays. -->
-    {#if state === "missing"}
-        <span class="text-muted-foreground text-[10px]">(unavailable)</span>
-    {:else if state === "saved"}
-        <span
-            class="text-muted-foreground border-muted-foreground/40 rounded border px-1 text-[10px]"
-            title="Streams from YouTube; needs internet"
-        >
-            streaming
-        </span>
-    {:else if state === "downloaded"}
-        <span
-            class="text-primary border-primary/40 rounded border px-1 text-[10px]"
-            title="Saved to disk; plays offline"
-        >
-            offline
-        </span>
-    {/if}
+<!-- Unavailable tracks stay listed, marked. Hiding them would make the panel
+     disagree with what actually plays. -->
+{#snippet badge(entry: QueueEntry)}
+    <SourceBadge
+        source={entry.source}
+        state={entry.state}
+        durationSecs={entry.durationSecs}
+        compact
+    />
 {/snippet}
 
 {#if queueStore.open}
@@ -97,7 +87,7 @@
                                 — {queueStore.current.artist ?? "Unknown artist"}
                             </span>
                         </span>
-                        {@render badge(queueStore.current.state)}
+                        {@render badge(queueStore.current)}
                     </div>
                 </section>
             {/if}
@@ -162,7 +152,7 @@
                                     </span>
                                 </span>
 
-                                {@render badge(entry.state)}
+                                {@render badge(entry)}
 
                                 <span
                                     class="text-muted-foreground shrink-0 text-[11px] tabular-nums"
@@ -215,7 +205,7 @@
                                     </span>
                                 </span>
 
-                                {@render badge(entry.state)}
+                                {@render badge(entry)}
 
                                 <span
                                     class="text-muted-foreground shrink-0 tabular-nums"

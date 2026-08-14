@@ -307,8 +307,9 @@ async fn a_playlist_can_mix_local_downloaded_and_streamed_tracks() {
     .unwrap();
 
     let downloaded: i64 = sqlx::query_scalar(
-        "INSERT INTO tracks (source, title, state, yt_video_id, local_path)
-         VALUES ('youtube', 'Downloaded', 'downloaded', 'aaaaaaaaaaa', 'D:\\b.m4a')
+        "INSERT INTO tracks (source, title, state, remote_id, remote_url, local_path)
+         VALUES ('youtube', 'Downloaded', 'downloaded', 'aaaaaaaaaaa',
+                 'https://www.youtube.com/watch?v=aaaaaaaaaaa', 'D:\\b.m4a')
          RETURNING id",
     )
     .fetch_one(&db.pool)
@@ -316,8 +317,9 @@ async fn a_playlist_can_mix_local_downloaded_and_streamed_tracks() {
     .unwrap();
 
     let streamed: i64 = sqlx::query_scalar(
-        "INSERT INTO tracks (source, title, state, yt_video_id)
-         VALUES ('youtube', 'Streamed', 'saved', 'bbbbbbbbbbb') RETURNING id",
+        "INSERT INTO tracks (source, title, state, remote_id, remote_url)
+         VALUES ('youtube', 'Streamed', 'saved', 'bbbbbbbbbbb',
+                 'https://www.youtube.com/watch?v=bbbbbbbbbbb') RETURNING id",
     )
     .fetch_one(&db.pool)
     .await

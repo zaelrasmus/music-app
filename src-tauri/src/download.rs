@@ -7,6 +7,7 @@ use sqlx::Row;
 use tauri::{AppHandle, Manager, State};
 
 use crate::db::Db;
+use crate::providers::Provider;
 use crate::sidecar::{self, Tool};
 
 /// Tracks currently downloading, so a double-click cannot start two writes to
@@ -85,7 +86,7 @@ pub async fn download_track(
 ) -> Result<(), String> {
     let _guard = downloads.try_claim(track_id)?;
 
-    let row = sqlx::query("SELECT source, state, yt_video_id FROM tracks WHERE id = ?")
+    let row = sqlx::query("SELECT source, state, remote_id, remote_url FROM tracks WHERE id = ?")
         .bind(track_id)
         .fetch_optional(&db.pool)
         .await
@@ -94,21 +95,34 @@ pub async fn download_track(
 
     let source: String = row.get("source");
     let state: String = row.get("state");
-    let video_id: Option<String> = row.get("yt_video_id");
+    let remote_id: Option<String> = row.get("remote_id");
+    let remote_url: Option<String> = row.get("remote_url");
 
-    if source != "youtube" {
-        return Err("Only YouTube tracks can be downloaded.".to_string());
-    }
+    let provider =
+        Provider::from_source(&source).ok_or("Only tracks from a provider can be downloaded.")?;
     if state == "downloaded" {
         return Err("That track is already downloaded.".to_string());
     }
-    let video_id = video_id.ok_or("That track has no YouTube id recorded.")?;
+
+    let remote_id = remote_id.ok_or("That track has no provider id recorded.")?;
+    let remote_url = remote_url.ok_or("That track has no source URL recorded.")?;
+    if !provider.accepts_url(&remote_url) {
+        return Err(format!(
+            "That track's stored {} link does not look valid.",
+            provider.display_name()
+        ));
+    }
 
     let yt_dlp = sidecar::resolve(&app, Tool::YtDlp)?.path;
     let ffmpeg = sidecar::resolve(&app, Tool::Ffmpeg)?.path;
     let dir = downloads_dir(&app)?;
 
-    let (final_path, partial_path) = fetch_with_retries(&yt_dlp, &ffmpeg, &video_id, &dir).await?;
+    // Names are keyed by provider *and* id: SoundCloud ids are plain integers,
+    // so an id alone could collide with another provider's in one directory.
+    let name_key = format!("{}-{}", provider.as_str(), remote_id);
+
+    let (final_path, partial_path) =
+        fetch_with_retries(&yt_dlp, &ffmpeg, &remote_url, &name_key, &dir).await?;
 
     // Only now does the file become the real one, so an interrupted download
     // can never be mistaken for a complete track.
@@ -150,16 +164,17 @@ const FETCH_ATTEMPTS: usize = 3;
 async fn fetch_with_retries(
     yt_dlp: &Path,
     ffmpeg: &Path,
-    video_id: &str,
+    page_url: &str,
+    name_key: &str,
     dir: &Path,
 ) -> Result<(PathBuf, PathBuf), String> {
     let mut last_error = String::new();
 
     for attempt in 1..=FETCH_ATTEMPTS {
-        let (url, extension) = resolve_format(yt_dlp.to_path_buf(), video_id).await?;
+        let (url, extension) = resolve_format(yt_dlp.to_path_buf(), page_url).await?;
 
-        let final_path = dir.join(final_file_name(video_id, &extension));
-        let partial_path = dir.join(partial_file_name(video_id, &extension));
+        let final_path = dir.join(final_file_name(name_key, &extension));
+        let partial_path = dir.join(partial_file_name(name_key, &extension));
 
         match copy_stream(ffmpeg.to_path_buf(), &url, &partial_path).await {
             Ok(()) => return Ok((final_path, partial_path)),
@@ -188,8 +203,8 @@ async fn fetch_with_retries(
 ///
 /// Both in one invocation: yt-dlp takes seconds to start, and asking twice
 /// would also risk the two answers describing different formats.
-async fn resolve_format(yt_dlp: PathBuf, video_id: &str) -> Result<(String, String), String> {
-    let url = format!("https://www.youtube.com/watch?v={video_id}");
+async fn resolve_format(yt_dlp: PathBuf, page_url: &str) -> Result<(String, String), String> {
+    let url = page_url.to_string();
 
     let output = tauri::async_runtime::spawn_blocking(move || {
         Command::new(&yt_dlp)
@@ -258,10 +273,10 @@ async fn copy_stream(ffmpeg: PathBuf, url: &str, destination: &Path) -> Result<(
 }
 
 /// Where the finished download lives.
-fn final_file_name(video_id: &str, extension: &str) -> String {
-    // Named by video id, never by title: titles contain `:` `?` `|` `*` `"`,
-    // all illegal in Windows filenames, and two uploads can share a title.
-    format!("{video_id}.{extension}")
+fn final_file_name(name_key: &str, extension: &str) -> String {
+    // Named by provider and id, never by title: titles contain `:` `?` `|` `*`
+    // `"`, all illegal in Windows filenames, and two uploads can share a title.
+    format!("{name_key}.{extension}")
 }
 
 /// Where a download lives while it is still arriving.
@@ -269,8 +284,8 @@ fn final_file_name(video_id: &str, extension: &str) -> String {
 /// The extension has to stay **last**. ffmpeg chooses its output muxer from the
 /// filename, so a name ending in `.part` leaves it nothing to infer from and it
 /// refuses to start: "Unable to choose an output format".
-fn partial_file_name(video_id: &str, extension: &str) -> String {
-    format!("{video_id}.part.{extension}")
+fn partial_file_name(name_key: &str, extension: &str) -> String {
+    format!("{name_key}.part.{extension}")
 }
 
 /// yt-dlp's `ext` reaches a filename, so it must not carry separators.
@@ -302,8 +317,8 @@ pub async fn delete_download(db: State<'_, Db>, track_id: i64) -> Result<(), Str
         .ok_or("That track no longer exists.")?;
 
     let source: String = row.get("source");
-    if source != "youtube" {
-        return Err("Only downloaded YouTube tracks can be removed this way.".to_string());
+    if Provider::from_source(&source).is_none() {
+        return Err("Only downloaded provider tracks can be removed this way.".to_string());
     }
 
     if let Some(path) = row.get::<Option<String>, _>("local_path") {
@@ -366,8 +381,18 @@ mod tests {
     }
 
     #[test]
-    fn the_finished_file_is_named_by_video_id() {
+    fn the_finished_file_is_named_by_its_key() {
         assert_eq!(final_file_name("cQ95BBVO3I8", "webm"), "cQ95BBVO3I8.webm");
+    }
+
+    /// Provider-scoped, matching the database's `(source, remote_id)`
+    /// uniqueness. SoundCloud ids are plain integers, so keying files on the id
+    /// alone could put two providers' tracks at the same path.
+    #[test]
+    fn two_providers_sharing_an_id_get_different_files() {
+        let a = final_file_name("soundcloud-199428706", "m4a");
+        let b = final_file_name("bandcamp-199428706", "m4a");
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -407,7 +432,8 @@ mod network_tests {
             // Both tools come off PATH here; the app resolves them via `sidecar`.
             Path::new("yt-dlp"),
             Path::new("ffmpeg"),
-            "dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "youtube-dQw4w9WgXcQ",
             &dir,
         )
         .await;

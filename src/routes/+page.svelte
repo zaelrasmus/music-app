@@ -4,7 +4,8 @@
     import { library } from "$lib/library.svelte";
     import { trackStore } from "$lib/tracks.svelte";
     import { player } from "$lib/player.svelte";
-    import YoutubeSearch from "$components/youtube-search.svelte";
+    import ProviderSearch from "$components/provider-search.svelte";
+    import { providerSearch } from "$lib/provider-search.svelte";
     import PlaylistsPanel from "$components/playlists-panel.svelte";
     import LibraryView from "$components/library-view.svelte";
     import { playlistStore } from "$lib/playlists.svelte";
@@ -21,6 +22,7 @@
         playlistStore.load();
         tagStore.load();
         libraryView.refresh();
+        providerSearch.loadProviders();
         player.restorePreferences();
 
         const scans = trackStore.listenForScans();
@@ -123,7 +125,7 @@
 
     <PlaylistsPanel />
 
-    <YoutubeSearch />
+    <ProviderSearch />
 
     <LibraryView />
 </main>
