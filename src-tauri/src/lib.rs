@@ -3,10 +3,13 @@ mod download;
 mod engine;
 mod library;
 mod playable;
+mod playlists;
 pub mod player;
 mod queue;
 mod scanner;
+mod search;
 mod sidecar;
+mod tags;
 mod transcode;
 mod tracks;
 mod youtube;
@@ -71,6 +74,22 @@ pub fn run() {
             tracks::list_tracks,
             tracks::rescan_library,
             tracks::update_track_metadata,
+            playlists::create_playlist,
+            playlists::rename_playlist,
+            playlists::delete_playlist,
+            playlists::list_playlists,
+            playlists::get_playlist,
+            playlists::add_tracks_to_playlist,
+            playlists::remove_track_from_playlist,
+            playlists::reorder_playlist_track,
+            tags::assign_tag,
+            tags::remove_tag_from_track,
+            tags::list_tags,
+            tags::list_track_tags,
+            tags::rename_tag,
+            tags::delete_tag,
+            search::query_library,
+            search::group_tracks_by_artist,
             download::download_track,
             download::delete_download,
             player::play_queue,

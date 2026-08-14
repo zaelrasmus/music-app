@@ -5,6 +5,7 @@
     import SearchIcon from "@lucide/svelte/icons/search";
     import PlayIcon from "@lucide/svelte/icons/play";
     import LoaderIcon from "@lucide/svelte/icons/loader-circle";
+    import AddToPlaylist from "$components/add-to-playlist.svelte";
 
     /** Whole minutes and seconds; hours only when there are hours. */
     function formatDuration(secs: number | null) {
@@ -117,6 +118,11 @@
                             {/if}
                         </span>
                     </div>
+
+                    <AddToPlaylist
+                        resolveTrackId={() => youtubeSearch.saveResult(result)}
+                        label="Add {result.title} to a playlist"
+                    />
 
                     <Button
                         variant="ghost"

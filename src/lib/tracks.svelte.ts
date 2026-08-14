@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "svelte-sonner";
+import { libraryView } from "$lib/library-view.svelte";
 
 export type Track = {
   id: number;
@@ -45,6 +46,9 @@ class TrackStore {
     try {
       this.tracks = await invoke<Track[]>("list_tracks");
       this.error = null;
+      // The library view runs its own filtered query, so it will not see an
+      // edit, download or scan unless it is told to look again.
+      await libraryView.refresh();
     } catch (e) {
       this.error = String(e);
     }

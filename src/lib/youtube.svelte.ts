@@ -82,6 +82,27 @@ class YoutubeSearchStore {
     }
   }
 
+  /**
+   * Saves a result as a track without playing it, returning its id.
+   *
+   * This is what makes "add a YouTube result to a playlist" work: the result
+   * becomes an ordinary track first, and from then on nothing downstream can
+   * tell it apart from a local one.
+   */
+  async saveResult(result: SearchResult): Promise<number | null> {
+    this.saving = result.videoId;
+    try {
+      const trackId = await invoke<number>("save_youtube_track", { result });
+      await trackStore.load();
+      return trackId;
+    } catch (e) {
+      toast.error(String(e));
+      return null;
+    } finally {
+      this.saving = null;
+    }
+  }
+
   /** Runs immediately — for the Enter key. */
   async searchNow() {
     clearTimeout(this.#debounce);
