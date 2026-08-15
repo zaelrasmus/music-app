@@ -1,14 +1,13 @@
 <script lang="ts">
-    import { Button } from "$components/ui/button";
     import PageShell from "$components/page-shell.svelte";
+    import ListHeader from "$components/list-header.svelte";
     import EmptyState from "$components/empty-state.svelte";
     import TrackRow from "$components/track-row.svelte";
     import { historyStore } from "$lib/history.svelte";
     import { cacheStore } from "$lib/cache.svelte";
     import { player } from "$lib/player.svelte";
+    import { formatTotal } from "$lib/duration";
     import HistoryIcon from "@lucide/svelte/icons/history";
-    import PlayIcon from "@lucide/svelte/icons/play";
-    import WifiOffIcon from "@lucide/svelte/icons/wifi-off";
 
     /**
      * Playing from history queues the whole list in the order shown, so it
@@ -33,36 +32,43 @@
     );
 
     const total = $derived(historyStore.tracks.length);
+
+    const totalSecs = $derived(
+        historyStore.tracks.reduce((sum, t) => sum + (t.durationSecs ?? 0), 0),
+    );
+
+    async function shuffle() {
+        if (total === 0) return;
+        if (!player.shuffle) await player.toggleShuffle();
+        await player.playQueue(
+            queueIds,
+            Math.floor(Math.random() * total),
+            "recently played",
+        );
+    }
 </script>
 
-<PageShell
-    title="Recently played"
-    badge={total > 0 ? `${total}` : null}
-    subtitle="Tracks appear here once you have listened to a fair part of them — not everything you skipped past."
->
-    {#snippet actions()}
-        <Button
-            size="sm"
-            disabled={total === 0}
-            onclick={() => player.playQueue(queueIds, 0, "recently played")}
+<PageShell>
+    {#snippet hero()}
+        <ListHeader
+            eyebrow="History"
+            title="Recently played"
+            empty={total === 0}
+            meta={[
+                `${total} ${total === 1 ? "song" : "songs"}`,
+                formatTotal(totalSecs),
+                total > 0 ? `${offline} playable offline` : null,
+            ]}
+            onPlay={() => player.playQueue(queueIds, 0, "recently played")}
+            onShuffle={shuffle}
         >
-            <PlayIcon data-icon="inline-start" />
-            Play
-        </Button>
-    {/snippet}
-
-    {#snippet toolbar()}
-        {#if total > 0}
-            <p class="text-muted-foreground flex items-center gap-1.5 text-xs">
-                <WifiOffIcon class="text-signal size-3.5" />
-                <span>
-                    <span class="text-foreground font-medium tabular-nums">
-                        {offline} of {total}
-                    </span>
-                    would still play with no connection.
-                </span>
-            </p>
-        {/if}
+            {#snippet toolbar()}
+                <p class="text-muted-foreground text-xs">
+                    Tracks appear here once you have listened to a fair part of
+                    them — not everything you skipped past.
+                </p>
+            {/snippet}
+        </ListHeader>
     {/snippet}
 
     {#if total === 0}

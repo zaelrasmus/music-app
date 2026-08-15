@@ -13,6 +13,8 @@
     import LoaderIcon from "@lucide/svelte/icons/loader-circle";
     import SearchIcon from "@lucide/svelte/icons/search";
     import RadioIcon from "@lucide/svelte/icons/radio";
+    import PlusIcon from "@lucide/svelte/icons/plus";
+    import CheckIcon from "@lucide/svelte/icons/check";
 
     /** Whole minutes and seconds; hours only when there are hours. */
     function formatDuration(secs: number | null) {
@@ -139,6 +141,7 @@
                 {@const count = formatCount(result.viewCount, countNoun)}
                 {@const busy = providerSearch.saving === result.remoteId}
                 {@const preview = looksLikePreview(result)}
+                {@const inLibrary = providerSearch.added.has(result.remoteId)}
                 <li
                     class="group/result hover:bg-accent/50 flex items-start gap-3 rounded-lg px-2 py-2 transition-colors"
                 >
@@ -205,6 +208,40 @@
                             </span>
                         {/if}
                     </div>
+
+                    <!--
+                      The explicit gesture.
+
+                      Playing, queueing and adding to a playlist all create the
+                      track row, but none of them file it in the library —
+                      auditioning ten songs to find one should not leave nine
+                      behind. This button is the only thing here that says
+                      "keep it", which is why it is a button and not a menu
+                      item three clicks in.
+                    -->
+                    <button
+                        type="button"
+                        class="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full border px-3 text-xs font-medium transition-colors
+                               {inLibrary
+                            ? 'border-signal/40 text-signal cursor-default'
+                            : 'border-border hover:bg-accent'}"
+                        aria-label={inLibrary
+                            ? `${result.title} is in your library`
+                            : `Add ${result.title} to your library`}
+                        title={inLibrary
+                            ? "In your library"
+                            : "Add to your library. Playing a track does not do this — history is how you find one you did not keep."}
+                        disabled={inLibrary || busy}
+                        onclick={() => providerSearch.addToLibrary(result)}
+                    >
+                        {#if inLibrary}
+                            <CheckIcon class="size-3.5" />
+                            In library
+                        {:else}
+                            <PlusIcon class="size-3.5" />
+                            Add
+                        {/if}
+                    </button>
 
                     <!-- Queueing saves the result first: the queue holds track
                          ids, and a search result is not a track yet. -->

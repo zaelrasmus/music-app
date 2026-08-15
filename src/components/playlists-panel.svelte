@@ -2,6 +2,7 @@
     import { Button } from "$components/ui/button";
     import * as DropdownMenu from "$components/ui/dropdown-menu";
     import PageShell from "$components/page-shell.svelte";
+    import ListHeader from "$components/list-header.svelte";
     import EmptyState from "$components/empty-state.svelte";
     import SearchField from "$components/search-field.svelte";
     import TagFilter from "$components/tag-filter.svelte";
@@ -11,7 +12,9 @@
     import { player } from "$lib/player.svelte";
     import { nav } from "$lib/nav.svelte";
     import { promptFor } from "$lib/prompt.svelte";
-    import PlayIcon from "@lucide/svelte/icons/play";
+    import { open } from "@tauri-apps/plugin-dialog";
+    import { cacheStore } from "$lib/cache.svelte";
+    import { formatTotal } from "$lib/duration";
     import PlusIcon from "@lucide/svelte/icons/plus";
     import Trash2Icon from "@lucide/svelte/icons/trash-2";
     import PencilIcon from "@lucide/svelte/icons/pencil";
@@ -19,7 +22,8 @@
     import ChevronLeftIcon from "@lucide/svelte/icons/chevron-left";
     import ListMusicIcon from "@lucide/svelte/icons/list-music";
     import MoreHorizontalIcon from "@lucide/svelte/icons/more-horizontal";
-    import ShuffleIcon from "@lucide/svelte/icons/shuffle";
+    import ImageIcon from "@lucide/svelte/icons/image";
+    import ImageOffIcon from "@lucide/svelte/icons/image-off";
 
     /** Index currently being dragged, and the index it is hovering over. */
     let dragFrom = $state<number | null>(null);
@@ -76,6 +80,44 @@
             Math.floor(Math.random() * detail.tracks.length),
         );
     }
+
+    /**
+     * Picks an image for the open playlist.
+     *
+     * The file is copied into the cover store by the backend, not referenced
+     * where it sits — a path into someone's pictures folder would break the
+     * first time they moved it.
+     */
+    async function pickCover() {
+        if (!detail) return;
+
+        const picked = await open({
+            multiple: false,
+            directory: false,
+            filters: [
+                {
+                    name: "Images",
+                    extensions: ["jpg", "jpeg", "png", "webp", "gif", "bmp"],
+                },
+            ],
+        });
+        if (typeof picked !== "string") return;
+
+        await playlistStore.setCover(detail.playlist.id, picked);
+    }
+
+    const totalSecs = $derived(
+        (detail?.tracks ?? []).reduce((sum, t) => sum + (t.durationSecs ?? 0), 0),
+    );
+
+    const offline = $derived(
+        (detail?.tracks ?? []).filter(
+            (t) =>
+                t.state === "downloaded" ||
+                t.state === "present" ||
+                cacheStore.isCached(t.id),
+        ).length,
+    );
 </script>
 
 {#if !detail}
@@ -87,7 +129,7 @@
         subtitle="Local files and streamed tracks in the same list."
     >
         {#snippet actions()}
-            <Button size="sm" onclick={create}>
+            <Button size="sm" class="rounded-full" onclick={create}>
                 <PlusIcon data-icon="inline-start" />
                 New playlist
             </Button>
@@ -105,14 +147,21 @@
                 </Button>
             </EmptyState>
         {:else}
+            <!--
+              Art above the name, as in the demo's Library grid — but every
+              tile is the same rounded square. The demo mixed a circle and a
+              square in one grid, and those shapes already mean something
+              (a circle is a person, a square is a collection), so the mix read
+              as two different kinds of thing rather than as two playlists.
+            -->
             <ul
-                class="grid gap-2 px-2 [grid-template-columns:repeat(auto-fill,minmax(15rem,1fr))]"
+                class="grid gap-x-5 gap-y-6 px-3 [grid-template-columns:repeat(auto-fill,minmax(9.5rem,1fr))]"
             >
                 {#each playlistStore.playlists as playlist (playlist.id)}
                     <li class="group/card relative">
                         <button
                             type="button"
-                            class="bg-card hover:border-primary/40 hover:bg-accent/40 flex w-full items-center gap-3 rounded-lg border p-2.5 text-left transition-colors"
+                            class="flex w-full flex-col gap-2.5 text-left"
                             onclick={() => playlistStore.openPlaylist(playlist.id)}
                         >
                             <!-- The art is generated from the playlist's name,
@@ -120,28 +169,29 @@
                                  grid of otherwise identical cards. -->
                             <CoverArt
                                 seed={`playlist::${playlist.name}`}
-                                class="size-11"
+                                coverKey={playlist.coverKey}
+                                class="aspect-square w-full rounded-xl transition-transform group-hover/card:scale-[1.02]"
                                 glyph={false}
                             />
-                            <span class="flex min-w-0 flex-1 flex-col">
-                                <span class="truncate text-sm font-medium">
+                            <span class="flex min-w-0 flex-col gap-0.5">
+                                <span class="truncate text-[13px] font-medium">
                                     {playlist.name}
                                 </span>
                                 <span class="text-muted-foreground text-xs">
                                     {playlist.trackCount}
-                                    {playlist.trackCount === 1 ? "track" : "tracks"}
+                                    {playlist.trackCount === 1 ? "song" : "songs"}
                                 </span>
                             </span>
                         </button>
 
                         <button
                             type="button"
-                            class="text-muted-foreground hover:bg-accent hover:text-destructive absolute top-2 right-2 grid size-7 place-items-center rounded-md opacity-0 transition-opacity group-hover/card:opacity-100 focus-visible:opacity-100"
+                            class="text-white/80 hover:bg-black/70 hover:text-white absolute top-2 right-2 grid size-7 place-items-center rounded-full bg-black/50 opacity-0 backdrop-blur-sm transition-opacity group-hover/card:opacity-100 focus-visible:opacity-100"
                             aria-label="Delete {playlist.name}"
                             title="Delete {playlist.name}"
                             onclick={() => playlistStore.remove(playlist.id)}
                         >
-                            <Trash2Icon class="size-4" />
+                            <Trash2Icon class="size-3.5" />
                         </button>
                     </li>
                 {/each}
@@ -149,95 +199,113 @@
         {/if}
     </PageShell>
 {:else}
-    <PageShell
-        title={detail.playlist.name}
-        badge={playlistStore.filtering
-            ? `${detail.tracks.length} of ${detail.playlist.trackCount}`
-            : `${detail.playlist.trackCount}`}
-        subtitle={playlistStore.filtering
-            ? "Play uses the filtered list. Reordering is off while filtered, because a row's position here is not its position in the playlist."
-            : undefined}
-    >
-        {#snippet leading()}
-            <button
-                type="button"
-                class="text-muted-foreground hover:bg-accent hover:text-foreground grid size-8 place-items-center rounded-md transition-colors"
-                aria-label="Back to playlists"
-                onclick={() => playlistStore.close()}
+    <PageShell>
+        {#snippet hero()}
+            <ListHeader
+                eyebrow="Playlist"
+                title={detail.playlist.name}
+                cover={`playlist::${detail.playlist.name}`}
+                coverKey={detail.playlist.coverKey}
+                empty={detail.tracks.length === 0}
+                meta={[
+                    playlistStore.filtering
+                        ? `${detail.tracks.length} of ${detail.playlist.trackCount} shown`
+                        : `${detail.playlist.trackCount} ${
+                              detail.playlist.trackCount === 1 ? "song" : "songs"
+                          }`,
+                    formatTotal(totalSecs),
+                    detail.tracks.length > 0 ? `${offline} playable offline` : null,
+                ]}
+                onPlay={() => playlistStore.play(0)}
+                onShuffle={shuffle}
             >
-                <ChevronLeftIcon class="size-5" />
-            </button>
-        {/snippet}
-
-        {#snippet actions()}
-            <Button
-                variant="ghost"
-                size="sm"
-                disabled={detail.tracks.length === 0}
-                onclick={shuffle}
-            >
-                <ShuffleIcon data-icon="inline-start" />
-                Shuffle
-            </Button>
-            <Button
-                size="sm"
-                disabled={detail.tracks.length === 0}
-                onclick={() => playlistStore.play(0)}
-            >
-                <PlayIcon data-icon="inline-start" />
-                Play
-            </Button>
-
-            <DropdownMenu.Root>
-                <DropdownMenu.Trigger>
-                    {#snippet child({ props })}
-                        <button
-                            {...props}
-                            type="button"
-                            class="text-muted-foreground hover:bg-accent hover:text-foreground grid size-8 place-items-center rounded-md transition-colors"
-                            aria-label="Playlist options"
-                        >
-                            <MoreHorizontalIcon class="size-4" />
-                        </button>
-                    {/snippet}
-                </DropdownMenu.Trigger>
-                <DropdownMenu.Content align="end" class="w-48">
-                    <DropdownMenu.Item onSelect={rename}>
-                        <PencilIcon />
-                        Rename
-                    </DropdownMenu.Item>
-                    <DropdownMenu.Separator />
-                    <DropdownMenu.Item
-                        onSelect={async () => {
-                            await playlistStore.remove(detail.playlist.id);
-                            playlistStore.close();
-                        }}
+                {#snippet leading()}
+                    <button
+                        type="button"
+                        class="text-muted-foreground hover:bg-accent hover:text-foreground grid size-8 place-items-center rounded-full transition-colors"
+                        aria-label="Back to playlists"
+                        onclick={() => playlistStore.close()}
                     >
-                        <Trash2Icon />
-                        Delete playlist
-                    </DropdownMenu.Item>
-                </DropdownMenu.Content>
-            </DropdownMenu.Root>
-        {/snippet}
+                        <ChevronLeftIcon class="size-5" />
+                    </button>
+                {/snippet}
 
-        {#snippet toolbar()}
-            <!-- Filters this playlist only; the library keeps its own. -->
-            <SearchField
-                class="max-w-md"
-                value={playlistStore.query}
-                placeholder="Filter this playlist…"
-                oninput={(v) => playlistStore.setQuery(v)}
-            />
+                {#snippet actions()}
+                    <DropdownMenu.Root>
+                        <DropdownMenu.Trigger>
+                            {#snippet child({ props })}
+                                <button
+                                    {...props}
+                                    type="button"
+                                    class="text-muted-foreground hover:bg-accent hover:text-foreground grid size-9 place-items-center rounded-full border transition-colors"
+                                    aria-label="Playlist options"
+                                >
+                                    <MoreHorizontalIcon class="size-4" />
+                                </button>
+                            {/snippet}
+                        </DropdownMenu.Trigger>
+                        <DropdownMenu.Content align="end" class="w-52">
+                            <DropdownMenu.Item onSelect={rename}>
+                                <PencilIcon />
+                                Rename
+                            </DropdownMenu.Item>
+                            <DropdownMenu.Item onSelect={pickCover}>
+                                <ImageIcon />
+                                {detail.playlist.coverKey
+                                    ? "Change cover…"
+                                    : "Choose a cover…"}
+                            </DropdownMenu.Item>
+                            {#if detail.playlist.coverKey}
+                                <DropdownMenu.Item
+                                    onSelect={() =>
+                                        playlistStore.clearCover(detail.playlist.id)}
+                                >
+                                    <ImageOffIcon />
+                                    Use generated art
+                                </DropdownMenu.Item>
+                            {/if}
+                            <DropdownMenu.Separator />
+                            <DropdownMenu.Item
+                                onSelect={async () => {
+                                    await playlistStore.remove(detail.playlist.id);
+                                    playlistStore.close();
+                                }}
+                            >
+                                <Trash2Icon />
+                                Delete playlist
+                            </DropdownMenu.Item>
+                        </DropdownMenu.Content>
+                    </DropdownMenu.Root>
+                {/snippet}
 
-            <TagFilter
-                selectedIds={playlistStore.selectedTagIds}
-                mode={playlistStore.mode}
-                active={playlistStore.filtering}
-                onToggle={(id) => playlistStore.toggleTag(id)}
-                onModeChange={(m) => playlistStore.setMode(m)}
-                onClear={() => playlistStore.clearFilters()}
-                showCounts={false}
-            />
+                {#snippet toolbar()}
+                    <!-- Filters this playlist only; the library keeps its own. -->
+                    <SearchField
+                        class="max-w-md"
+                        value={playlistStore.query}
+                        placeholder="Filter this playlist…"
+                        oninput={(v) => playlistStore.setQuery(v)}
+                    />
+
+                    <TagFilter
+                        selectedIds={playlistStore.selectedTagIds}
+                        mode={playlistStore.mode}
+                        active={playlistStore.filtering}
+                        onToggle={(id) => playlistStore.toggleTag(id)}
+                        onModeChange={(m) => playlistStore.setMode(m)}
+                        onClear={() => playlistStore.clearFilters()}
+                        showCounts={false}
+                    />
+
+                    {#if playlistStore.filtering}
+                        <p class="text-muted-foreground text-xs">
+                            Play uses the filtered list. Reordering is off while
+                            filtered, because a row's position here is not its
+                            position in the playlist.
+                        </p>
+                    {/if}
+                {/snippet}
+            </ListHeader>
         {/snippet}
 
         {#if detail.tracks.length === 0}

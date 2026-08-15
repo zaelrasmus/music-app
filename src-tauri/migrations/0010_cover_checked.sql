@@ -1,0 +1,14 @@
+-- Whether a file has ever been looked at for embedded artwork.
+--
+-- Without this, cover art would only ever appear on files touched *after* the
+-- feature shipped: a rescan skips any file whose mtime and size are unchanged,
+-- which is every track in an existing library. One flag turns that into a
+-- single catch-up pass.
+--
+-- Distinct from `cover_key IS NULL`, which cannot tell "not looked at yet"
+-- from "looked, and this file has no picture". Using the key as the flag would
+-- re-read every untagged file on every scan forever -- worst for exactly the
+-- libraries that are already slowest to scan.
+--
+-- Defaults to 0 so existing rows are picked up once, then never again.
+ALTER TABLE tracks ADD COLUMN cover_checked INTEGER NOT NULL DEFAULT 0;

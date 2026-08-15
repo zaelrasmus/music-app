@@ -104,6 +104,7 @@
                     >
                         <CoverArt
                             seed={coverSeed(queueStore.current)}
+                            coverKey={queueStore.current.coverKey}
                             class="size-9"
                             glyph={false}
                         />

@@ -20,13 +20,21 @@ pub struct Track {
     pub album: Option<String>,
     pub duration_secs: Option<i64>,
     pub state: String,
+    /// Names a file in the cover store. `None` means generated artwork.
+    pub cover_key: Option<String>,
+    /// Whether the user keeps this in their library.
+    ///
+    /// Always true for local files. False for a streamed track that has been
+    /// played or queued but never explicitly kept -- it still exists, and is
+    /// still in history, but the library does not list it.
+    pub in_library: bool,
 }
 
 #[tauri::command]
 pub async fn list_tracks(db: State<'_, Db>) -> Result<Vec<Track>, String> {
     sqlx::query_as(
-        "SELECT id, source, title, artist, album, duration_secs, state \
-         FROM tracks ORDER BY artist, album, title",
+        "SELECT id, source, title, artist, album, duration_secs, state, cover_key, in_library \
+         FROM tracks WHERE in_library = 1 ORDER BY artist, album, title",
     )
     .fetch_all(&db.pool)
     .await
@@ -34,6 +42,10 @@ pub async fn list_tracks(db: State<'_, Db>) -> Result<Vec<Track>, String> {
 }
 
 /// The tracks played most recently, newest first.
+///
+/// Deliberately not filtered by library membership. This is the one list that
+/// shows what was played rather than what was kept, which is exactly what makes
+/// it the way back to a streamed track nobody remembered to add.
 ///
 /// Reads straight from `tracks` rather than keeping a history table: a play
 /// is already an attribute of the track, and a separate log would need pruning
@@ -46,7 +58,7 @@ pub async fn recently_played(db: State<'_, Db>, limit: Option<u32>) -> Result<Ve
     let limit = limit.unwrap_or(50).clamp(1, 500);
 
     sqlx::query_as(
-        "SELECT id, source, title, artist, album, duration_secs, state \
+        "SELECT id, source, title, artist, album, duration_secs, state, cover_key, in_library \
          FROM tracks WHERE last_played IS NOT NULL \
          ORDER BY last_played DESC LIMIT ?",
     )
@@ -54,6 +66,32 @@ pub async fn recently_played(db: State<'_, Db>, limit: Option<u32>) -> Result<Ve
     .fetch_all(&db.pool)
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Adds a track to the library, or takes it out.
+///
+/// Removing does not delete anything: the row, its history, its cache entry
+/// and its playlist memberships all survive. It only stops being listed in the
+/// library, which is the difference between "I do not want this filed here"
+/// and "destroy it".
+#[tauri::command]
+pub async fn set_in_library(
+    db: State<'_, Db>,
+    track_id: i64,
+    in_library: bool,
+) -> Result<(), String> {
+    let outcome = sqlx::query("UPDATE tracks SET in_library = ? WHERE id = ?")
+        .bind(i64::from(in_library))
+        .bind(track_id)
+        .execute(&db.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if outcome.rows_affected() == 0 {
+        return Err("That track no longer exists.".to_string());
+    }
+
+    Ok(())
 }
 
 /// Rescans every registered folder.
@@ -65,8 +103,9 @@ pub async fn rescan_library(
     app: AppHandle,
     db: State<'_, Db>,
     lock: State<'_, ScanLock>,
+    covers: State<'_, crate::covers::CoverStore>,
 ) -> Result<Option<ScanSummary>, String> {
-    let summary = scanner::scan_all(&db.pool, &lock).await?;
+    let summary = scanner::scan_all(&db.pool, &lock, Some(&covers)).await?;
 
     if summary.is_some() {
         app.emit(SCAN_FINISHED_EVENT, ()).map_err(|e| e.to_string())?;

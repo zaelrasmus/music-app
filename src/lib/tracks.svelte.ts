@@ -10,6 +10,16 @@ export type Track = {
   artist: string | null;
   album: string | null;
   durationSecs: number | null;
+  /** Names a file in the cover store; null means generated artwork. */
+  coverKey?: string | null;
+  /**
+   * Whether the user keeps this in their library.
+   *
+   * Always true for local files. False for a streamed track that has been
+   * played but never explicitly kept — it stays in history and stays playable,
+   * it just is not filed in the library.
+   */
+  inLibrary?: boolean;
   state: "present" | "missing" | "saved" | "downloaded";
 };
 
@@ -120,6 +130,23 @@ class TrackStore {
       toast.error(String(e));
       return false;
     }
+  }
+}
+
+/**
+ * Files a track in the library, or takes it out.
+ *
+ * Nothing is destroyed either way: removing leaves the row, its history, its
+ * cached audio and its playlist memberships exactly where they were. It is a
+ * statement about filing, not about deletion.
+ */
+export async function setInLibrary(trackId: number, inLibrary: boolean) {
+  try {
+    await invoke("set_in_library", { trackId, inLibrary });
+    return true;
+  } catch (e) {
+    toast.error(String(e));
+    return false;
   }
 }
 

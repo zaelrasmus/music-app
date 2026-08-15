@@ -18,7 +18,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `protocol-asset` serves files from disk to the webview. Cover art is loaded
+# this way rather than over IPC: a list of five hundred rows would otherwise be
+# five hundred round trips, each returning base64.
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -46,6 +49,20 @@ rtrb = "0.3"
 # Channels and `select!` for the coordinator. Tauri already runs on tokio;
 # this only makes the crate nameable.
 tokio = { version = "1", features = ["sync", "macros", "time"] }
+# Cover art normalisation. default-features = false drops around twenty codecs
+# this app will never meet; the five kept are what tag pictures are actually
+# encoded as. JPEG is the only *encoder* needed -- everything is stored as one.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+    "gif",
+    "bmp",
+] }
+# Content-addressing for cover art. A stable hash is the requirement, which
+# rules out DefaultHasher -- it is explicitly not guaranteed across releases,
+# and these hashes are filenames on disk.
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

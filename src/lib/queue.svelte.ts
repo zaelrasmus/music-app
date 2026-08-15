@@ -20,6 +20,7 @@ export type QueueEntry = {
   durationSecs: number | null;
   state: string;
   source: string;
+  coverKey: string | null;
 };
 
 export type QueueState = {

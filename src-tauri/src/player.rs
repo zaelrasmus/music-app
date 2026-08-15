@@ -150,6 +150,8 @@ pub struct QueueEntry {
     /// "present" / "missing" / "saved" / "downloaded", as in the library.
     pub state: String,
     pub source: String,
+    /// Names a file in the cover store; `None` means generated artwork.
+    pub cover_key: Option<String>,
 }
 
 /// The whole "Up Next" panel in one payload.
@@ -363,9 +365,10 @@ pub fn spawn<E: PlayerEvents>(
             epoch: 0,
             engine: Arc::new(engine),
             loads: loads_tx,
+            // With the pool, so a resolve can file the upload date it learned.
+            stream_urls: Arc::new(StreamUrlCache::with_pool(pool.clone())),
             pool,
             yt_dlp,
-            stream_urls: Arc::new(StreamUrlCache::default()),
             prefetching: Arc::new(Mutex::new(None)),
             audio_cache,
             ffmpeg,
@@ -1233,7 +1236,8 @@ impl<E: PlayerEvents> Coordinator<E> {
         }
 
         let mut builder = QueryBuilder::new(
-            "SELECT id, source, title, artist, duration_secs, state FROM tracks WHERE id IN (",
+            "SELECT id, source, title, artist, duration_secs, state, cover_key \
+         FROM tracks WHERE id IN (",
         );
         let mut separated = builder.separated(", ");
         for id in ids {
@@ -1259,6 +1263,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                         artist: row.get("artist"),
                         duration_secs: row.get("duration_secs"),
                         state: row.get("state"),
+                        cover_key: row.get("cover_key"),
                     },
                 )
             })
@@ -1445,6 +1450,7 @@ struct TrackDetail {
     artist: Option<String>,
     duration_secs: Option<i64>,
     state: String,
+    cover_key: Option<String>,
 }
 
 /// Turns an id into a row, keeping deleted tracks visible.
@@ -1462,6 +1468,7 @@ fn entry_for(details: &HashMap<i64, TrackDetail>, entry_id: Option<u64>, track_i
             duration_secs: detail.duration_secs,
             state: detail.state.clone(),
             source: detail.source.clone(),
+            cover_key: detail.cover_key.clone(),
         },
         None => QueueEntry {
             entry_id,
@@ -1471,6 +1478,7 @@ fn entry_for(details: &HashMap<i64, TrackDetail>, entry_id: Option<u64>, track_i
             duration_secs: None,
             state: "missing".to_string(),
             source: "local".to_string(),
+            cover_key: None,
         },
     }
 }

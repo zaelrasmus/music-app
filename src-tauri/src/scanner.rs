@@ -9,6 +9,8 @@ use serde::Serialize;
 use sqlx::{Row, SqlitePool};
 use walkdir::WalkDir;
 
+use crate::covers::CoverStore;
+
 /// Extensions we consider audio. Compared lowercased -- `.MP3` is common from
 /// older rippers.
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "ogg", "opus", "wav"];
@@ -60,12 +62,24 @@ pub struct ScanSummary {
     pub errors: u64,
     /// Folders whose root was unreachable. Their tracks were left untouched.
     pub skipped_folders: Vec<String>,
+    /// Cover files deleted because nothing points at them any more.
+    pub covers_removed: usize,
 }
 
 /// A registered library folder.
 struct Folder {
     id: i64,
     path: String,
+}
+
+/// What the database already knows about a file, for deciding whether it has
+/// to be read again.
+struct KnownFile {
+    mtime: i64,
+    size: i64,
+    /// Whether artwork has ever been looked for. Not the same as "has a cover":
+    /// a file with no picture is still checked, and must not be re-read for it.
+    cover_checked: bool,
 }
 
 /// What `stat` told us about a file during the walk.
@@ -81,12 +95,18 @@ struct Metadata {
     artist: Option<String>,
     album: Option<String>,
     duration_secs: Option<i64>,
+    /// Key into the cover store, if the file embedded a picture we could read.
+    cover_key: Option<String>,
 }
 
 /// Scans every registered folder and reconciles the `tracks` table.
 ///
 /// Returns `None` if a scan is already in progress.
-pub async fn scan_all(pool: &SqlitePool, lock: &ScanLock) -> Result<Option<ScanSummary>, String> {
+pub async fn scan_all(
+    pool: &SqlitePool,
+    lock: &ScanLock,
+    covers: Option<&CoverStore>,
+) -> Result<Option<ScanSummary>, String> {
     let Some(_guard) = lock.try_acquire() else {
         return Ok(None);
     };
@@ -112,10 +132,33 @@ pub async fn scan_all(pool: &SqlitePool, lock: &ScanLock) -> Result<Option<ScanS
     let mut summary = ScanSummary::default();
 
     for folder in &folders {
-        scan_folder(pool, folder, generation, &mut summary).await?;
+        scan_folder(pool, folder, generation, &mut summary, covers).await?;
+    }
+
+    // Now, rather than on a timer: the set of live keys is a query away at
+    // exactly this moment, and nothing else in the app knows when it changed.
+    if let Some(covers) = covers {
+        summary.covers_removed = sweep_covers(pool, covers).await.unwrap_or(0);
     }
 
     Ok(Some(summary))
+}
+
+/// Deletes cover files no track and no playlist points at any more.
+///
+/// Failure is not worth surfacing: an orphaned JPEG costs a few kilobytes and
+/// the next scan tries again.
+async fn sweep_covers(pool: &SqlitePool, covers: &CoverStore) -> Result<usize, String> {
+    let keys: Vec<String> = sqlx::query_scalar(
+        "SELECT cover_key FROM tracks WHERE cover_key IS NOT NULL
+         UNION
+         SELECT cover_key FROM playlists WHERE cover_key IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(covers.sweep(&keys.into_iter().collect()))
 }
 
 async fn scan_folder(
@@ -123,6 +166,7 @@ async fn scan_folder(
     folder: &Folder,
     generation: i64,
     summary: &mut ScanSummary,
+    covers: Option<&CoverStore>,
 ) -> Result<(), String> {
     // An unreachable root -- unplugged drive, disconnected share -- yields zero
     // entries from WalkDir, which would otherwise look exactly like "every file
@@ -141,18 +185,27 @@ async fn scan_folder(
     // Load what we already know before walking, so the mtime comparison can
     // decide whether a file needs re-parsing at all. Reading metadata is ~99%
     // of scan cost, so this is what makes a rescan fast.
-    let known: HashMap<String, (i64, i64)> =
-        sqlx::query("SELECT local_path, file_mtime, file_size FROM tracks WHERE folder_id = ?")
-            .bind(folder.id)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .filter_map(|row| {
-                let path: Option<String> = row.get("local_path");
-                Some((path?, (row.get("file_mtime"), row.get("file_size"))))
-            })
-            .collect();
+    let known: HashMap<String, KnownFile> = sqlx::query(
+        "SELECT local_path, file_mtime, file_size, cover_checked \
+         FROM tracks WHERE folder_id = ?",
+    )
+    .bind(folder.id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .into_iter()
+    .filter_map(|row| {
+        let path: Option<String> = row.get("local_path");
+        Some((
+            path?,
+            KnownFile {
+                mtime: row.get("file_mtime"),
+                size: row.get("file_size"),
+                cover_checked: row.get::<i64, _>("cover_checked") != 0,
+            },
+        ))
+    })
+    .collect();
 
     let root = folder.path.clone();
     let (entries, walk_errors) = tauri::async_runtime::spawn_blocking(move || walk(&root))
@@ -167,7 +220,14 @@ async fn scan_folder(
     let mut needs_parse = Vec::new();
     for entry in entries {
         match known.get(&entry.path) {
-            Some(&(mtime, size)) if mtime == entry.mtime && size == entry.size => {
+            // Unchanged on disk *and* already examined for artwork. The second
+            // half is what lets a library that predates cover art pick it up on
+            // one rescan without re-reading everything on every rescan after.
+            Some(known)
+                if known.mtime == entry.mtime
+                    && known.size == entry.size
+                    && (known.cover_checked || covers.is_none()) =>
+            {
                 unchanged.push(entry)
             }
             _ => needs_parse.push(entry),
@@ -201,8 +261,14 @@ async fn scan_folder(
 
         // Parse a whole batch on one blocking thread rather than spawning a
         // task per file.
+        // Cloned in because the closure outlives this frame. `CoverStore` is
+        // one path, so the clone is free.
+        let store = covers.cloned();
         let parsed = tauri::async_runtime::spawn_blocking(move || {
-            paths.into_iter().map(|p| read_metadata(&p)).collect::<Vec<_>>()
+            paths
+                .into_iter()
+                .map(|p| read_metadata(&p, store.as_ref()))
+                .collect::<Vec<_>>()
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -228,14 +294,21 @@ async fn scan_folder(
                 "INSERT INTO tracks (
                      source, title, artist, album, duration_secs,
                      local_path, file_mtime, file_size, folder_id,
-                     last_seen_scan, state
+                     last_seen_scan, state, cover_key, cover_checked
                  )
-                 VALUES ('local', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'present')
+                 VALUES ('local', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'present', ?, ?)
                  ON CONFLICT(local_path) DO UPDATE SET
                      title          = excluded.title,
                      artist         = excluded.artist,
                      album          = excluded.album,
                      duration_secs  = excluded.duration_secs,
+                     -- COALESCE, not a plain assignment: a rescan that cannot
+                     -- read the artwork this time (no store, unreadable image)
+                     -- must leave the working cover alone rather than clear it.
+                     cover_key      = COALESCE(excluded.cover_key, tracks.cover_key),
+                     -- Sticky: once a file has been examined it stays examined,
+                     -- so a later scan without a store cannot undo the work.
+                     cover_checked  = MAX(excluded.cover_checked, tracks.cover_checked),
                      file_mtime     = excluded.file_mtime,
                      file_size      = excluded.file_size,
                      folder_id      = excluded.folder_id,
@@ -252,6 +325,8 @@ async fn scan_folder(
             .bind(entry.size)
             .bind(folder.id)
             .bind(generation)
+            .bind(&metadata.cover_key)
+            .bind(i64::from(covers.is_some()))
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
@@ -341,7 +416,7 @@ fn is_audio(path: &Path) -> bool {
 ///
 /// Dirty and absent tags are the norm in a real library, so a missing or
 /// blank title falls back to the file name rather than failing.
-fn read_metadata(path: &str) -> Option<Metadata> {
+fn read_metadata(path: &str, covers: Option<&CoverStore>) -> Option<Metadata> {
     let tagged = lofty::read_from_path(path).ok()?;
 
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
@@ -356,12 +431,46 @@ fn read_metadata(path: &str) -> Option<Metadata> {
 
     Some(Metadata {
         title,
+        cover_key: covers.and_then(|store| extract_cover(tag, store)),
         artist: tag.and_then(|t| t.artist()).and_then(non_empty),
         album: tag.and_then(|t| t.album()).and_then(non_empty),
         // lofty reports a zero duration when it cannot determine one; storing
         // NULL keeps that distinguishable from a genuinely empty file.
         duration_secs: (duration > 0).then_some(duration as i64),
     })
+}
+
+/// Stores the file's embedded artwork, returning its key.
+///
+/// The picture bytes are already in memory -- `read_from_path` parsed the whole
+/// tag to get the title -- so the only cost here is the store's, and that is
+/// skipped entirely for a cover already seen. An album therefore pays one
+/// decode for twelve tracks.
+///
+/// A file with no picture, or one the decoder rejects, simply has no cover.
+/// Failing a scan over unreadable artwork would be losing a library to a
+/// broken JPEG.
+fn extract_cover(tag: Option<&lofty::tag::Tag>, covers: &CoverStore) -> Option<String> {
+    use lofty::picture::PictureType;
+
+    let pictures = tag?.pictures();
+
+    // Prefer the front cover when the file says which is which. Tags routinely
+    // carry a back cover, a disc scan and an artist photo alongside it, and any
+    // of those would be a strange thing to show as the track's artwork.
+    let picture = pictures
+        .iter()
+        .find(|p| p.pic_type() == PictureType::CoverFront)
+        .or_else(|| pictures.first())?;
+
+    match covers.store(picture.data()) {
+        Ok(key) => Some(key),
+        Err(e) => {
+            // Expected in a real library, so never loud.
+            eprintln!("cover art skipped: {e}");
+            None
+        }
+    }
 }
 
 /// The file name without its extension -- otherwise every untagged track would
@@ -477,6 +586,51 @@ mod tests {
             .unwrap()
     }
 
+    /// The catch-up pass.
+    ///
+    /// Cover art shipped after these libraries were built, so every existing
+    /// row has `cover_checked = 0` while its file is byte-for-byte unchanged.
+    /// Without the flag those files are "unchanged" forever and never gain
+    /// artwork -- the feature would only ever work for music added later.
+    #[tokio::test]
+    async fn files_scanned_before_cover_art_are_examined_once_and_then_left_alone() {
+        let (db, music, base) = fixture("cover-catchup").await;
+        write_wav(&music.join("Old Song.wav"));
+
+        // A library from before covers existed.
+        let first = scan_all(&db.pool, &ScanLock::new(), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.added, 1);
+
+        let store = CoverStore::new(base.join("covers"));
+
+        // The upgrade. Nothing on disk changed, but the file has never been
+        // looked at for artwork, so it must be read again.
+        let second = scan_all(&db.pool, &ScanLock::new(), Some(&store))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.unchanged, 0,
+            "an unexamined file must be re-read even though its mtime matches"
+        );
+
+        // And exactly once. Re-reading every coverless file on every scan
+        // would tax precisely the worst-tagged libraries hardest.
+        let third = scan_all(&db.pool, &ScanLock::new(), Some(&store))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            third.unchanged, 1,
+            "a file already examined must not be read again, even with no art"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[tokio::test]
     async fn a_scan_imports_audio_files_and_falls_back_to_the_file_name() {
         let (db, music, base) = fixture("import").await;
@@ -484,7 +638,7 @@ mod tests {
         write_wav(&music.join("Another Song.wav"));
         std::fs::write(music.join("cover.jpg"), b"not audio").unwrap();
 
-        let summary = scan_all(&db.pool, &ScanLock::new())
+        let summary = scan_all(&db.pool, &ScanLock::new(), None)
             .await
             .expect("scan should succeed")
             .expect("no scan should be in progress");
@@ -509,8 +663,8 @@ mod tests {
         let (db, music, base) = fixture("rescan").await;
         write_wav(&music.join("Track.wav"));
 
-        scan_all(&db.pool, &ScanLock::new()).await.unwrap().unwrap();
-        let second = scan_all(&db.pool, &ScanLock::new())
+        scan_all(&db.pool, &ScanLock::new(), None).await.unwrap().unwrap();
+        let second = scan_all(&db.pool, &ScanLock::new(), None)
             .await
             .unwrap()
             .unwrap();
@@ -531,10 +685,10 @@ mod tests {
         write_wav(&doomed);
         write_wav(&music.join("Kept.wav"));
 
-        scan_all(&db.pool, &ScanLock::new()).await.unwrap().unwrap();
+        scan_all(&db.pool, &ScanLock::new(), None).await.unwrap().unwrap();
         std::fs::remove_file(&doomed).unwrap();
 
-        let summary = scan_all(&db.pool, &ScanLock::new())
+        let summary = scan_all(&db.pool, &ScanLock::new(), None)
             .await
             .unwrap()
             .unwrap();
@@ -559,7 +713,7 @@ mod tests {
         let file = music.join("Played.wav");
         write_wav(&file);
 
-        scan_all(&db.pool, &ScanLock::new()).await.unwrap().unwrap();
+        scan_all(&db.pool, &ScanLock::new(), None).await.unwrap().unwrap();
         sqlx::query("UPDATE tracks SET play_count = 42, last_played = 1000")
             .execute(&db.pool)
             .await
@@ -570,7 +724,7 @@ mod tests {
         std::fs::write(&file, std::fs::read(&file).unwrap()).unwrap();
         filetime_bump(&file);
 
-        let summary = scan_all(&db.pool, &ScanLock::new())
+        let summary = scan_all(&db.pool, &ScanLock::new(), None)
             .await
             .unwrap()
             .unwrap();
@@ -601,12 +755,12 @@ mod tests {
         let (db, music, base) = fixture("unreachable").await;
         write_wav(&music.join("OnTheDrive.wav"));
 
-        scan_all(&db.pool, &ScanLock::new()).await.unwrap().unwrap();
+        scan_all(&db.pool, &ScanLock::new(), None).await.unwrap().unwrap();
 
         // Simulate the drive being unplugged: the root itself disappears.
         std::fs::remove_dir_all(&music).unwrap();
 
-        let summary = scan_all(&db.pool, &ScanLock::new())
+        let summary = scan_all(&db.pool, &ScanLock::new(), None)
             .await
             .unwrap()
             .unwrap();

@@ -1,20 +1,22 @@
 <script lang="ts">
     import { Button } from "$components/ui/button";
     import PageShell from "$components/page-shell.svelte";
+    import ListHeader from "$components/list-header.svelte";
     import EmptyState from "$components/empty-state.svelte";
     import SearchField from "$components/search-field.svelte";
+    import SortControl from "$components/sort-control.svelte";
     import TrackRow from "$components/track-row.svelte";
     import TagFilter from "$components/tag-filter.svelte";
     import { libraryView } from "$lib/library-view.svelte";
     import { library } from "$lib/library.svelte";
     import { trackStore } from "$lib/tracks.svelte";
     import { player } from "$lib/player.svelte";
+    import { cacheStore } from "$lib/cache.svelte";
     import { nav } from "$lib/nav.svelte";
+    import { formatTotal } from "$lib/duration";
     import LibraryIcon from "@lucide/svelte/icons/library";
     import UsersIcon from "@lucide/svelte/icons/users";
     import ListIcon from "@lucide/svelte/icons/list";
-    import PlayIcon from "@lucide/svelte/icons/play";
-    import ShuffleIcon from "@lucide/svelte/icons/shuffle";
     import FolderPlusIcon from "@lucide/svelte/icons/folder-plus";
     import SearchIcon from "@lucide/svelte/icons/search";
 
@@ -41,8 +43,24 @@
     });
 
     const grouped = $derived(libraryView.groupByArtist);
+    const shown = $derived(grouped ? libraryView.groups.flatMap((g) => g.tracks) : libraryView.results);
     const ids = $derived(grouped ? groupedIds : flatIds);
     const total = $derived(ids.length);
+
+    const totalSecs = $derived(
+        shown.reduce((sum, t) => sum + (t.durationSecs ?? 0), 0),
+    );
+
+    /** Only worth saying once some of the library actually needs a connection. */
+    const offline = $derived(
+        shown.filter(
+            (t) =>
+                t.state === "downloaded" ||
+                t.state === "present" ||
+                cacheStore.isCached(t.id),
+        ).length,
+    );
+    const anyStreamed = $derived(shown.some((t) => t.source !== "local"));
 
     /**
      * Shuffle starts from a random point as well as shuffling what follows.
@@ -61,80 +79,81 @@
     }
 </script>
 
-<PageShell
-    title="Library"
-    badge={total > 0 ? `${total}` : null}
-    subtitle="Everything you have saved, local files and streams together."
->
-    {#snippet actions()}
-        <Button
-            variant="ghost"
-            size="sm"
-            disabled={total === 0}
-            onclick={shuffleAll}
+<PageShell>
+    {#snippet hero()}
+        <ListHeader
+            title="Library"
+            empty={total === 0}
+            meta={[
+                `${total} ${total === 1 ? "song" : "songs"}`,
+                formatTotal(totalSecs),
+                anyStreamed && total > 0 ? `${offline} playable offline` : null,
+            ]}
+            onPlay={() => player.playQueue(ids, 0, "your library")}
+            onShuffle={shuffleAll}
         >
-            <ShuffleIcon data-icon="inline-start" />
-            Shuffle
-        </Button>
-        <Button
-            size="sm"
-            disabled={total === 0}
-            onclick={() => player.playQueue(ids, 0, "your library")}
-        >
-            <PlayIcon data-icon="inline-start" />
-            Play
-        </Button>
-    {/snippet}
+            {#snippet actions()}
+                <!-- Grouping is a different backend query that takes no
+                     filters, so it is a mode rather than another control
+                     alongside them. -->
+                <Button
+                    variant="outline"
+                    size="sm"
+                    class="rounded-full"
+                    aria-pressed={grouped}
+                    title={grouped
+                        ? "Show one flat, filterable list"
+                        : "Group the library by artist"}
+                    onclick={() => libraryView.toggleGrouping()}
+                >
+                    {#if grouped}
+                        <ListIcon data-icon="inline-start" />
+                        Flat list
+                    {:else}
+                        <UsersIcon data-icon="inline-start" />
+                        By artist
+                    {/if}
+                </Button>
+            {/snippet}
 
-    {#snippet toolbar()}
-        <div class="flex items-center gap-2">
-            <SearchField
-                class="max-w-md flex-1"
-                value={libraryView.query}
-                placeholder="Search titles and artists…"
-                oninput={(v) => libraryView.setQuery(v)}
-            />
-
-            <!-- Grouping is a different backend query that takes no filters, so
-                 it is a mode rather than another control alongside them. -->
-            <Button
-                variant="outline"
-                size="sm"
-                aria-pressed={grouped}
-                title={grouped
-                    ? "Show one flat, filterable list"
-                    : "Group the library by artist"}
-                onclick={() => libraryView.toggleGrouping()}
-            >
+            {#snippet toolbar()}
                 {#if grouped}
-                    <ListIcon data-icon="inline-start" />
-                    Flat list
+                    <p class="text-muted-foreground text-xs">
+                        Grouped by artist — searching, sorting and tag filters
+                        apply to the flat list.
+                    </p>
                 {:else}
-                    <UsersIcon data-icon="inline-start" />
-                    By artist
-                {/if}
-            </Button>
-        </div>
+                    <div class="flex flex-wrap items-center gap-2">
+                        <SearchField
+                            class="min-w-[14rem] max-w-md flex-1"
+                            value={libraryView.query}
+                            placeholder="Search titles and artists…"
+                            oninput={(v) => libraryView.setQuery(v)}
+                        />
+                        <SortControl
+                            sort={libraryView.sort}
+                            direction={libraryView.direction}
+                            searching={libraryView.query.trim() !== ""}
+                            onChange={(s, d) => libraryView.setSort(s, d)}
+                            onToggleDirection={() => libraryView.toggleDirection()}
+                        />
+                    </div>
 
-        {#if grouped}
-            <p class="text-muted-foreground text-xs">
-                Grouped by artist — searching and tag filters apply to the flat
-                list.
-            </p>
-        {:else}
-            <TagFilter
-                selectedIds={libraryView.selectedTagIds}
-                mode={libraryView.mode}
-                active={libraryView.filtering}
-                onToggle={(id) => libraryView.toggleTag(id)}
-                onModeChange={(m) => libraryView.setMode(m)}
-                onClear={() => libraryView.clearFilters()}
-            />
-        {/if}
+                    <TagFilter
+                        selectedIds={libraryView.selectedTagIds}
+                        mode={libraryView.mode}
+                        active={libraryView.filtering}
+                        onToggle={(id) => libraryView.toggleTag(id)}
+                        onModeChange={(m) => libraryView.setMode(m)}
+                        onClear={() => libraryView.clearFilters()}
+                    />
+                {/if}
+            {/snippet}
+        </ListHeader>
     {/snippet}
 
     {#if libraryView.loading && total === 0}
-        <p class="text-muted-foreground px-2 py-6 text-sm">Loading…</p>
+        <p class="text-muted-foreground px-3 py-6 text-sm">Loading…</p>
     {:else if grouped}
         {#if libraryView.groups.length === 0}
             <EmptyState
@@ -147,7 +166,7 @@
                 {#each libraryView.groups as group, groupIndex (group.artist)}
                     <section class="flex flex-col gap-1">
                         <h2
-                            class="text-muted-foreground bg-background/85 sticky top-0 z-[1] px-2 py-1 text-[11px] font-semibold tracking-[0.07em] uppercase backdrop-blur-sm"
+                            class="text-muted-foreground bg-background/90 sticky top-0 z-[1] px-3 py-1.5 text-[11px] font-semibold tracking-[0.07em] uppercase backdrop-blur-sm"
                         >
                             {group.artist}
                             <span class="opacity-60">({group.tracks.length})</span>
@@ -175,6 +194,7 @@
                 <Button
                     variant="outline"
                     size="sm"
+                    class="rounded-full"
                     onclick={() => libraryView.clearFilters()}
                 >
                     Clear filters
@@ -187,11 +207,16 @@
                 hint="Point the app at a folder of music, or search YouTube and SoundCloud for something to save."
             >
                 <div class="flex items-center gap-2">
-                    <Button size="sm" onclick={() => library.addFromPicker()}>
+                    <Button size="sm" class="rounded-full" onclick={() => library.addFromPicker()}>
                         <FolderPlusIcon data-icon="inline-start" />
                         Add a folder
                     </Button>
-                    <Button variant="outline" size="sm" onclick={() => nav.go("search")}>
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        class="rounded-full"
+                        onclick={() => nav.go("search")}
+                    >
                         <SearchIcon data-icon="inline-start" />
                         Search online
                     </Button>
@@ -206,6 +231,7 @@
                 <Button
                     variant="outline"
                     size="sm"
+                    class="rounded-full"
                     disabled={trackStore.scanning}
                     onclick={() => trackStore.rescan()}
                 >

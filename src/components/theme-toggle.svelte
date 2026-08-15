@@ -32,7 +32,7 @@
 
     const trigger = $derived(
         chrome
-            ? "inline-grid h-8 w-9 place-items-center rounded-md text-titlebar-foreground transition-colors hover:bg-foreground/10 hover:text-foreground focus-visible:outline-none focus-visible:bg-foreground/10"
+            ? "inline-grid size-7 place-items-center rounded-md text-titlebar-foreground transition-colors hover:bg-foreground/10 hover:text-foreground focus-visible:outline-none focus-visible:bg-foreground/10"
             : "inline-grid size-9 place-items-center rounded-md border transition-colors hover:bg-accent",
     );
 </script>

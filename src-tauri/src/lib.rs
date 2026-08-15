@@ -1,4 +1,5 @@
 pub mod audio_cache;
+mod covers;
 pub mod db;
 mod download;
 mod engine;
@@ -32,7 +33,10 @@ use tauri::Manager;
 // DONE: two-tier queue -- a consumed manual queue that outranks the context
 //       queue. Shuffle and repeat act on the context alone.
 //
-// TODO: cover art extraction into `tracks.cover_path` (column already exists).
+// DONE: cover art -- a content-addressed store fed by embedded tag pictures,
+//       provider thumbnails and user-picked playlist images, served to the
+//       webview over the asset protocol scoped to that one directory.
+//
 // TODO: removing tracks from the context preview (the permutation makes this
 //       more work than it looks; the preview is read-only for now).
 
@@ -78,6 +82,11 @@ pub fn run() {
             let audio_cache = audio_cache::AudioCache::new(data_dir.join("cache").join("audio"));
             app.manage(audio_cache.clone());
 
+            // Cover art. Not under `cache/`: entries here are cheap to
+            // rebuild but are referenced by id from the database, so clearing
+            // them behind the app is a visible loss rather than a free one.
+            app.manage(covers::CoverStore::new(data_dir.join("covers")));
+
             app.manage(player::spawn(
                 app.handle().clone(),
                 pool,
@@ -114,6 +123,7 @@ pub fn run() {
             tracks::recently_played,
             tracks::rescan_library,
             tracks::update_track_metadata,
+            tracks::set_in_library,
             playlists::create_playlist,
             playlists::rename_playlist,
             playlists::delete_playlist,
@@ -129,6 +139,9 @@ pub fn run() {
             tags::rename_tag,
             tags::set_tag_color,
             tags::list_tag_colors,
+            covers::cover_dir,
+            covers::set_playlist_cover,
+            covers::clear_playlist_cover,
             tags::delete_tag,
             search::query_library,
             search::group_tracks_by_artist,

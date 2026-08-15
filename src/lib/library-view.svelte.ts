@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "svelte-sonner";
 import type { Track } from "$lib/tracks.svelte";
+import type { Direction, Sort } from "$lib/sorting";
+import { readSetting, writeSetting } from "$lib/settings.svelte";
 
 export type ArtistGroup = {
   artist: string;
@@ -22,6 +24,9 @@ class LibraryViewStore {
   selectedTagIds = $state<number[]>([]);
   mode = $state<"all" | "any">("all");
   groupByArtist = $state(false);
+
+  sort = $state<Sort>("auto");
+  direction = $state<Direction>("asc");
 
   results = $state<Track[]>([]);
   groups = $state<ArtistGroup[]>([]);
@@ -46,6 +51,36 @@ class LibraryViewStore {
       ? this.selectedTagIds.filter((id) => id !== tagId)
       : [...this.selectedTagIds, tagId];
     this.refresh();
+  }
+
+  /**
+   * Restores the saved order.
+   *
+   * A device preference, like volume -- it says how you like to look at your
+   * library, not anything about the library itself, so it lives in settings
+   * rather than the database.
+   */
+  async restore() {
+    const [sort, direction] = await Promise.all([
+      readSetting<Sort>("librarySort", "auto"),
+      readSetting<Direction>("librarySortDirection", "asc"),
+    ]);
+    this.sort = sort;
+    this.direction = direction;
+    await this.refresh();
+  }
+
+  setSort(sort: Sort, direction: Direction) {
+    this.sort = sort;
+    this.direction = direction;
+    void writeSetting("librarySort", sort);
+    void writeSetting("librarySortDirection", direction);
+    void this.refresh();
+  }
+
+  /** Flips the current field without leaving it. */
+  toggleDirection() {
+    this.setSort(this.sort, this.direction === "asc" ? "desc" : "asc");
   }
 
   setMode(mode: "all" | "any") {
@@ -78,6 +113,8 @@ class LibraryViewStore {
           search: this.query.trim() === "" ? null : this.query,
           tagIds: this.selectedTagIds,
           mode: this.mode,
+          sort: this.sort,
+          direction: this.direction,
         });
         if (request !== this.#latestRequest) return;
         this.results = results;

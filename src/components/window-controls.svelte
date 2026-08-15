@@ -17,7 +17,7 @@
 
     /** Close is the only one that gets a colour, and only on hover. */
     const base =
-        "inline-grid h-8 w-[46px] place-items-center text-titlebar-foreground transition-colors duration-75 hover:bg-foreground/10 active:bg-foreground/[0.16] focus-visible:outline-none focus-visible:bg-foreground/10";
+        "inline-grid h-9 w-[46px] place-items-center text-titlebar-foreground transition-colors duration-75 hover:bg-foreground/10 active:bg-foreground/[0.16] focus-visible:outline-none focus-visible:bg-foreground/10";
 </script>
 
 <!--

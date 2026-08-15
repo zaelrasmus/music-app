@@ -21,12 +21,23 @@
     /**
      * The sidebar, built by hand.
      *
-     * Three modes with one rule between them: nothing is *reachable only* in
+     * The rail follows the demo: icons floating on the background, vertically
+     * centred, with no panel behind them and no border beside them. That is
+     * what makes a five-item navigation take no visual weight at all -- it
+     * reads as part of the window rather than as a column competing with the
+     * list.
+     *
+     * Two things the demo does not do, both from reviewing it: the active item
+     * is filled rather than outlined, because a hairline box on a near-black
+     * ground is almost invisible; and every icon has a label on hover, because
+     * icon-only navigation is a memory test the moment one glyph is not
+     * conventional.
+     *
+     * Three modes, with one rule between them: nothing is *reachable only* in
      * expanded mode. The rail keeps every destination, and the sections it
-     * cannot show (the playlist shortcuts, the storage meter) are shortcuts to
-     * places the rail still links to. Collapsing therefore costs reach, never
-     * capability -- which is what makes hiding it entirely a safe thing to
-     * offer.
+     * cannot show are shortcuts to places the rail still links to. Collapsing
+     * costs reach, never capability -- which is what makes hiding it entirely
+     * a safe thing to offer.
      */
 
     type Item = {
@@ -125,28 +136,21 @@
     {@const active = nav.view === item.view}
     <button
         type="button"
-        class="group/item relative flex h-9 w-full items-center rounded-md text-sm transition-colors
-               {expanded ? 'gap-2.5 px-2.5' : 'justify-center px-0'}
+        class="group/item relative flex items-center rounded-lg transition-colors
+               {expanded ? 'h-9 w-full gap-2.5 px-2.5' : 'size-10 justify-center'}
                {active
-            ? 'bg-sidebar-accent text-sidebar-accent-foreground font-medium'
-            : 'text-sidebar-foreground/75 hover:bg-sidebar-accent/60 hover:text-sidebar-foreground'}"
+            ? 'bg-foreground/[0.09] text-foreground'
+            : 'text-muted-foreground hover:bg-foreground/[0.05] hover:text-foreground'}"
         aria-current={active ? "page" : undefined}
         aria-label={item.label}
         onclick={() => nav.go(item.view)}
     >
-        <!-- The active marker is a bar on the sidebar's own edge rather than a
-             filled row: it survives being 60px wide, so the rail and the
-             expanded sidebar indicate the current view the same way. -->
-        {#if active}
-            <span
-                class="bg-primary absolute top-1/2 -left-2 h-4 w-[3px] -translate-y-1/2 rounded-full"
-            ></span>
-        {/if}
-
-        <item.icon class="size-[18px] shrink-0" />
+        <item.icon class="size-[19px] shrink-0" stroke-width={active ? 2.2 : 1.8} />
 
         {#if expanded}
-            <span class="min-w-0 flex-1 truncate text-left">{item.label}</span>
+            <span class="min-w-0 flex-1 truncate text-left text-[13px] {active ? 'font-medium' : ''}">
+                {item.label}
+            </span>
             {#if item.count !== undefined}
                 <span class="text-muted-foreground shrink-0 text-[11px] tabular-nums">
                     {item.count}
@@ -156,7 +160,7 @@
             <!-- The rail's label. A real element rather than `title`, which
                  waits a second and then renders in the OS's font. -->
             <span
-                class="bg-popover text-popover-foreground pointer-events-none absolute top-1/2 left-[calc(100%+10px)] z-50 -translate-y-1/2 rounded-md border px-2 py-1 text-xs whitespace-nowrap opacity-0 shadow-md transition-opacity duration-100 group-hover/item:opacity-100"
+                class="bg-popover text-popover-foreground pointer-events-none absolute top-1/2 left-[calc(100%+8px)] z-50 -translate-y-1/2 rounded-md border px-2 py-1 text-xs whitespace-nowrap opacity-0 shadow-md transition-opacity duration-100 group-hover/item:opacity-100"
                 role="tooltip"
             >
                 {item.label}
@@ -168,7 +172,7 @@
 <aside
     class="bg-sidebar relative z-10 flex shrink-0 flex-col overflow-hidden
            {sidebar.resizing ? '' : 'transition-[width] duration-200 ease-out'}
-           {hidden ? '' : 'border-border/70 border-r'}"
+           {expanded ? 'border-sidebar-border border-r' : ''}"
     style="width: {sidebar.effectiveWidth}px"
     aria-label="Main"
     aria-hidden={hidden}
@@ -180,13 +184,13 @@
         class="flex min-h-0 flex-1 flex-col"
         style="width: {expanded ? `${sidebar.width}px` : `${ICON_WIDTH}px`}"
     >
-        <nav class="flex flex-col gap-0.5 px-2 pt-3">
-            {#each items as item (item.view)}
-                {@render navButton(item)}
-            {/each}
-        </nav>
-
         {#if expanded}
+            <nav class="flex flex-col gap-0.5 px-2 pt-3">
+                {#each items as item (item.view)}
+                    {@render navButton(item)}
+                {/each}
+            </nav>
+
             <div class="seam mx-3 mt-3 h-px shrink-0"></div>
 
             <div class="min-h-0 flex-1 overflow-y-auto px-2 py-2">
@@ -209,10 +213,10 @@
                             <li>
                                 <button
                                     type="button"
-                                    class="hover:bg-sidebar-accent/60 flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-[13px] transition-colors
+                                    class="hover:bg-foreground/[0.05] flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-[13px] transition-colors
                                            {active
-                                        ? 'text-sidebar-accent-foreground font-medium'
-                                        : 'text-sidebar-foreground/70 hover:text-sidebar-foreground'}"
+                                        ? 'text-foreground font-medium'
+                                        : 'text-muted-foreground hover:text-foreground'}"
                                     onclick={() => open(playlist.id)}
                                 >
                                     <span class="min-w-0 flex-1 truncate">
@@ -244,7 +248,7 @@
                  whether the offline badges elsewhere keep their promise. -->
             <button
                 type="button"
-                class="hover:bg-sidebar-accent/60 border-border/70 m-2 flex flex-col gap-1.5 rounded-md border border-transparent px-2.5 py-2 text-left transition-colors"
+                class="hover:bg-foreground/[0.05] m-2 flex flex-col gap-1.5 rounded-lg px-2.5 py-2 text-left transition-colors"
                 onclick={() => nav.go("settings")}
                 title="Streaming cache — {formatBytes(
                     cacheStore.usedBytes,
@@ -261,13 +265,23 @@
                 </span>
                 <span class="bg-muted h-1 overflow-hidden rounded-full">
                     <span
-                        class="bg-primary/70 block h-full rounded-full transition-[width] duration-300"
+                        class="bg-foreground/45 block h-full rounded-full transition-[width] duration-300"
                         style="width: {usedFraction * 100}%"
                     ></span>
                 </span>
             </button>
         {:else}
-            <div class="flex-1"></div>
+            <!--
+              The rail. Centred vertically rather than stacked under the
+              titlebar: with no panel behind it, a top-aligned column of five
+              icons reads as debris in the corner. Centred, it reads as a
+              deliberate edge to the window.
+            -->
+            <nav class="flex flex-1 flex-col items-center justify-center gap-1.5">
+                {#each items as item (item.view)}
+                    {@render navButton(item)}
+                {/each}
+            </nav>
         {/if}
     </div>
 
@@ -309,8 +323,8 @@
             ondblclick={() => sidebar.reset()}
         >
             <span
-                class="bg-primary absolute inset-y-0 right-0 w-[2px] opacity-0 transition-opacity group-hover/handle:opacity-60 group-focus-visible/handle:opacity-100
-                       {sidebar.resizing ? '!opacity-100' : ''}"
+                class="bg-foreground absolute inset-y-0 right-0 w-[2px] opacity-0 transition-opacity group-hover/handle:opacity-40 group-focus-visible/handle:opacity-70
+                       {sidebar.resizing ? '!opacity-70' : ''}"
             ></span>
         </div>
     {/if}

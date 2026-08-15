@@ -2,15 +2,19 @@
     import WindowControls from "$components/window-controls.svelte";
     import ThemeToggle from "$components/theme-toggle.svelte";
     import { sidebar } from "$lib/sidebar.svelte";
-    import { nav } from "$lib/nav.svelte";
-    import { player } from "$lib/player.svelte";
-    import { queueStore } from "$lib/queue.svelte";
     import PanelLeftIcon from "@lucide/svelte/icons/panel-left";
     import PanelLeftCloseIcon from "@lucide/svelte/icons/panel-left-close";
     import PanelLeftDashedIcon from "@lucide/svelte/icons/panel-left-dashed";
 
     /**
      * The window frame.
+     *
+     * Almost empty, which is the demo's decision and the right one. The bar
+     * used to carry the view's name and the playing track; both were already
+     * on screen -- the view name above the list it names, the track in the
+     * player bar -- so the titlebar was repeating things rather than saying
+     * anything. An empty strip reads as part of the window; a busy one reads
+     * as a toolbar you have to check.
      *
      * `data-tauri-drag-region` is what makes an undecorated window movable, and
      * it acts on the element the press lands on -- so it goes on the bar and on
@@ -26,80 +30,34 @@
     } as const;
 
     const toggleLabel = $derived(TOGGLE_LABELS[sidebar.mode]);
-
-    /**
-     * The title shows what is playing, not the app's name.
-     *
-     * The app's name is on the taskbar already, and this is the one strip of
-     * the window that is visible whichever view is open -- so it is worth
-     * spending on the only fact that outlives navigation.
-     */
-    const nowPlaying = $derived(queueStore.current);
-
-    const VIEW_NAMES = {
-        library: "Library",
-        search: "Search",
-        playlists: "Playlists",
-        history: "Recently played",
-        settings: "Settings",
-    } as const;
 </script>
 
 <header
     data-tauri-drag-region
-    class="bg-titlebar border-border/70 flex h-10 shrink-0 items-center gap-1 border-b pl-1.5"
+    class="bg-titlebar flex h-9 shrink-0 items-center gap-1 pl-1.5"
 >
+    <!--
+      The one control that has to live here. Hiding the sidebar removes every
+      other way to bring it back, so the toggle cannot live inside the thing it
+      hides.
+    -->
     <button
         type="button"
-        class="text-titlebar-foreground hover:bg-foreground/10 hover:text-foreground focus-visible:bg-foreground/10 inline-grid size-8 shrink-0 place-items-center rounded-md transition-colors focus-visible:outline-none"
+        class="text-titlebar-foreground hover:bg-foreground/10 hover:text-foreground focus-visible:bg-foreground/10 inline-grid size-7 shrink-0 place-items-center rounded-md transition-colors focus-visible:outline-none"
         aria-label={toggleLabel}
         title="{toggleLabel}  (Ctrl+B)"
         onclick={() => sidebar.cycle()}
     >
         {#if sidebar.mode === "expanded"}
-            <PanelLeftCloseIcon class="size-4" />
+            <PanelLeftCloseIcon class="size-[15px]" />
         {:else if sidebar.mode === "icons"}
-            <PanelLeftDashedIcon class="size-4" />
+            <PanelLeftDashedIcon class="size-[15px]" />
         {:else}
-            <PanelLeftIcon class="size-4" />
+            <PanelLeftIcon class="size-[15px]" />
         {/if}
     </button>
 
-    <span
-        class="text-titlebar-foreground shrink-0 px-1 text-xs font-medium"
-        data-tauri-drag-region
-    >
-        {VIEW_NAMES[nav.view]}
-    </span>
-
-    <!-- The draggable middle. Also where the window title lives, so the bar
-         still says something when nothing is playing. -->
-    <div
-        data-tauri-drag-region
-        class="flex min-w-0 flex-1 items-center justify-center gap-1.5 px-2"
-    >
-        {#if nowPlaying}
-            <span
-                data-tauri-drag-region
-                class="text-titlebar-foreground min-w-0 truncate text-xs"
-            >
-                <span class="text-foreground/80 font-medium">{nowPlaying.title}</span>
-                <span class="opacity-70"> — {nowPlaying.artist ?? "Unknown artist"}</span>
-            </span>
-            {#if player.stalled}
-                <span
-                    data-tauri-drag-region
-                    class="text-titlebar-foreground shrink-0 text-[11px] opacity-80"
-                >
-                    · reconnecting
-                </span>
-            {/if}
-        {:else}
-            <span data-tauri-drag-region class="text-titlebar-foreground text-xs opacity-60">
-                music-app
-            </span>
-        {/if}
-    </div>
+    <div data-tauri-drag-region class="h-full flex-1"></div>
 
     <div class="flex shrink-0 items-center gap-0.5 pr-1">
         <ThemeToggle chrome />

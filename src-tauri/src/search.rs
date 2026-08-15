@@ -16,6 +16,73 @@ pub enum TagMode {
     Any,
 }
 
+/// What the library list is ordered by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Sort {
+    /// Best match while searching, artist/album/title otherwise.
+    ///
+    /// One option rather than two because they are the same intent -- "put the
+    /// most relevant thing first" -- and which one applies is decided by
+    /// whether there is a query, not by the user picking again.
+    #[default]
+    Auto,
+    Title,
+    Artist,
+    /// When it joined the library.
+    DateAdded,
+    /// When the provider published it. Unknown for most YouTube tracks.
+    DateUploaded,
+    Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    #[default]
+    Asc,
+    Desc,
+}
+
+impl Sort {
+    /// The ORDER BY body for this sort.
+    ///
+    /// Every branch is a fixed `&'static str` chosen by a match -- nothing the
+    /// user typed reaches the SQL. A column name cannot be bound as a
+    /// parameter, so this is the only way to keep it injection-proof.
+    ///
+    /// Unknown values sort last in *both* directions. A NULL upload date means
+    /// "not published information", and letting it lead a descending sort would
+    /// put the least-known tracks where the newest ones belong.
+    fn order_by(self, direction: Direction) -> &'static str {
+        let desc = direction == Direction::Desc;
+        match self {
+            // Handled by the caller, which knows whether a query is present.
+            Sort::Auto => "",
+            Sort::Title if desc => " ORDER BY t.title COLLATE NOCASE DESC",
+            Sort::Title => " ORDER BY t.title COLLATE NOCASE ASC",
+            Sort::Artist if desc => {
+                " ORDER BY t.artist IS NULL, t.artist COLLATE NOCASE DESC, t.album, t.title"
+            }
+            Sort::Artist => {
+                " ORDER BY t.artist IS NULL, t.artist COLLATE NOCASE ASC, t.album, t.title"
+            }
+            Sort::DateAdded if desc => " ORDER BY t.date_added DESC, t.id DESC",
+            // A tiebreak on id, because a scan stamps a whole folder with the
+            // same second and an unstable order makes a list flicker on reload.
+            Sort::DateAdded => " ORDER BY t.date_added ASC, t.id ASC",
+            Sort::DateUploaded if desc => {
+                " ORDER BY t.uploaded_at IS NULL, t.uploaded_at DESC, t.title"
+            }
+            Sort::DateUploaded => " ORDER BY t.uploaded_at IS NULL, t.uploaded_at ASC, t.title",
+            Sort::Duration if desc => {
+                " ORDER BY t.duration_secs IS NULL, t.duration_secs DESC, t.title"
+            }
+            Sort::Duration => " ORDER BY t.duration_secs IS NULL, t.duration_secs ASC, t.title",
+        }
+    }
+}
+
 /// Tracks grouped under one artist heading.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,7 +92,8 @@ pub struct ArtistGroup {
 }
 
 const TRACK_COLUMNS: &str =
-    "SELECT t.id, t.source, t.title, t.artist, t.album, t.duration_secs, t.state FROM tracks t";
+    "SELECT t.id, t.source, t.title, t.artist, t.album, t.duration_secs, t.state, t.cover_key, \
+     t.in_library FROM tracks t";
 
 /// Turns what the user typed into an FTS5 expression.
 ///
@@ -58,8 +126,12 @@ pub async fn query_library(
     search: Option<String>,
     tag_ids: Vec<i64>,
     mode: Option<TagMode>,
+    sort: Option<Sort>,
+    direction: Option<Direction>,
 ) -> Result<Vec<Track>, String> {
     let mode = mode.unwrap_or_default();
+    let sort = sort.unwrap_or_default();
+    let direction = direction.unwrap_or_default();
     let expression = search.as_deref().and_then(to_fts_expression);
 
     // The user typed something, but it was all punctuation.
@@ -78,15 +150,17 @@ pub async fn query_library(
         query.push(" JOIN track_tags tt ON tt.track_id = t.id");
     }
 
-    let mut has_where = false;
+    // Always present, so it opens the WHERE clause and everything else is an
+    // AND. The library is the set of tracks the user chose to keep -- a
+    // streamed track auditioned from search is a row, but not a member.
+    query.push(" WHERE t.in_library = 1");
 
     if let Some(expression) = &expression {
-        query.push(" WHERE tracks_fts MATCH ").push_bind(expression);
-        has_where = true;
+        query.push(" AND tracks_fts MATCH ").push_bind(expression);
     }
 
     if !tag_ids.is_empty() {
-        query.push(if has_where { " AND " } else { " WHERE " });
+        query.push(" AND ");
         query.push("tt.tag_id IN (");
 
         let mut list = query.separated(", ");
@@ -108,12 +182,20 @@ pub async fn query_library(
         }
     }
 
-    if expression.is_some() {
-        // Weighted so a title hit outranks an album hit. bm25 returns
-        // increasingly negative values for better matches, hence ascending.
-        query.push(" ORDER BY bm25(tracks_fts, 10.0, 5.0, 2.0)");
-    } else {
-        query.push(" ORDER BY t.artist, t.album, t.title");
+    match sort {
+        Sort::Auto if expression.is_some() => {
+            // Weighted so a title hit outranks an album hit. bm25 returns
+            // increasingly negative values for better matches, hence ascending.
+            query.push(" ORDER BY bm25(tracks_fts, 10.0, 5.0, 2.0)");
+        }
+        Sort::Auto => {
+            query.push(Sort::Artist.order_by(Direction::Asc));
+        }
+        chosen => {
+            // An explicit choice outranks relevance: the user asked for this
+            // order and a search is a filter, not a re-ranking, once they have.
+            query.push(chosen.order_by(direction));
+        }
     }
 
     query.push(" LIMIT 500");
@@ -133,8 +215,10 @@ pub async fn query_library(
 #[tauri::command]
 pub async fn group_tracks_by_artist(db: State<'_, Db>) -> Result<Vec<ArtistGroup>, String> {
     let tracks: Vec<Track> = sqlx::query_as(
-        "SELECT t.id, t.source, t.title, t.artist, t.album, t.duration_secs, t.state
+        "SELECT t.id, t.source, t.title, t.artist, t.album, t.duration_secs, t.state, t.cover_key,
+                t.in_library
          FROM tracks t
+         WHERE t.in_library = 1
          ORDER BY LOWER(COALESCE(NULLIF(TRIM(t.artist), ''), 'Unknown Artist')),
                   t.album,
                   t.title",
@@ -220,3 +304,115 @@ mod tests {
         assert_eq!(display_artist(Some(" Radiohead")), "Radiohead");
     }
 }
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    /// Runs the real ORDER BY against real SQLite.
+    ///
+    /// Not a string comparison: the behaviour worth pinning is where NULLs
+    /// land, and only the database can answer that. SQLite sorts NULL *first*
+    /// ascending, which is the opposite of what "oldest first" should mean for
+    /// a date nobody knows.
+    async fn ordered(pool: &SqlitePool, sort: Sort, direction: Direction) -> Vec<String> {
+        let sql = format!("SELECT t.title FROM tracks t{}", sort.order_by(direction));
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn fixture(name: &str) -> SqlitePool {
+        let dir = std::env::temp_dir().join(format!("music-app-sort-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pool = crate::db::init(&dir).await.unwrap().pool;
+
+        // Deliberately mixed: one with everything, one missing the dates, one
+        // with a lowercase title so casing is exercised too.
+        for (title, uploaded, duration, added) in [
+            ("beta", Some(2_000i64), Some(300i64), 100i64),
+            ("Alpha", Some(1_000), Some(100), 300),
+            ("Gamma", None, None, 200),
+        ] {
+            sqlx::query(
+                "INSERT INTO tracks (source, title, local_path, state, uploaded_at, \
+                 duration_secs, date_added) VALUES ('local', ?, ?, 'present', ?, ?, ?)",
+            )
+            .bind(title)
+            .bind(format!("D:\\music\\{title}.mp3"))
+            .bind(uploaded)
+            .bind(duration)
+            .bind(added)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        pool
+    }
+
+    #[tokio::test]
+    async fn titles_sort_case_insensitively_in_both_directions() {
+        let pool = fixture("title").await;
+
+        // "beta" between "Alpha" and "Gamma" is the whole point: a binary sort
+        // would put every lowercase title after every uppercase one.
+        assert_eq!(
+            ordered(&pool, Sort::Title, Direction::Asc).await,
+            ["Alpha", "beta", "Gamma"]
+        );
+        assert_eq!(
+            ordered(&pool, Sort::Title, Direction::Desc).await,
+            ["Gamma", "beta", "Alpha"]
+        );
+    }
+
+    #[tokio::test]
+    async fn date_added_orders_by_when_it_joined_the_library() {
+        let pool = fixture("added").await;
+
+        assert_eq!(
+            ordered(&pool, Sort::DateAdded, Direction::Asc).await,
+            ["beta", "Gamma", "Alpha"]
+        );
+        assert_eq!(
+            ordered(&pool, Sort::DateAdded, Direction::Desc).await,
+            ["Alpha", "Gamma", "beta"]
+        );
+    }
+
+    /// The one that would be wrong without saying so explicitly.
+    #[tokio::test]
+    async fn an_unknown_upload_date_sorts_last_whichever_way_round() {
+        let pool = fixture("uploaded").await;
+
+        assert_eq!(
+            ordered(&pool, Sort::DateUploaded, Direction::Asc).await,
+            ["Alpha", "beta", "Gamma"],
+            "oldest first must not mean 'the ones we know nothing about'"
+        );
+        assert_eq!(
+            ordered(&pool, Sort::DateUploaded, Direction::Desc).await,
+            ["beta", "Alpha", "Gamma"],
+            "newest first must not put an unknown date at the top either"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_duration_also_sorts_last_both_ways() {
+        let pool = fixture("duration").await;
+
+        assert_eq!(
+            ordered(&pool, Sort::Duration, Direction::Asc).await,
+            ["Alpha", "beta", "Gamma"]
+        );
+        assert_eq!(
+            ordered(&pool, Sort::Duration, Direction::Desc).await,
+            ["beta", "Alpha", "Gamma"]
+        );
+    }
+}
+

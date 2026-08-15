@@ -8,144 +8,156 @@
 /*
  * The palette.
  *
- * Neutrals carry a small amount of chroma on a fixed hue (285, a cool violet)
- * rather than being pure grey. Pure grey next to a saturated accent reads as
- * dirty; a neutral that shares the accent's hue reads as deliberate. The cost
- * is one number repeated, which is why it is written down here once.
+ * Chroma is zero on every neutral. That is the demo's whole visual argument
+ * and it is a good one: with no hue in the chrome, the only coloured things on
+ * screen are the ones carrying meaning -- a tag, an offline badge, a
+ * destructive action. Tint the greys and those stop reading as signal.
  *
- * Every value is oklch because lightness there is perceptual: 0.55 in violet
- * and 0.55 in emerald genuinely look equally bright, so a tag palette built by
- * varying only the hue stays legible across all of it. That property is what
- * makes `--tag-h` below work at all.
+ * It also decides what "primary" is. There is no accent hue to be primary, so
+ * white is: the filled pill, the progress fill, the playing marker. On a
+ * near-black ground white is the loudest thing available, which is exactly
+ * what a primary action should be.
+ *
+ * Everything is oklch because lightness there is perceptual -- 0.66 in rose
+ * and 0.66 in teal genuinely look equally bright. That is what lets the tag
+ * palette vary hue alone and stay legible across all of it.
  */
 :root {
-	--background: oklch(0.985 0.002 285);
-	--foreground: oklch(0.21 0.015 285);
+	/* The light mirror: same structure, inverted. Near-white rather than
+	   white, so a pure-white surface can still sit above it. */
+	--background: oklch(0.975 0 0);
+	--foreground: oklch(0.16 0 0);
 
-	/* Raised above the background: rows, panels, the player bar. */
+	/* Raised: thumbnails, popovers, the settings cards. */
 	--card: oklch(1 0 0);
-	--card-foreground: oklch(0.21 0.015 285);
+	--card-foreground: oklch(0.16 0 0);
 	--popover: oklch(1 0 0);
-	--popover-foreground: oklch(0.21 0.015 285);
+	--popover-foreground: oklch(0.16 0 0);
 
-	--primary: oklch(0.53 0.215 296);
+	--primary: oklch(0.16 0 0);
 	--primary-foreground: oklch(0.99 0 0);
 
-	--secondary: oklch(0.955 0.005 285);
-	--secondary-foreground: oklch(0.25 0.015 285);
+	--secondary: oklch(0.94 0 0);
+	--secondary-foreground: oklch(0.22 0 0);
 
-	--muted: oklch(0.955 0.005 285);
-	--muted-foreground: oklch(0.52 0.014 285);
+	--muted: oklch(0.93 0 0);
+	--muted-foreground: oklch(0.50 0 0);
 
-	--accent: oklch(0.95 0.008 285);
-	--accent-foreground: oklch(0.25 0.02 296);
+	--accent: oklch(0 0 0 / 5%);
+	--accent-foreground: oklch(0.16 0 0);
 
-	--destructive: oklch(0.575 0.22 27);
+	--destructive: oklch(0.57 0.21 27);
 	--destructive-foreground: oklch(0.99 0 0);
 
 	/*
-	 * "This works without a connection." Its own colour, not the accent:
-	 * offline-readiness is a fact about a track, while the accent means
-	 * "this is the one you picked". Sharing a colour would blur both.
+	 * "This works without a connection."
+	 *
+	 * One of the few places colour is spent, and it is spent on a fact rather
+	 * than on decoration -- which is the rule that keeps the rest monochrome.
 	 */
-	--signal: oklch(0.52 0.13 165);
+	--signal: oklch(0.52 0.12 165);
 
-	--border: oklch(0.91 0.005 285);
-	--input: oklch(0.90 0.006 285);
-	--ring: oklch(0.53 0.215 296);
+	--border: oklch(0 0 0 / 11%);
+	--input: oklch(0 0 0 / 14%);
+	--ring: oklch(0.16 0 0);
 
-	--chart-1: oklch(0.53 0.215 296);
-	--chart-2: oklch(0.62 0.16 250);
-	--chart-3: oklch(0.66 0.15 195);
-	--chart-4: oklch(0.70 0.16 145);
-	--chart-5: oklch(0.72 0.17 85);
+	--chart-1: oklch(0.16 0 0);
+	--chart-2: oklch(0.40 0 0);
+	--chart-3: oklch(0.55 0 0);
+	--chart-4: oklch(0.68 0 0);
+	--chart-5: oklch(0.80 0 0);
 
 	--radius: 0.625rem;
 
-	--sidebar: oklch(0.968 0.004 285);
-	--sidebar-foreground: oklch(0.21 0.015 285);
-	--sidebar-primary: oklch(0.53 0.215 296);
+	/* The rail floats on the background rather than sitting on a panel, so
+	   it shares the background's colour and has no border of its own. */
+	--sidebar: oklch(0.975 0 0);
+	--sidebar-foreground: oklch(0.16 0 0);
+	--sidebar-primary: oklch(0.16 0 0);
 	--sidebar-primary-foreground: oklch(0.99 0 0);
-	--sidebar-accent: oklch(0.93 0.008 285);
-	--sidebar-accent-foreground: oklch(0.25 0.02 296);
-	--sidebar-border: oklch(0.90 0.005 285);
-	--sidebar-ring: oklch(0.53 0.215 296);
+	--sidebar-accent: oklch(0 0 0 / 6%);
+	--sidebar-accent-foreground: oklch(0.16 0 0);
+	--sidebar-border: oklch(0 0 0 / 9%);
+	--sidebar-ring: oklch(0.16 0 0);
 
-	/* The window frame we draw ourselves. */
-	--titlebar: oklch(0.968 0.004 285);
-	--titlebar-foreground: oklch(0.42 0.014 285);
+	--titlebar: oklch(0.975 0 0);
+	--titlebar-foreground: oklch(0.45 0 0);
 
 	/* Tag chips: lightness and chroma are fixed, only `--tag-h` varies. */
-	--tag-bg-l: 0.955;
-	--tag-bg-c: 0.045;
-	--tag-fg-l: 0.44;
-	--tag-fg-c: 0.155;
-	--tag-border-l: 0.88;
-	--tag-border-c: 0.07;
+	--tag-bg-l: 0.95;
+	--tag-bg-c: 0.05;
+	--tag-fg-l: 0.42;
+	--tag-fg-c: 0.16;
+	--tag-border-l: 0.86;
+	--tag-border-c: 0.075;
 
 	color-scheme: light;
 }
 
 .dark {
 	/*
-	 * Not pure black. An OLED-black background makes every raised surface
-	 * look like it is glowing, and a player is mostly raised surfaces.
+	 * Near-black, and the app is drawn almost entirely on it. Raised surfaces
+	 * are rare on purpose -- the demo puts the track list straight onto the
+	 * background and reserves elevation for things that really are objects
+	 * (artwork, popovers). That is what makes a list of sixty rows feel calm.
+	 *
+	 * Not pure black: a #000 ground makes every raised surface look like it is
+	 * glowing, and it leaves nowhere to go for a surface that must sit lower.
 	 */
-	--background: oklch(0.165 0.011 285);
-	--foreground: oklch(0.96 0.003 285);
+	--background: oklch(0.115 0 0);
+	--foreground: oklch(0.97 0 0);
 
-	--card: oklch(0.205 0.013 285);
-	--card-foreground: oklch(0.96 0.003 285);
-	--popover: oklch(0.225 0.014 285);
-	--popover-foreground: oklch(0.96 0.003 285);
+	--card: oklch(0.185 0 0);
+	--card-foreground: oklch(0.97 0 0);
+	--popover: oklch(0.19 0 0);
+	--popover-foreground: oklch(0.97 0 0);
 
-	/* Lifted and desaturated, because the same violet on a dark ground
-	   reads far more intense than it does on white. */
-	--primary: oklch(0.72 0.165 296);
-	--primary-foreground: oklch(0.17 0.03 296);
+	/* White. The filled pill, the progress fill, the playing marker. */
+	--primary: oklch(0.98 0 0);
+	--primary-foreground: oklch(0.14 0 0);
 
-	--secondary: oklch(0.27 0.014 285);
-	--secondary-foreground: oklch(0.96 0.003 285);
+	--secondary: oklch(0.24 0 0);
+	--secondary-foreground: oklch(0.97 0 0);
 
-	--muted: oklch(0.27 0.014 285);
-	--muted-foreground: oklch(0.68 0.014 285);
+	--muted: oklch(0.24 0 0);
+	--muted-foreground: oklch(0.63 0 0);
 
 	--accent: oklch(1 0 0 / 7%);
-	--accent-foreground: oklch(0.97 0.01 296);
+	--accent-foreground: oklch(0.98 0 0);
 
-	--destructive: oklch(0.68 0.19 24);
-	--destructive-foreground: oklch(0.15 0.02 24);
+	--destructive: oklch(0.66 0.19 24);
+	--destructive-foreground: oklch(0.14 0 0);
 
-	--signal: oklch(0.76 0.14 165);
+	--signal: oklch(0.78 0.13 165);
 
-	--border: oklch(1 0 0 / 9%);
-	--input: oklch(1 0 0 / 13%);
-	--ring: oklch(0.72 0.165 296);
+	--border: oklch(1 0 0 / 10%);
+	--input: oklch(1 0 0 / 14%);
+	--ring: oklch(0.98 0 0);
 
-	--chart-1: oklch(0.72 0.165 296);
-	--chart-2: oklch(0.70 0.14 250);
-	--chart-3: oklch(0.74 0.13 195);
-	--chart-4: oklch(0.78 0.14 145);
-	--chart-5: oklch(0.80 0.15 85);
+	--chart-1: oklch(0.98 0 0);
+	--chart-2: oklch(0.78 0 0);
+	--chart-3: oklch(0.62 0 0);
+	--chart-4: oklch(0.46 0 0);
+	--chart-5: oklch(0.32 0 0);
 
-	--sidebar: oklch(0.185 0.012 285);
-	--sidebar-foreground: oklch(0.96 0.003 285);
-	--sidebar-primary: oklch(0.72 0.165 296);
-	--sidebar-primary-foreground: oklch(0.17 0.03 296);
-	--sidebar-accent: oklch(1 0 0 / 7%);
-	--sidebar-accent-foreground: oklch(0.97 0.01 296);
-	--sidebar-border: oklch(1 0 0 / 8%);
-	--sidebar-ring: oklch(0.72 0.165 296);
+	--sidebar: oklch(0.115 0 0);
+	--sidebar-foreground: oklch(0.97 0 0);
+	--sidebar-primary: oklch(0.98 0 0);
+	--sidebar-primary-foreground: oklch(0.14 0 0);
+	--sidebar-accent: oklch(1 0 0 / 8%);
+	--sidebar-accent-foreground: oklch(0.98 0 0);
+	--sidebar-border: oklch(1 0 0 / 9%);
+	--sidebar-ring: oklch(0.98 0 0);
 
-	--titlebar: oklch(0.185 0.012 285);
-	--titlebar-foreground: oklch(0.70 0.014 285);
+	--titlebar: oklch(0.115 0 0);
+	--titlebar-foreground: oklch(0.66 0 0);
 
-	--tag-bg-l: 0.30;
-	--tag-bg-c: 0.055;
-	--tag-fg-l: 0.83;
-	--tag-fg-c: 0.125;
-	--tag-border-l: 0.40;
-	--tag-border-c: 0.075;
+	--tag-bg-l: 0.28;
+	--tag-bg-c: 0.06;
+	--tag-fg-l: 0.84;
+	--tag-fg-c: 0.13;
+	--tag-border-l: 0.38;
+	--tag-border-c: 0.08;
 
 	color-scheme: dark;
 }

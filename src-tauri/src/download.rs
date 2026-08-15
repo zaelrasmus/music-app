@@ -121,7 +121,7 @@ pub async fn download_track(
     // so an id alone could collide with another provider's in one directory.
     let name_key = format!("{}-{}", provider.as_str(), remote_id);
 
-    let (final_path, partial_path) =
+    let (final_path, partial_path, uploaded_at) =
         fetch_with_retries(&yt_dlp, &ffmpeg, &remote_url, &name_key, &dir).await?;
 
     // Only now does the file become the real one, so an interrupted download
@@ -135,8 +135,21 @@ pub async fn download_track(
         .to_str()
         .ok_or("The download path is not valid UTF-8.")?;
 
-    sqlx::query("UPDATE tracks SET local_path = ?, state = 'downloaded' WHERE id = ?")
+    // Downloading is the strongest "I want to keep this" there is, so it also
+    // files the track in the library. Otherwise you could deliberately save a
+    // copy to disk and still not find it anywhere but history.
+    //
+    // The upload date comes along for free from the same resolve. COALESCE so
+    // a date already known -- from the search result, or from an earlier play
+    // -- is never replaced by a NULL from a provider that did not report one.
+    sqlx::query(
+        "UPDATE tracks \
+         SET local_path = ?, state = 'downloaded', in_library = 1, \
+             uploaded_at = COALESCE(uploaded_at, ?) \
+         WHERE id = ?",
+    )
         .bind(stored)
+        .bind(uploaded_at)
         .bind(track_id)
         .execute(&db.pool)
         .await
@@ -169,7 +182,8 @@ pub async fn fetch_into_cache(
     for attempt in 1..=FETCH_ATTEMPTS {
         // A fresh URL each time: the signed links are short-lived enough that
         // retrying the same one just fails again.
-        let (url, _extension) = resolve_format(yt_dlp.to_path_buf(), page_url).await?;
+        let (url, _extension, _uploaded_at) =
+            resolve_format(yt_dlp.to_path_buf(), page_url).await?;
 
         match copy_stream(ffmpeg.to_path_buf(), &url, &pending.partial).await {
             Ok(()) => {
@@ -207,24 +221,25 @@ const FETCH_ATTEMPTS: usize = 3;
 /// one just fails again.
 ///
 /// Returns the finished and partial paths, with the audio already at the
-/// partial one.
+/// partial one, plus whatever the resolve learned about the upload date.
 async fn fetch_with_retries(
     yt_dlp: &Path,
     ffmpeg: &Path,
     page_url: &str,
     name_key: &str,
     dir: &Path,
-) -> Result<(PathBuf, PathBuf), String> {
+) -> Result<(PathBuf, PathBuf, Option<i64>), String> {
     let mut last_error = String::new();
 
     for attempt in 1..=FETCH_ATTEMPTS {
-        let (url, extension) = resolve_format(yt_dlp.to_path_buf(), page_url).await?;
+        let (url, extension, uploaded_at) =
+            resolve_format(yt_dlp.to_path_buf(), page_url).await?;
 
         let final_path = dir.join(final_file_name(name_key, &extension));
         let partial_path = dir.join(partial_file_name(name_key, &extension));
 
         match copy_stream(ffmpeg.to_path_buf(), &url, &partial_path).await {
-            Ok(()) => return Ok((final_path, partial_path)),
+            Ok(()) => return Ok((final_path, partial_path, uploaded_at)),
             Err(e) => {
                 // A rejected fetch can still leave a stub file behind.
                 let _ = std::fs::remove_file(&partial_path);
@@ -250,13 +265,20 @@ async fn fetch_with_retries(
 ///
 /// Both in one invocation: yt-dlp takes seconds to start, and asking twice
 /// would also risk the two answers describing different formats.
-async fn resolve_format(yt_dlp: PathBuf, page_url: &str) -> Result<(String, String), String> {
+async fn resolve_format(
+    yt_dlp: PathBuf,
+    page_url: &str,
+) -> Result<(String, String, Option<i64>), String> {
     let url = page_url.to_string();
 
     let output = tauri::async_runtime::spawn_blocking(move || {
         Command::new(&yt_dlp)
             .args(["-f", "bestaudio[ext=m4a]/bestaudio"])
-            .args(["--print", "urls", "--print", "ext"])
+            // Timestamp last on purpose: `--print` writes in flag order, so
+            // appending leaves the two positions parsed below exactly where
+            // they were. Free, like the playback resolve -- the extraction has
+            // already happened to produce the URL.
+            .args(["--print", "urls", "--print", "ext", "--print", "timestamp"])
             .args(["--no-warnings", "--no-playlist"])
             .arg(url)
             .output()
@@ -282,7 +304,14 @@ async fn resolve_format(yt_dlp: PathBuf, page_url: &str) -> Result<(String, Stri
 
     let extension = lines.next().unwrap_or("m4a").to_string();
 
-    Ok((url, sanitize_extension(&extension)))
+    // A field yt-dlp cannot supply prints as `NA`, which simply fails to
+    // parse. Zero means the provider said nothing useful, not 1970.
+    let uploaded_at = lines
+        .next()
+        .and_then(|line| line.parse::<i64>().ok())
+        .filter(|seconds| *seconds > 0);
+
+    Ok((url, sanitize_extension(&extension), uploaded_at))
 }
 
 /// Copies the remote audio packets into `destination` without re-encoding.
@@ -485,7 +514,7 @@ mod network_tests {
         )
         .await;
 
-        let (_final_path, destination) = match fetched {
+        let (_final_path, destination, _uploaded_at) = match fetched {
             Ok(paths) => paths,
             Err(e) => {
                 // YouTube refuses a large share of these outright, and the

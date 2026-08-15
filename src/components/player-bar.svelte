@@ -35,6 +35,17 @@
 
     // Total comes from the scanned tag, not from rodio, whose total_duration
     // is None for several formats.
+    /**
+     * The playing track's artwork.
+     *
+     * `nowPlaying` is a queue entry or a library row depending on which
+     * arrived first, and only the queue entry carries a cover key -- so this
+     * reads it defensively rather than assuming a shape.
+     */
+    const coverKey = $derived(
+        (nowPlaying as { coverKey?: string | null } | null)?.coverKey ?? null,
+    );
+
     const totalSecs = $derived(nowPlaying?.durationSecs ?? 0);
     const loading = $derived(player.state === "loading");
     /**
@@ -74,18 +85,31 @@
     /** Ghost buttons in the transport row; the play button is separate. */
     const ghost =
         "grid size-8 shrink-0 place-items-center rounded-md transition-colors hover:bg-accent focus-visible:outline-none focus-visible:bg-accent disabled:opacity-40 disabled:hover:bg-transparent";
-    const on = "text-primary";
+    const on = "text-foreground";
     const off = "text-muted-foreground hover:text-foreground";
 </script>
 
+<!--
+  The player bar sits on the background, not on a raised card. The demo draws
+  it as part of the window rather than as a panel stuck to the bottom, and a
+  single hairline is enough to separate it from the list above.
+-->
 <footer
-    class="bg-card border-border/70 relative flex h-[74px] shrink-0 items-center gap-3 border-t px-3"
+    class="border-border/60 relative flex h-[78px] shrink-0 items-center gap-4 border-t px-4"
 >
-    <!-- Left: what is playing. Sized as a third so the transport stays centred
-         in the window rather than centred in whatever is left over. -->
-    <div class="flex w-[30%] min-w-0 items-center gap-3">
+    <!--
+      Left: what is playing.
+      Wider than the demo's, which truncated the title while leaving a large
+      empty gap before the transport. The centre column is fixed, so this can
+      take whatever the window has spare.
+    -->
+    <div class="flex min-w-0 flex-1 items-center gap-3">
         {#if nowPlaying}
-            <CoverArt seed={coverSeed(nowPlaying)} class="size-12" />
+            <CoverArt
+                seed={coverSeed(nowPlaying)}
+                coverKey={coverKey}
+                class="size-[52px] rounded-lg"
+            />
             <div class="flex min-w-0 flex-col gap-0.5">
                 <span class="selectable truncate text-[13px] leading-tight font-medium">
                     {nowPlaying.title}
@@ -114,15 +138,16 @@
                 </span>
             </div>
         {:else}
-            <div class="bg-muted grid size-12 shrink-0 place-items-center rounded-md">
+            <div class="bg-muted grid size-[52px] shrink-0 place-items-center rounded-lg">
                 <ListMusicIcon class="text-muted-foreground size-5" />
             </div>
             <span class="text-muted-foreground text-[13px]">Nothing playing</span>
         {/if}
     </div>
 
-    <!-- Centre: transport over the seek bar. -->
-    <div class="flex min-w-0 flex-1 flex-col items-center gap-1">
+    <!-- Centre: transport over the seek bar. Fixed width, so the controls stay
+         put as the title beside them changes length. -->
+    <div class="flex w-[34rem] max-w-[45%] shrink-0 flex-col items-center gap-1">
         <div class="flex items-center gap-1">
             <button
                 type="button"
@@ -149,7 +174,7 @@
                  modifier; this is the verb. -->
             <button
                 type="button"
-                class="bg-foreground text-background grid size-9 shrink-0 place-items-center rounded-full transition-transform hover:scale-105 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-card active:scale-95 disabled:opacity-50 disabled:hover:scale-100"
+                class="bg-foreground text-background grid size-9 shrink-0 place-items-center rounded-full transition-transform hover:scale-105 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background active:scale-95 disabled:opacity-50 disabled:hover:scale-100"
                 aria-label={loading
                     ? "Loading"
                     : player.state === "playing"
@@ -193,7 +218,7 @@
             </button>
         </div>
 
-        <div class="flex w-full max-w-[32rem] items-center gap-2">
+        <div class="flex w-full items-center gap-2.5">
             <span
                 class="text-muted-foreground w-9 shrink-0 text-right text-[11px] tabular-nums"
             >
@@ -218,7 +243,7 @@
     </div>
 
     <!-- Right: volume and the queue. -->
-    <div class="flex w-[30%] min-w-0 items-center justify-end gap-1">
+    <div class="flex min-w-0 flex-1 items-center justify-end gap-1">
         <button
             type="button"
             class="{ghost} {off}"

@@ -285,6 +285,56 @@ async fn a_saved_youtube_track_streams() {
     eprintln!("errors:   {errors:?}");
     eprintln!("progress: {progress:?}");
 
+    // The upload date rides along on the resolve.
+    //
+    // YouTube publishes nothing datelike in `--flat-playlist` search, so this
+    // is the *only* way a YouTube track ever learns when it was uploaded --
+    // and it is free, because the resolve has already done the extraction that
+    // produces it. Worth asserting end to end rather than only parsing a
+    // fixture: what would break here is yt-dlp's output, not our parsing.
+    //
+    // Checked *before* the skip below, and deliberately so. Every skippable
+    // condition except an outright resolve failure happens after yt-dlp has
+    // already succeeded -- a 403 comes from ffmpeg fetching the URL yt-dlp
+    // returned, and a missing audio device stops playback, not resolution. So
+    // the date must be there in all of those cases, and letting the skip run
+    // first would leave this assertion never executing on a red day.
+    //
+    // Fire-and-forget, so it may land just after playback starts.
+    let mut uploaded_at: Option<i64> = None;
+    for _ in 0..20 {
+        uploaded_at = sqlx::query_scalar("SELECT uploaded_at FROM tracks WHERE id = ?")
+            .bind(track_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        if uploaded_at.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // The only failures that mean yt-dlp itself never ran or never answered.
+    // Nothing can be concluded about the date in those cases.
+    let resolve_failed = |e: &String| {
+        e.contains("internet connection")
+            || e.contains("Could not find yt-dlp")
+            || e.contains("Could not start yt-dlp")
+            || e.contains("no longer available")
+    };
+
+    if errors.iter().any(resolve_failed) {
+        eprintln!("SKIP: yt-dlp never resolved, so nothing can be asserted about the date");
+    } else {
+        let uploaded_at =
+            uploaded_at.expect("playing a YouTube track must record its upload date");
+        // 2009-10-25, and it is not going to change.
+        assert!(
+            (1_256_000_000..1_257_000_000).contains(&uploaded_at),
+            "expected the real upload date, got {uploaded_at}"
+        );
+    }
+
     // Conditions outside this codebase. A 403 in particular is YouTube
     // refusing the request -- usually because the bundled yt-dlp has aged out
     // of whatever client YouTube currently accepts. That is worth reporting

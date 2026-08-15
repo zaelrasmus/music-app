@@ -9,6 +9,7 @@ export type Playlist = {
   coverPath: string | null;
   createdAt: number;
   trackCount: number;
+  coverKey?: string | null;
 };
 
 export type PlaylistDetail = {
@@ -140,6 +141,31 @@ class PlaylistStore {
     } catch (e) {
       toast.error(String(e));
       return false;
+    }
+  }
+
+  /**
+   * Gives the playlist artwork from a file on disk.
+   *
+   * The backend copies the image into the cover store and normalises it, so
+   * nothing here depends on where the file was or how large it is.
+   */
+  async setCover(playlistId: number, path: string) {
+    try {
+      await invoke("set_playlist_cover", { playlistId, path });
+      await this.refreshOpen();
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
+  /** Back to artwork generated from the playlist's name. */
+  async clearCover(playlistId: number) {
+    try {
+      await invoke("clear_playlist_cover", { playlistId });
+      await this.refreshOpen();
+    } catch (e) {
+      toast.error(String(e));
     }
   }
 

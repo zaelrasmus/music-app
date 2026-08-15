@@ -11,7 +11,9 @@ use crate::tracks::Track;
 pub struct Playlist {
     pub id: i64,
     pub name: String,
-    pub cover_path: Option<String>,
+    /// Names a file in the cover store, set by the user. `None` means
+    /// artwork generated from the playlist's name.
+    pub cover_key: Option<String>,
     pub created_at: i64,
     /// Shown in the list so a playlist's size is visible without opening it.
     pub track_count: i64,
@@ -99,7 +101,7 @@ pub async fn delete_playlist(db: State<'_, Db>, playlist_id: i64) -> Result<(), 
 #[tauri::command]
 pub async fn list_playlists(db: State<'_, Db>) -> Result<Vec<Playlist>, String> {
     sqlx::query_as(
-        "SELECT p.id, p.name, p.cover_path, p.created_at,
+        "SELECT p.id, p.name, p.cover_key, p.created_at,
                 COUNT(pt.track_id) AS track_count
          FROM playlists p
          LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
@@ -140,7 +142,7 @@ pub async fn get_playlist(
     }
 
     let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(
-        "SELECT t.id, t.source, t.title, t.artist, t.album, t.duration_secs, t.state
+        "SELECT t.id, t.source, t.title, t.artist, t.album, t.duration_secs, t.state, t.cover_key, t.in_library
          FROM playlist_tracks pt
          JOIN tracks t ON t.id = pt.track_id",
     );
@@ -331,7 +333,7 @@ pub async fn reorder_playlist_track(
 
 async fn load_playlist(pool: &sqlx::SqlitePool, playlist_id: i64) -> Result<Playlist, String> {
     sqlx::query_as(
-        "SELECT p.id, p.name, p.cover_path, p.created_at,
+        "SELECT p.id, p.name, p.cover_key, p.created_at,
                 COUNT(pt.track_id) AS track_count
          FROM playlists p
          LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id

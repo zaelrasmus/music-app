@@ -2,7 +2,7 @@
     import * as DropdownMenu from "$components/ui/dropdown-menu";
     import { player } from "$lib/player.svelte";
     import { playlistStore } from "$lib/playlists.svelte";
-    import { trackStore, type Track } from "$lib/tracks.svelte";
+    import { trackStore, setInLibrary, type Track } from "$lib/tracks.svelte";
     import { promptFor } from "$lib/prompt.svelte";
     import MoreHorizontalIcon from "@lucide/svelte/icons/more-horizontal";
     import CornerUpRightIcon from "@lucide/svelte/icons/corner-up-right";
@@ -12,6 +12,8 @@
     import TagIcon from "@lucide/svelte/icons/tag";
     import DownloadIcon from "@lucide/svelte/icons/download";
     import Trash2Icon from "@lucide/svelte/icons/trash-2";
+    import LibraryBigIcon from "@lucide/svelte/icons/library-big";
+    import BookmarkPlusIcon from "@lucide/svelte/icons/bookmark-plus";
     import LoaderIcon from "@lucide/svelte/icons/loader-circle";
     import type { Snippet } from "svelte";
 
@@ -41,6 +43,12 @@
         track?: Track | null;
         onEdit?: () => void;
         onTag?: () => void;
+        /**
+         * Called after library membership changes, so the list that owns this
+         * row can reload — a track removed from the library has to leave the
+         * library view, and this component cannot know which list it is in.
+         */
+        onLibraryChange?: () => void;
         /** Context-specific items, e.g. "Remove from this playlist". */
         extra?: Snippet;
         align?: "start" | "end";
@@ -54,6 +62,7 @@
         track = null,
         onEdit,
         onTag,
+        onLibraryChange,
         extra,
         align = "end",
         trigger = "",
@@ -71,6 +80,24 @@
             const trackId = await resolveTrackId();
             if (trackId === null) return;
             await action(trackId);
+        } finally {
+            busy = false;
+        }
+    }
+
+    /**
+     * Local files are always in the library — there is nowhere else for a file
+     * on your disk to be — so the option is only meaningful for streamed ones.
+     */
+    const canFile = $derived(track === null || track.source !== "local");
+    const filed = $derived(track?.inLibrary ?? false);
+
+    async function file(inLibrary: boolean) {
+        busy = true;
+        try {
+            const trackId = await resolveTrackId();
+            if (trackId === null) return;
+            if (await setInLibrary(trackId, inLibrary)) onLibraryChange?.();
         } finally {
             busy = false;
         }
@@ -151,6 +178,21 @@
                 </DropdownMenu.Item>
             </DropdownMenu.SubContent>
         </DropdownMenu.Sub>
+
+        {#if canFile}
+            <DropdownMenu.Separator />
+            {#if filed}
+                <DropdownMenu.Item onSelect={() => file(false)}>
+                    <LibraryBigIcon />
+                    Remove from library
+                </DropdownMenu.Item>
+            {:else}
+                <DropdownMenu.Item onSelect={() => file(true)}>
+                    <BookmarkPlusIcon />
+                    Add to library
+                </DropdownMenu.Item>
+            {/if}
+        {/if}
 
         {#if onEdit || onTag}
             <DropdownMenu.Separator />

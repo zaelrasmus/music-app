@@ -18,6 +18,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use sqlx::SqlitePool;
+
 /// Trimmed off any parsed expiry, so a URL is never handed out moments before
 /// it dies -- a stream that starts and then stops is worse than a slow start.
 const SAFETY_MARGIN: Duration = Duration::from_secs(300);
@@ -39,18 +41,63 @@ struct Entry {
 #[derive(Default)]
 pub struct StreamUrlCache {
     entries: Mutex<HashMap<String, Entry>>,
+    /// Absent in tests, which exercise the expiry logic and nothing else.
+    pool: Option<SqlitePool>,
 }
 
 impl StreamUrlCache {
+    /// A cache that also records what a resolve happens to teach it.
+    ///
+    /// The pool is here rather than in the caller because this is the only
+    /// place that observes a resolve actually running -- everything above sees
+    /// a URL and cannot tell a fresh one from a cached one. Since the resolve
+    /// is the one moment a YouTube upload date is available for free, the
+    /// write belongs where that moment is visible.
+    pub fn with_pool(pool: SqlitePool) -> Self {
+        Self {
+            entries: Mutex::default(),
+            pool: Some(pool),
+        }
+    }
+
     /// Returns a playable stream URL, resolving only when necessary.
     pub async fn resolve(&self, yt_dlp: &Path, page_url: &str) -> Result<String, String> {
         if let Some(url) = self.lookup(page_url, SystemTime::now()) {
             return Ok(url);
         }
 
-        let url = crate::youtube::resolve_stream_url(yt_dlp, page_url).await?;
-        self.store(page_url, url.clone(), SystemTime::now());
-        Ok(url)
+        let resolved = crate::youtube::resolve_stream_url(yt_dlp, page_url).await?;
+        self.store(page_url, resolved.url.clone(), SystemTime::now());
+
+        if let Some(uploaded_at) = resolved.uploaded_at {
+            self.remember_upload_date(page_url, uploaded_at);
+        }
+
+        Ok(resolved.url)
+    }
+
+    /// Files the upload date against whichever track has this page URL.
+    ///
+    /// Fire-and-forget, and only fills a gap: `uploaded_at IS NULL` means a
+    /// date already recorded at save time -- SoundCloud reports one in search
+    /// results -- is never overwritten by a later resolve. Failure costs
+    /// nothing, because the next play resolves again.
+    fn remember_upload_date(&self, page_url: &str, uploaded_at: i64) {
+        let Some(pool) = self.pool.clone() else {
+            return;
+        };
+        let page_url = page_url.to_string();
+
+        tauri::async_runtime::spawn(async move {
+            let _ = sqlx::query(
+                "UPDATE tracks SET uploaded_at = ? \
+                 WHERE remote_url = ? AND uploaded_at IS NULL",
+            )
+            .bind(uploaded_at)
+            .bind(&page_url)
+            .execute(&pool)
+            .await;
+        });
     }
 
     /// Forgets any cached URL for `page_url`.

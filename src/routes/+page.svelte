@@ -11,6 +11,7 @@
     import { tagStore } from "$lib/tags.svelte";
     import { libraryView } from "$lib/library-view.svelte";
     import { queueStore } from "$lib/queue.svelte";
+    import { covers } from "$lib/covers.svelte";
 
     import LibraryView from "$components/library-view.svelte";
     import ProviderSearch from "$components/provider-search.svelte";
@@ -24,20 +25,34 @@
         playlistStore.load();
         tagStore.load();
         tagStore.loadPalette();
-        libraryView.refresh();
+        // `restore` refreshes once the saved sort is known, so the list is not
+        // fetched twice and does not visibly reorder itself on launch.
+        libraryView.restore();
         providerSearch.loadProviders();
         cacheStore.restore();
         historyStore.load();
+        covers.load();
         player.restorePreferences().then(() => player.restorePlayback());
 
         const scans = trackStore.listenForScans();
         const playback = player.listenForPlayer();
         const queue = queueStore.listenForQueue();
 
+        // Artwork for a just-saved track arrives after the save returned, so
+        // the lists holding that row have to be told. Reloading them is a few
+        // local queries and far less code than patching one row in each of
+        // four arrays — and it cannot drift out of step with the database.
+        const artwork = covers.listenForCovers(() => {
+            void libraryView.refresh();
+            void historyStore.load();
+            void queueStore.refresh();
+        });
+
         return () => {
             scans.then((off) => off());
             playback.then((off) => off());
             queue.then((off) => off());
+            artwork.then((off) => off());
         };
     });
 </script>

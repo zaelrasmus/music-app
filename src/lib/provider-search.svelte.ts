@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "svelte-sonner";
 import { player } from "$lib/player.svelte";
 import { trackStore } from "$lib/tracks.svelte";
+import { libraryView } from "$lib/library-view.svelte";
+import { SvelteSet } from "svelte/reactivity";
 
 export type Provider = "youtube" | "soundcloud";
 
@@ -126,6 +128,16 @@ class ProviderSearchStore {
   saving = $state<string | null>(null);
 
   /**
+   * Results filed in the library during this session, by remote id.
+   *
+   * Only so the button can say "Added" instead of offering again. Not a source
+   * of truth -- the database is -- and deliberately not persisted: it exists
+   * to give feedback within one search, and a stale answer after a restart
+   * would be worse than no answer.
+   */
+  added = new SvelteSet<string>();
+
+  /**
    * Saves a result as a `saved` track and plays it.
    *
    * Saving is idempotent per provider, so picking the same result twice reuses
@@ -137,8 +149,12 @@ class ProviderSearchStore {
 
     try {
       const trackId = await invoke<number>("save_remote_track", { result });
-      // It is a library track now, so the list below should show it.
-      await trackStore.load();
+      // Deliberately *not* added to the library. Playing something to find out
+      // whether you like it is not a decision to keep it, and nine rejected
+      // auditions in the library is the cost of assuming otherwise. History
+      // remembers it either way, which is the way back if it turns out to be
+      // the one.
+      //
       // Resolving the stream takes seconds; the player reports `loading`
       // until audio actually starts.
       await player.playQueue([trackId], 0, `${this.providerName} search`);
@@ -165,6 +181,28 @@ class ProviderSearchStore {
     } catch (e) {
       toast.error(String(e));
       return null;
+    } finally {
+      this.saving = null;
+    }
+  }
+
+  /**
+   * Saves a result and files it in the library.
+   *
+   * The explicit gesture that nothing else performs: every other path here
+   * creates the row without claiming the user wants to keep it.
+   */
+  async addToLibrary(result: SearchResult): Promise<boolean> {
+    this.saving = result.remoteId;
+    try {
+      const trackId = await invoke<number>("save_remote_track", { result });
+      await invoke("set_in_library", { trackId, inLibrary: true });
+      this.added.add(result.remoteId);
+      await Promise.all([trackStore.load(), libraryView.refresh()]);
+      return true;
+    } catch (e) {
+      toast.error(String(e));
+      return false;
     } finally {
       this.saving = null;
     }
