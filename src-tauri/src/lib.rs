@@ -72,7 +72,11 @@ pub fn run() {
 
             // Disposable copies of streamed audio, so replaying or seeking
             // backwards does not fetch the same bytes twice.
+            // One instance, shared: the settings commands and the player must
+            // agree about the limit, or changing it would only take effect on
+            // the next launch.
             let audio_cache = audio_cache::AudioCache::new(data_dir.join("cache").join("audio"));
+            app.manage(audio_cache.clone());
 
             app.manage(player::spawn(
                 app.handle().clone(),
@@ -125,6 +129,9 @@ pub fn run() {
             player::set_repeat,
             player::set_shuffle,
             player::seek,
+            audio_cache::audio_cache_stats,
+            audio_cache::set_audio_cache_limit,
+            audio_cache::clear_audio_cache,
             providers::list_providers,
             youtube::search_provider,
             youtube::save_remote_track,

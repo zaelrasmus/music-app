@@ -15,11 +15,32 @@
 //! audio being played and the file kept for next time.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::SystemTime;
 
-/// Ceiling on the whole cache. At the measured rate this is roughly eighteen
-/// hours of audio.
+use serde::Serialize;
+
+/// Default ceiling on the whole cache. At the measured rate this is roughly
+/// eighteen hours of audio.
+///
+/// A default rather than a fixed rule: how much disk to spend on this is the
+/// user's call, and a machine with 8 TB free and one with 8 GB free do not
+/// want the same answer. Sizing it automatically would mean taking on a
+/// dependency purely to ask the OS how much room is left -- a poor trade
+/// against letting people see the number and change it.
 const DEFAULT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Floor, so a mistyped setting cannot quietly make caching useless.
+const MIN_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What the settings UI shows.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheStats {
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+}
 
 /// Matroska, because `-c copy` has to accept whatever codec the provider sent
 /// without us having probed it first -- AAC from YouTube, AAC-in-HLS from
@@ -42,7 +63,7 @@ pub struct PendingCache {
     /// its limit for as long as nobody plays anything new -- which is exactly
     /// when a user is most likely to look at their disk usage.
     dir: PathBuf,
-    max_bytes: u64,
+    max_bytes: Arc<AtomicU64>,
 }
 
 impl PendingCache {
@@ -52,7 +73,7 @@ impl PendingCache {
             let _ = std::fs::remove_file(&self.partial);
             return;
         }
-        evict(&self.dir, self.max_bytes);
+        evict(&self.dir, self.max_bytes.load(Ordering::Relaxed));
     }
 
     pub fn discard(self) {
@@ -60,22 +81,57 @@ impl PendingCache {
     }
 }
 
+/// Cloned freely: every copy shares one limit, so changing it in the settings
+/// reaches the copy the player is already holding.
+#[derive(Clone)]
 pub struct AudioCache {
     dir: PathBuf,
-    max_bytes: u64,
+    max_bytes: Arc<AtomicU64>,
 }
 
 impl AudioCache {
     pub fn new(dir: PathBuf) -> Self {
+        Self::with_limit(dir, DEFAULT_MAX_BYTES)
+    }
+
+    /// Takes `max_bytes` as given. The floor belongs on [`Self::set_limit`],
+    /// which is where a number actually arrives from outside.
+    pub fn with_limit(dir: PathBuf, max_bytes: u64) -> Self {
         Self {
             dir,
-            max_bytes: DEFAULT_MAX_BYTES,
+            max_bytes: Arc::new(AtomicU64::new(max_bytes)),
         }
     }
 
-    #[cfg(test)]
-    fn with_limit(dir: PathBuf, max_bytes: u64) -> Self {
-        Self { dir, max_bytes }
+    pub fn set_limit(&self, max_bytes: u64) {
+        self.max_bytes
+            .store(max_bytes.max(MIN_MAX_BYTES), Ordering::Relaxed);
+        // Applied at once: lowering the limit should free space now, not at
+        // some unpredictable later moment.
+        evict(&self.dir, self.limit());
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.max_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            used_bytes: self.used_bytes(),
+            limit_bytes: self.limit(),
+        }
+    }
+
+    /// Empties the cache. Downloads are untouched -- those were deliberate.
+    pub fn clear(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.metadata().is_ok_and(|m| m.is_file()) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 
     /// The cached file for a track, if it is there.
@@ -103,7 +159,7 @@ impl AudioCache {
     /// silently inert rather than breaking playback.
     pub fn reserve(&self, source: &str, remote_id: &str) -> Option<PendingCache> {
         std::fs::create_dir_all(&self.dir).ok()?;
-        evict(&self.dir, self.max_bytes);
+        evict(&self.dir, self.limit());
 
         let complete = self.dir.join(file_name(source, remote_id, EXTENSION));
         // The extension stays last, matching the downloads convention -- and a
@@ -118,12 +174,11 @@ impl AudioCache {
             partial,
             complete,
             dir: self.dir.clone(),
-            max_bytes: self.max_bytes,
+            max_bytes: Arc::clone(&self.max_bytes),
         })
     }
 
-    #[cfg(test)]
-    fn total_bytes(&self) -> u64 {
+    pub fn used_bytes(&self) -> u64 {
         std::fs::read_dir(&self.dir)
             .into_iter()
             .flatten()
@@ -209,6 +264,34 @@ fn sanitize(value: &str) -> String {
     }
 }
 
+// --- commands -----------------------------------------------------------
+
+/// How much disk the cache is using, and its ceiling.
+#[tauri::command]
+pub async fn audio_cache_stats(cache: tauri::State<'_, AudioCache>) -> Result<CacheStats, String> {
+    Ok(cache.stats())
+}
+
+/// Changes the ceiling, evicting immediately if the new one is lower.
+#[tauri::command]
+pub async fn set_audio_cache_limit(
+    limit_bytes: u64,
+    cache: tauri::State<'_, AudioCache>,
+) -> Result<CacheStats, String> {
+    cache.set_limit(limit_bytes);
+    Ok(cache.stats())
+}
+
+/// Empties the cache now.
+///
+/// Nothing is lost that cannot be fetched again -- which is the whole
+/// distinction between this and a download.
+#[tauri::command]
+pub async fn clear_audio_cache(cache: tauri::State<'_, AudioCache>) -> Result<CacheStats, String> {
+    cache.clear();
+    Ok(cache.stats())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,9 +367,9 @@ mod tests {
         }
 
         assert!(
-            cache.total_bytes() <= 300,
+            cache.used_bytes() <= 300,
             "cache grew to {} bytes",
-            cache.total_bytes()
+            cache.used_bytes()
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -329,6 +412,56 @@ mod tests {
             cache.lookup("youtube", "first").is_some(),
             "the recently played track was evicted instead of the idle one"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_limit_below_the_floor_is_raised_to_it() {
+        let dir = temp_dir("floor");
+        let cache = AudioCache::new(dir.clone());
+
+        // The floor guards the *input*, not the constructor -- otherwise the
+        // tests above could not use small limits to exercise eviction at all.
+        cache.set_limit(1);
+        assert_eq!(cache.limit(), MIN_MAX_BYTES);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lowering the limit should free space immediately, not at some later
+    /// moment nobody can predict.
+    #[test]
+    fn lowering_the_limit_evicts_at_once() {
+        let dir = temp_dir("shrink");
+        let cache = AudioCache::with_limit(dir.clone(), 1000);
+
+        for name in ["a", "b", "c"] {
+            store(&cache, "youtube", name, 100);
+        }
+        assert_eq!(cache.used_bytes(), 300);
+
+        cache.set_limit(150);
+        assert!(
+            cache.used_bytes() <= MIN_MAX_BYTES.max(150),
+            "still {} bytes",
+            cache.used_bytes()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clearing_empties_the_cache() {
+        let dir = temp_dir("clear");
+        let cache = AudioCache::new(dir.clone());
+
+        store(&cache, "youtube", "a", 100);
+        assert!(cache.used_bytes() > 0);
+
+        cache.clear();
+        assert_eq!(cache.used_bytes(), 0);
+        assert!(cache.lookup("youtube", "a").is_none());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

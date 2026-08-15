@@ -7,7 +7,7 @@ use sqlx::{QueryBuilder, Row, SqlitePool};
 use tauri::{AppHandle, Emitter, Runtime, State};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use crate::engine::{self, AudioEngine, EngineEvent};
+use crate::engine::{self, AudioEngine, EngineEvent, SUPERSEDED};
 use crate::audio_cache::AudioCache;
 use crate::playable::{get_playable_source, PlayableTrack};
 use crate::providers::Provider;
@@ -233,7 +233,10 @@ struct Coordinator<E: PlayerEvents> {
     /// Incremented on every start. The engine echoes it back so a `Finished`
     /// for a track we already moved past can be discarded.
     epoch: u64,
-    engine: AudioEngine,
+    /// Shared: a load runs on its own task and reaches the engine from there.
+    engine: Arc<AudioEngine>,
+    /// Where those tasks report back.
+    loads: UnboundedSender<LoadOutcome>,
     pool: SqlitePool,
     /// Handed in at startup: the coordinator has no `AppHandle` to resolve it
     /// from, and doing so per play would repeat the lookup needlessly.
@@ -265,6 +268,7 @@ pub fn spawn<E: PlayerEvents>(
     let engine = engine::spawn(engine_tx, ffmpeg);
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let (loads_tx, loads_rx) = mpsc::unbounded_channel();
 
     tauri::async_runtime::spawn(async move {
         Coordinator {
@@ -274,7 +278,8 @@ pub fn spawn<E: PlayerEvents>(
             volume: 1.0,
             muted: false,
             epoch: 0,
-            engine,
+            engine: Arc::new(engine),
+            loads: loads_tx,
             pool,
             yt_dlp,
             stream_urls: Arc::new(StreamUrlCache::default()),
@@ -282,7 +287,7 @@ pub fn spawn<E: PlayerEvents>(
             audio_cache,
             events,
         }
-        .run(command_rx, engine_rx)
+        .run(command_rx, engine_rx, loads_rx)
         .await;
     });
 
@@ -294,11 +299,13 @@ impl<E: PlayerEvents> Coordinator<E> {
         mut self,
         mut commands: UnboundedReceiver<PlayerCommand>,
         mut engine_events: UnboundedReceiver<EngineEvent>,
+        mut loads: UnboundedReceiver<LoadOutcome>,
     ) {
         loop {
             tokio::select! {
                 Some(command) = commands.recv() => self.handle_command(command).await,
                 Some(event) = engine_events.recv() => self.handle_engine_event(event).await,
+                Some(outcome) = loads.recv() => self.handle_load(outcome).await,
                 else => break,
             }
         }
@@ -317,7 +324,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // user interposed are a separate intention from "play this
                 // playlist".
                 let target = self.queue.set_context(track_ids, start_index, context_name);
-                self.start(target).await;
+                self.start(target);
             }
 
             PlayerCommand::PlayNext(track_id) => {
@@ -353,10 +360,13 @@ impl<E: PlayerEvents> Coordinator<E> {
                         self.state = PlaybackState::Playing;
                     }
                 }
-                // Nothing loaded, or still resolving: start from the cursor.
-                PlaybackState::Stopped | PlaybackState::Loading => {
+                // Already resolving: a second load would race the first for
+                // the output, and the epoch guard would simply discard one of
+                // them. Waiting is the honest behaviour.
+                PlaybackState::Loading => {}
+                PlaybackState::Stopped => {
                     let target = self.queue.current();
-                    self.start(target).await;
+                    self.start(target);
                 }
             },
 
@@ -364,7 +374,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // The same call the natural end uses, so pressing Next and
                 // letting a track run out cannot disagree about what is next.
                 match self.queue.on_next() {
-                    Some(track_id) => self.start(Some(track_id)).await,
+                    Some(track_id) => self.start(Some(track_id)),
                     None => self.halt(),
                 }
             }
@@ -373,7 +383,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // Past the threshold, Previous restarts the current track
                 // instead of leaving it.
                 let restart = self.state != PlaybackState::Stopped
-                    && self.engine.position() > RESTART_THRESHOLD;
+                    && self.engine.position().await > RESTART_THRESHOLD;
 
                 let target = if restart {
                     self.queue.current()
@@ -420,7 +430,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                     self.emit_state();
                     self.state = resume_to;
 
-                    match self.engine.seek(position) {
+                    match self.engine.seek(position).await {
                         // Echo the new position straight away rather than
                         // leaving the bar stale until the next tick.
                         Ok(()) => self.emit_progress(position),
@@ -458,7 +468,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                 self.loaded = None;
 
                 match self.queue.on_finished() {
-                    Some(track_id) => self.start(Some(track_id)).await,
+                    Some(track_id) => self.start(Some(track_id)),
                     None => self.halt(),
                 }
 
@@ -487,7 +497,7 @@ impl<E: PlayerEvents> Coordinator<E> {
             return;
         }
         if let Some(track_id) = self.queue.on_next() {
-            self.start(Some(track_id)).await;
+            self.start(Some(track_id));
         }
     }
 
@@ -501,7 +511,7 @@ impl<E: PlayerEvents> Coordinator<E> {
             target.is_some() && target == self.loaded && self.state != PlaybackState::Stopped;
 
         if already_loaded {
-            match self.engine.seek(Duration::ZERO) {
+            match self.engine.seek(Duration::ZERO).await {
                 Ok(()) => {
                     self.emit_progress(Duration::ZERO);
                     return;
@@ -513,91 +523,115 @@ impl<E: PlayerEvents> Coordinator<E> {
             }
         }
 
-        self.start(target).await;
+        self.start(target);
     }
 
-    /// Plays `first`, skipping over tracks that will not resolve.
+    /// Begins playing `first`, without waiting for it.
     ///
-    /// A queue can contain tracks whose files vanished since the last scan.
-    /// Stopping dead on the first would be worse than skipping, but skipping
-    /// must be bounded or a queue of entirely missing tracks would spin
-    /// forever -- with repeat on, the context never runs out.
-    async fn start(&mut self, first: Option<i64>) {
-        // Bounded far below the queue length on purpose. A local file fails
-        // instantly, but resolving a YouTube stream takes ~7 seconds, so
-        // walking a long queue of dead links would freeze playback for
-        // minutes with no explanation.
-        const MAX_ATTEMPTS: usize = 3;
+    /// A load -- a yt-dlp resolve, then ffmpeg buffering -- takes seconds, and
+    /// awaiting it here left the coordinator deaf to every command for the
+    /// whole of it: pressing Pause or Next during a load did nothing. It now
+    /// runs on its own task and reports back through [`LoadOutcome`], which
+    /// the run loop treats as just another event.
+    ///
+    /// Correctness comes from the epoch that already existed for exactly this
+    /// class of problem. A load carries the epoch it began under, and an
+    /// outcome whose epoch has moved on is discarded the same way a stale
+    /// `Finished` is.
+    fn start(&mut self, first: Option<i64>) {
+        self.begin_load(first, 0);
+    }
 
-        let mut candidate = first;
-        let mut last_error = None;
-
-        for _ in 0..MAX_ATTEMPTS {
-            let Some(track_id) = candidate else {
-                break;
-            };
-
-            // Resolution can take seconds; without this the UI would sit on
-            // "stopped" and look broken while a stream is being fetched.
-            self.state = PlaybackState::Loading;
+    fn begin_load(&mut self, candidate: Option<i64>, attempt: usize) {
+        let Some(track_id) = candidate else {
+            self.halt();
             self.emit_state();
+            return;
+        };
 
-            match self.load(track_id).await {
-                Ok(()) => {
-                    self.loaded = Some(track_id);
-                    self.state = PlaybackState::Playing;
-                    self.apply_volume();
-                    // Reset the bar immediately; the first tick is up to a
-                    // poll interval away.
-                    self.emit_progress(Duration::ZERO);
-                    return;
-                }
-                Err(e) => last_error = Some(e),
+        // Claims this load, which makes anything already in flight stale.
+        self.epoch += 1;
+        let epoch = self.epoch;
+
+        // Without this the UI would sit on "stopped" and look broken while a
+        // stream is being fetched.
+        self.state = PlaybackState::Loading;
+        self.emit_state();
+
+        let pool = self.pool.clone();
+        let engine = Arc::clone(&self.engine);
+        let urls = Arc::clone(&self.stream_urls);
+        let cache = self.audio_cache.clone();
+        let yt_dlp = self.yt_dlp.clone();
+        let loads = self.loads.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let result = load_track(
+                &pool,
+                &engine,
+                &urls,
+                cache.as_ref(),
+                yt_dlp.as_deref(),
+                track_id,
+                epoch,
+            )
+            .await;
+
+            let _ = loads.send(LoadOutcome {
+                epoch,
+                track_id,
+                attempt,
+                result,
+            });
+        });
+    }
+
+    /// A load finished -- possibly for a track the user has already left.
+    async fn handle_load(&mut self, outcome: LoadOutcome) {
+        if outcome.epoch != self.epoch {
+            // Superseded. The audio thread refuses stale plays itself, so
+            // nothing is sounding that should not be.
+            return;
+        }
+
+        match outcome.result {
+            Ok(()) => {
+                self.loaded = Some(outcome.track_id);
+                self.state = PlaybackState::Playing;
+                self.apply_volume();
+                // Reset the bar immediately; the first tick is up to a poll
+                // interval away.
+                self.emit_progress(Duration::ZERO);
+                self.emit_state();
             }
 
-            // Skipping a dead track goes through the same priority rule as a
-            // natural end, so an unplayable context track cannot swallow the
-            // tracks the user queued behind it.
-            candidate = self.queue.on_next();
-        }
+            // Lost the race, and already knows it. Not a failure, and above
+            // all not a reason to skip a track.
+            Err(e) if e == SUPERSEDED => {}
 
-        self.halt();
+            Err(e) => {
+                let next_attempt = outcome.attempt + 1;
 
-        if let Some(error) = last_error {
-            self.events.error(error);
-        }
-    }
+                // Skipping a dead track goes through the same priority rule as
+                // a natural end, so an unplayable context track cannot swallow
+                // the tracks the user queued behind it.
+                let candidate = (next_attempt < MAX_LOAD_ATTEMPTS)
+                    .then(|| self.queue.on_next())
+                    .flatten();
 
-    /// Resolves `track_id` and hands it to the engine.
-    ///
-    /// Retries once when a *cached* stream URL fails. Providers can revoke a
-    /// link before its stated expiry, and the alternative -- skipping to the
-    /// next track -- would punish the user for an optimisation they cannot
-    /// see. Only worth doing when something was actually cached: a first-time
-    /// failure is the provider's answer, and asking again just fails slower.
-    async fn load(&mut self, track_id: i64) -> Result<(), String> {
-        const ATTEMPTS: usize = 2;
-
-        let mut last_error = String::new();
-
-        for attempt in 0..ATTEMPTS {
-            let source = self.resolve(track_id).await?;
-
-            self.epoch += 1;
-            match self.engine.play(source, self.epoch) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    last_error = e;
-
-                    let stale = attempt + 1 < ATTEMPTS && self.forget_stream_url(track_id).await;
-                    if !stale {
-                        break;
+                match candidate {
+                    Some(_) => {
+                        self.begin_load(candidate, next_attempt);
+                        self.emit_queue().await;
+                    }
+                    None => {
+                        self.halt();
+                        self.emit_state();
+                        self.events.error(e);
                     }
                 }
             }
         }
-
-        Err(last_error)
     }
 
     /// Resolves the next track's stream while the current one is still
@@ -647,51 +681,13 @@ impl<E: PlayerEvents> Coordinator<E> {
         });
     }
 
-    /// Drops any cached stream URL for `track_id`, reporting whether there was
-    /// one to drop.
-    async fn forget_stream_url(&self, track_id: i64) -> bool {
-        let url: Option<String> =
-            sqlx::query_scalar("SELECT remote_url FROM tracks WHERE id = ?")
-                .bind(track_id)
-                .fetch_optional(&self.pool)
-                .await
-                .ok()
-                .flatten();
-
-        url.is_some_and(|url| self.stream_urls.invalidate(&url))
-    }
-
-    async fn resolve(&self, track_id: i64) -> Result<crate::playable::PlayableSource, String> {
-        let row =
-            sqlx::query("SELECT source, state, remote_id, local_path, remote_url FROM tracks WHERE id = ?")
-                .bind(track_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("That track no longer exists.")?;
-
-        get_playable_source(
-            &PlayableTrack {
-                source: row.get("source"),
-                state: row.get("state"),
-                remote_id: row.get("remote_id"),
-                local_path: row.get("local_path"),
-                remote_url: row.get("remote_url"),
-            },
-            self.yt_dlp.as_deref(),
-            &self.stream_urls,
-            self.audio_cache.as_ref(),
-        )
-        .await
-    }
-
     fn halt(&mut self) {
         // Bump the epoch so any in-flight `Finished` for the stopped track is
         // discarded rather than triggering an advance.
         self.epoch += 1;
         self.state = PlaybackState::Stopped;
         self.loaded = None;
-        self.report(self.engine.stop());
+        self.report(self.engine.stop(self.epoch));
     }
 
     fn apply_volume(&self) {
@@ -808,6 +804,114 @@ impl<E: PlayerEvents> Coordinator<E> {
             })
             .collect()
     }
+}
+
+/// Bounded far below the queue length on purpose. A local file fails
+/// instantly, but resolving a stream takes seconds, so walking a long queue of
+/// dead links would leave playback stalled for minutes with no explanation.
+const MAX_LOAD_ATTEMPTS: usize = 3;
+
+/// What a spawned load reports back.
+#[derive(Debug)]
+pub struct LoadOutcome {
+    /// The epoch it began under. Anything older than the coordinator's current
+    /// epoch is a load the user has already moved past.
+    epoch: u64,
+    track_id: i64,
+    /// How many tracks have already been skipped in this run, so the retry
+    /// stays bounded across the tasks it is now spread over.
+    attempt: usize,
+    result: Result<(), String>,
+}
+
+/// Resolves `track_id` and hands it to the engine.
+///
+/// Retries once when a *cached* stream URL fails. Providers can revoke a link
+/// before its stated expiry, and the alternative -- skipping to the next track
+/// -- would punish the user for an optimisation they cannot see. Only worth
+/// doing when something was actually cached: a first-time failure is the
+/// provider's answer, and asking again just fails slower.
+///
+/// A free function because it runs on a task that outlives any borrow of the
+/// coordinator: it owns everything it touches.
+async fn load_track(
+    pool: &SqlitePool,
+    engine: &AudioEngine,
+    urls: &StreamUrlCache,
+    cache: Option<&AudioCache>,
+    yt_dlp: Option<&std::path::Path>,
+    track_id: i64,
+    epoch: u64,
+) -> Result<(), String> {
+    const ATTEMPTS: usize = 2;
+
+    let mut last_error = String::new();
+
+    for attempt in 0..ATTEMPTS {
+        let source = resolve_track(pool, urls, cache, yt_dlp, track_id).await?;
+
+        match engine.play(source, epoch).await {
+            Ok(()) => return Ok(()),
+            // Another load won while this one was resolving. Retrying would
+            // only lose again, and the caller must not treat it as a fault.
+            Err(e) if e == SUPERSEDED => return Err(e),
+            Err(e) => {
+                last_error = e;
+
+                let stale =
+                    attempt + 1 < ATTEMPTS && forget_stream_url(pool, urls, track_id).await;
+                if !stale {
+                    break;
+                }
+            }
+        }
+    }
+
+    Err(last_error)
+}
+
+async fn resolve_track(
+    pool: &SqlitePool,
+    urls: &StreamUrlCache,
+    cache: Option<&AudioCache>,
+    yt_dlp: Option<&std::path::Path>,
+    track_id: i64,
+) -> Result<crate::playable::PlayableSource, String> {
+    let row = sqlx::query(
+        "SELECT source, state, remote_id, local_path, remote_url FROM tracks WHERE id = ?",
+    )
+    .bind(track_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("That track no longer exists.")?;
+
+    get_playable_source(
+        &PlayableTrack {
+            source: row.get("source"),
+            state: row.get("state"),
+            remote_id: row.get("remote_id"),
+            local_path: row.get("local_path"),
+            remote_url: row.get("remote_url"),
+        },
+        yt_dlp,
+        urls,
+        cache,
+    )
+    .await
+}
+
+/// Drops any cached stream URL for `track_id`, reporting whether there was one
+/// to drop.
+async fn forget_stream_url(pool: &SqlitePool, urls: &StreamUrlCache, track_id: i64) -> bool {
+    let url: Option<String> = sqlx::query_scalar("SELECT remote_url FROM tracks WHERE id = ?")
+        .bind(track_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+    url.is_some_and(|url| urls.invalidate(&url))
 }
 
 /// Warms the URL cache for `track_id`, if it is something that streams.

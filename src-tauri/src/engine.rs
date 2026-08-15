@@ -7,6 +7,7 @@ use std::time::Duration;
 use rodio::stream::DeviceSinkBuilder;
 use rodio::{Decoder, Player};
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 
 use crate::playable::PlayableSource;
 use crate::transcode::{FfmpegInput, FfmpegSource};
@@ -30,6 +31,13 @@ const _: () = assert!(
     "a caller must not give up before a stream is allowed to start"
 );
 
+/// Returned when a load lost the race to a newer one.
+///
+/// A sentinel rather than a variant because it crosses the same
+/// `Result<(), String>` channel every other engine failure uses, and it is the
+/// one "failure" the coordinator must not show anyone or skip a track over.
+pub const SUPERSEDED: &str = "__superseded__";
+
 /// What the engine reports upwards. It never decides anything -- the
 /// coordinator owns every policy question.
 #[derive(Debug)]
@@ -47,20 +55,28 @@ enum Command {
         source: PlayableSource,
         /// Echoed back in `Finished`, so the coordinator can discard a report
         /// about a track it has already moved on from.
+        ///
+        /// Also orders the plays themselves: loads now run concurrently, so
+        /// two can be in flight at once and the *older* one must not win by
+        /// finishing last.
         epoch: u64,
-        reply: Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
     Pause,
     Resume,
-    Stop,
+    Stop {
+        /// Bumped past every load in flight, so none of them can start audio
+        /// after the user has already stopped.
+        epoch: u64,
+    },
     /// Linear amplitude, already curved by the caller.
     SetVolume(f32),
     Position {
-        reply: Sender<Duration>,
+        reply: oneshot::Sender<Duration>,
     },
     Seek {
         position: Duration,
-        reply: Sender<Result<(), String>>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -85,17 +101,18 @@ impl AudioEngine {
             .map_err(|_| "The audio thread is not running.".to_string())
     }
 
-    pub fn play(&self, source: PlayableSource, epoch: u64) -> Result<(), String> {
-        let (reply, response) = mpsc::channel();
+    /// Async rather than blocking: opening a stream legitimately takes
+    /// seconds, and a blocking wait here would park a runtime worker for the
+    /// whole of it.
+    pub async fn play(&self, source: PlayableSource, epoch: u64) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
         self.send(Command::Play {
             source,
             epoch,
             reply,
         })?;
 
-        response
-            .recv_timeout(REPLY_TIMEOUT)
-            .map_err(|_| "The audio thread did not respond.".to_string())?
+        await_reply(response, "The audio thread did not respond.").await
     }
 
     pub fn pause(&self) -> Result<(), String> {
@@ -106,8 +123,8 @@ impl AudioEngine {
         self.send(Command::Resume)
     }
 
-    pub fn stop(&self) -> Result<(), String> {
-        self.send(Command::Stop)
+    pub fn stop(&self, epoch: u64) -> Result<(), String> {
+        self.send(Command::Stop { epoch })
     }
 
     pub fn set_volume(&self, linear: f32) -> Result<(), String> {
@@ -120,22 +137,36 @@ impl AudioEngine {
     /// it has to happen on the audio thread rather than in a command handler.
     /// It is also genuinely fallible -- some sources cannot seek at all -- so
     /// the error is propagated rather than swallowed.
-    pub fn seek(&self, position: Duration) -> Result<(), String> {
-        let (reply, response) = mpsc::channel();
+    pub async fn seek(&self, position: Duration) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
         self.send(Command::Seek { position, reply })?;
 
-        response
-            .recv_timeout(REPLY_TIMEOUT)
-            .map_err(|_| "The audio thread did not respond to the seek.".to_string())?
+        await_reply(response, "The audio thread did not respond to the seek.").await
     }
 
     /// Position within the current track. Zero when nothing is playing.
-    pub fn position(&self) -> Duration {
-        let (reply, response) = mpsc::channel();
+    pub async fn position(&self) -> Duration {
+        let (reply, response) = oneshot::channel();
         if self.send(Command::Position { reply }).is_err() {
             return Duration::ZERO;
         }
-        response.recv_timeout(REPLY_TIMEOUT).unwrap_or(Duration::ZERO)
+        tokio::time::timeout(REPLY_TIMEOUT, response)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .unwrap_or(Duration::ZERO)
+    }
+}
+
+/// Waits for the audio thread, turning both a timeout and a dropped sender
+/// into the same plain message.
+async fn await_reply(
+    response: oneshot::Receiver<Result<(), String>>,
+    on_silence: &str,
+) -> Result<(), String> {
+    match tokio::time::timeout(REPLY_TIMEOUT, response).await {
+        Ok(Ok(result)) => result,
+        _ => Err(on_silence.to_string()),
     }
 }
 
@@ -169,6 +200,13 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
     let mut volume = 1.0f32;
     // What is loaded, kept so a seek can rebuild the decode from a new offset.
     let mut loaded: Option<Loaded> = None;
+    // The newest epoch this thread has acted on.
+    //
+    // Loads run concurrently now, so a slow one can finish after a newer one
+    // has already started playing. Without this the older audio would simply
+    // overwrite the newer -- the user presses Next, waits, and then hears the
+    // track they skipped.
+    let mut highest_epoch: u64 = 0;
 
     loop {
         match rx.recv_timeout(POLL_INTERVAL) {
@@ -177,6 +215,15 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                 epoch: new_epoch,
                 reply,
             }) => {
+                if new_epoch < highest_epoch {
+                    // Superseded while it was still resolving. Reported as an
+                    // error the coordinator recognises and discards, rather
+                    // than silently succeeding and starting the wrong audio.
+                    let _ = reply.send(Err(SUPERSEDED.to_string()));
+                    continue;
+                }
+                highest_epoch = new_epoch;
+
                 let result = match &device {
                     Ok(sink) => {
                         start(sink, &source, volume, ffmpeg.as_deref(), Duration::ZERO)
@@ -215,12 +262,14 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                 }
             }
 
-            Ok(Command::Stop) => {
+            Ok(Command::Stop { epoch: new_epoch }) => {
                 // Clear the epoch before dropping so end-detection below cannot
                 // mistake a deliberate stop for a track finishing.
                 epoch = None;
                 player = None;
                 loaded = None;
+                // Anything still resolving is now stale.
+                highest_epoch = highest_epoch.max(new_epoch);
             }
 
             Ok(Command::SetVolume(linear)) => {
@@ -445,8 +494,8 @@ mod tests {
         f.write_all(&b).unwrap();
     }
 
-    #[test]
-    fn progress_events_advance_while_a_track_plays() {
+    #[tokio::test]
+    async fn progress_events_advance_while_a_track_plays() {
         let dir = std::env::temp_dir().join("music-app-engine-progress");
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("tone.wav");
@@ -456,7 +505,7 @@ mod tests {
         // No ffmpeg needed: this test plays a plain WAV, which rodio decodes.
         let engine = spawn(tx, None);
 
-        let played = engine.play(PlayableSource::LocalFile(wav), 1);
+        let played = engine.play(PlayableSource::LocalFile(wav), 1).await;
         if let Err(e) = &played {
             eprintln!("SKIP: {e}");
             return;

@@ -708,10 +708,16 @@ async fn the_next_stream_is_ready_before_the_current_track_ends() {
     .await
     .unwrap();
 
+    // SoundCloud rather than YouTube on purpose. A failed prefetch is silent
+    // by design -- the real play simply resolves normally -- so a YouTube 403
+    // would be indistinguishable here from prefetching being broken.
+    // SoundCloud does not rate-limit us, which keeps this measuring the code
+    // rather than the weather.
     let stream: i64 = sqlx::query_scalar(
         "INSERT INTO tracks (source, title, state, remote_id, remote_url) \
-         VALUES ('youtube', 'Never Gonna Give You Up', 'saved', 'dQw4w9WgXcQ', \
-                 'https://www.youtube.com/watch?v=dQw4w9WgXcQ') RETURNING id",
+         VALUES ('soundcloud', 'One More Time', 'saved', '199428706', \
+                 'https://soundcloud.com/daft-punk-id/daft-punk-one-more-time') \
+         RETURNING id",
     )
     .fetch_one(&db.pool)
     .await
@@ -919,6 +925,107 @@ async fn a_streamed_track_is_cached_and_replays_without_the_network() {
         progress.iter().any(|p| *p > 0.0),
         "the cached copy did not play (got {progress:?})"
     );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The coordinator keeps answering while a track is still loading.
+///
+/// A stream load is a yt-dlp resolve then ffmpeg buffering -- six or seven
+/// seconds. It used to be awaited inside the command handler, so for that
+/// whole time the player was deaf: pressing Pause, Next or Mute did nothing
+/// until the load finished.
+///
+/// Mute is the probe because it is cheap, unambiguous, and visible in the
+/// state snapshot. If it lands while the load is still in flight, the
+/// coordinator is genuinely concurrent.
+#[tokio::test]
+async fn commands_are_answered_while_a_track_is_loading() {
+    let _network = NETWORK.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-responsive-load");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, state, remote_id, remote_url) \
+         VALUES ('youtube', 'Never Gonna Give You Up', 'saved', 'dQw4w9WgXcQ', \
+                 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let track_id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    // No cache, so the load genuinely goes to the network and takes its time.
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        Some(std::path::PathBuf::from("ffmpeg")),
+        Some(std::path::PathBuf::from("yt-dlp")),
+        None,
+    );
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Long enough to be certain the resolve is under way, far short of the
+    // ~6s it takes to finish.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let loading = recorder
+        .0
+        .states
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| s.state == music_app_lib::player::PlaybackState::Loading);
+    if !loading {
+        eprintln!("SKIP: the load never started (upstream/environment)");
+        return;
+    }
+
+    let asked_at = std::time::Instant::now();
+    handle.send(PlayerCommand::SetMuted(true)).unwrap();
+
+    // Generous, but still nowhere near a full resolve.
+    let deadline = Duration::from_millis(2500);
+    let answered = loop {
+        if recorder.0.states.lock().unwrap().iter().any(|s| s.muted) {
+            break Some(asked_at.elapsed());
+        }
+        if asked_at.elapsed() > deadline {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    eprintln!("mute answered after: {answered:?}");
+    assert!(
+        answered.is_some(),
+        "the coordinator did not answer within {deadline:?} of being asked, \
+         which means it was still blocked waiting for the load"
+    );
+
+    // The assertion lands in milliseconds, but the load it was racing is still
+    // out there holding a yt-dlp process. Returning now would release the
+    // network lock while that is still running and hand the contention to
+    // whichever test goes next -- which is exactly what made the prefetch
+    // timing flaky.
+    handle.send(PlayerCommand::Stop).unwrap();
+    tokio::time::sleep(Duration::from_secs(8)).await;
 
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);
