@@ -86,6 +86,24 @@ pub fn run() {
                 Some(audio_cache),
             ));
 
+            // The window is created hidden so that the first frame the user
+            // sees is already themed and laid out -- an undecorated window
+            // otherwise flashes as a bare white rectangle while the frontend
+            // boots, and it has no title bar to explain what it is.
+            //
+            // The frontend reveals it as soon as the layout mounts. This is the
+            // safety net for when it never does: a bundle that fails to load
+            // would otherwise leave no window at all, which is indistinguishable
+            // from the app not starting. Showing late is a bad first frame;
+            // never showing is a bug report with nothing to look at.
+            if let Some(window) = app.get_webview_window("main") {
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    // A no-op if the frontend got there first.
+                    let _ = window.show();
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -109,6 +127,8 @@ pub fn run() {
             tags::list_tags,
             tags::list_track_tags,
             tags::rename_tag,
+            tags::set_tag_color,
+            tags::list_tag_colors,
             tags::delete_tag,
             search::query_library,
             search::group_tracks_by_artist,

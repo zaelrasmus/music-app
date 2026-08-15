@@ -1,8 +1,14 @@
 <script lang="ts">
+    import { Button } from "$components/ui/button";
+    import PageShell from "$components/page-shell.svelte";
+    import EmptyState from "$components/empty-state.svelte";
     import TrackRow from "$components/track-row.svelte";
     import { historyStore } from "$lib/history.svelte";
     import { cacheStore } from "$lib/cache.svelte";
+    import { player } from "$lib/player.svelte";
     import HistoryIcon from "@lucide/svelte/icons/history";
+    import PlayIcon from "@lucide/svelte/icons/play";
+    import WifiOffIcon from "@lucide/svelte/icons/wifi-off";
 
     /**
      * Playing from history queues the whole list in the order shown, so it
@@ -25,33 +31,46 @@
                 cacheStore.isCached(t.id),
         ).length,
     );
+
+    const total = $derived(historyStore.tracks.length);
 </script>
 
-<section class="flex flex-col gap-3">
-    <div class="flex flex-col gap-1">
-        <h2 class="flex items-center gap-2 text-lg font-semibold">
-            <HistoryIcon class="size-4" />
-            Recently played
-            {#if historyStore.tracks.length > 0}
-                <span class="text-muted-foreground text-sm font-normal">
-                    ({historyStore.tracks.length})
+<PageShell
+    title="Recently played"
+    badge={total > 0 ? `${total}` : null}
+    subtitle="Tracks appear here once you have listened to a fair part of them — not everything you skipped past."
+>
+    {#snippet actions()}
+        <Button
+            size="sm"
+            disabled={total === 0}
+            onclick={() => player.playQueue(queueIds, 0, "recently played")}
+        >
+            <PlayIcon data-icon="inline-start" />
+            Play
+        </Button>
+    {/snippet}
+
+    {#snippet toolbar()}
+        {#if total > 0}
+            <p class="text-muted-foreground flex items-center gap-1.5 text-xs">
+                <WifiOffIcon class="text-signal size-3.5" />
+                <span>
+                    <span class="text-foreground font-medium tabular-nums">
+                        {offline} of {total}
+                    </span>
+                    would still play with no connection.
                 </span>
-            {/if}
-        </h2>
-        {#if historyStore.tracks.length > 0}
-            <p class="text-muted-foreground text-sm">
-                {offline} of {historyStore.tracks.length} would still play offline.
             </p>
         {/if}
-    </div>
+    {/snippet}
 
-    {#if historyStore.tracks.length === 0}
-        <div
-            class="text-muted-foreground rounded-lg border border-dashed px-6 py-8 text-center text-sm"
-        >
-            Nothing yet. Tracks appear here once you have listened to a fair
-            part of them.
-        </div>
+    {#if total === 0}
+        <EmptyState
+            icon={HistoryIcon}
+            title="Nothing here yet"
+            hint="Play something for half a minute, or to the end, and it will show up."
+        />
     {:else}
         <ul class="flex flex-col">
             {#each historyStore.tracks as track, index (track.id)}
@@ -64,4 +83,4 @@
             {/each}
         </ul>
     {/if}
-</section>
+</PageShell>

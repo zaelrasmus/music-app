@@ -1,26 +1,25 @@
 <script lang="ts">
     import { Button } from "$components/ui/button";
-    import { Input } from "$components/ui/input";
+    import * as DropdownMenu from "$components/ui/dropdown-menu";
+    import PageShell from "$components/page-shell.svelte";
+    import EmptyState from "$components/empty-state.svelte";
+    import SearchField from "$components/search-field.svelte";
+    import TagFilter from "$components/tag-filter.svelte";
+    import TrackRow from "$components/track-row.svelte";
+    import CoverArt from "$components/cover-art.svelte";
     import { playlistStore } from "$lib/playlists.svelte";
     import { player } from "$lib/player.svelte";
+    import { nav } from "$lib/nav.svelte";
+    import { promptFor } from "$lib/prompt.svelte";
     import PlayIcon from "@lucide/svelte/icons/play";
-    import PauseIcon from "@lucide/svelte/icons/pause";
     import PlusIcon from "@lucide/svelte/icons/plus";
     import Trash2Icon from "@lucide/svelte/icons/trash-2";
     import PencilIcon from "@lucide/svelte/icons/pencil";
-    import CheckIcon from "@lucide/svelte/icons/check";
     import XIcon from "@lucide/svelte/icons/x";
     import ChevronLeftIcon from "@lucide/svelte/icons/chevron-left";
-    import GripVerticalIcon from "@lucide/svelte/icons/grip-vertical";
-    import SearchIcon from "@lucide/svelte/icons/search";
-    import TagFilter from "$components/tag-filter.svelte";
-    import TrackActions from "$components/track-actions.svelte";
-    import SourceBadge from "$components/source-badge.svelte";
-    import { cacheStore } from "$lib/cache.svelte";
-
-    let newName = $state("");
-    let renaming = $state(false);
-    let renameValue = $state("");
+    import ListMusicIcon from "@lucide/svelte/icons/list-music";
+    import MoreHorizontalIcon from "@lucide/svelte/icons/more-horizontal";
+    import ShuffleIcon from "@lucide/svelte/icons/shuffle";
 
     /** Index currently being dragged, and the index it is hovering over. */
     let dragFrom = $state<number | null>(null);
@@ -29,22 +28,22 @@
     const detail = $derived(playlistStore.open);
 
     async function create() {
-        if (newName.trim() === "") return;
-        await playlistStore.create(newName);
-        newName = "";
+        const name = await promptFor("New playlist", {
+            label: "What should it be called?",
+            placeholder: "Playlist name",
+            confirmLabel: "Create",
+        });
+        if (name !== null) await playlistStore.create(name);
     }
 
-    function startRename() {
+    async function rename() {
         if (!detail) return;
-        renameValue = detail.playlist.name;
-        renaming = true;
-    }
-
-    async function commitRename() {
-        if (!detail) return;
-        if (await playlistStore.rename(detail.playlist.id, renameValue)) {
-            renaming = false;
-        }
+        const name = await promptFor("Rename playlist", {
+            label: "A new name for this playlist",
+            initial: detail.playlist.name,
+            confirmLabel: "Rename",
+        });
+        if (name !== null) await playlistStore.rename(detail.playlist.id, name);
     }
 
     /**
@@ -70,252 +69,238 @@
         );
     }
 
-    function formatDuration(secs: number | null) {
-        if (secs === null) return "";
-        const m = Math.floor(secs / 60);
-        const s = secs % 60;
-        return `${m}:${String(s).padStart(2, "0")}`;
-    }
-
-    /** Tracks that cannot play right now still belong in the list, marked. */
-    function unavailable(state: string) {
-        return state === "missing";
+    async function shuffle() {
+        if (!detail || detail.tracks.length === 0) return;
+        if (!player.shuffle) await player.toggleShuffle();
+        await playlistStore.play(
+            Math.floor(Math.random() * detail.tracks.length),
+        );
     }
 </script>
 
-<section class="flex flex-col gap-3">
-    {#if !detail}
-        <div class="flex flex-col gap-1">
-            <h2 class="text-lg font-semibold">Playlists</h2>
-            <p class="text-muted-foreground text-sm">
-                Local files and YouTube tracks in the same list.
-            </p>
-        </div>
-
-        <div class="flex items-center gap-2">
-            <Input
-                bind:value={newName}
-                placeholder="New playlist name"
-                class="h-9"
-                onkeydown={(e) => {
-                    if (e.key === "Enter") create();
-                }}
-            />
-            <Button onclick={create} disabled={newName.trim() === ""}>
+{#if !detail}
+    <PageShell
+        title="Playlists"
+        badge={playlistStore.playlists.length > 0
+            ? `${playlistStore.playlists.length}`
+            : null}
+        subtitle="Local files and streamed tracks in the same list."
+    >
+        {#snippet actions()}
+            <Button size="sm" onclick={create}>
                 <PlusIcon data-icon="inline-start" />
-                Create
+                New playlist
             </Button>
-        </div>
+        {/snippet}
 
         {#if playlistStore.playlists.length === 0}
-            <div
-                class="text-muted-foreground rounded-lg border border-dashed px-6 py-8 text-center text-sm"
+            <EmptyState
+                icon={ListMusicIcon}
+                title="No playlists yet"
+                hint="Make one, then add tracks to it from the ⋯ menu on any row."
             >
-                No playlists yet.
-            </div>
+                <Button size="sm" onclick={create}>
+                    <PlusIcon data-icon="inline-start" />
+                    New playlist
+                </Button>
+            </EmptyState>
         {:else}
-            <ul class="flex flex-col gap-2">
+            <ul
+                class="grid gap-2 px-2 [grid-template-columns:repeat(auto-fill,minmax(15rem,1fr))]"
+            >
                 {#each playlistStore.playlists as playlist (playlist.id)}
-                    <li
-                        class="bg-card flex items-center justify-between gap-3 rounded-lg border px-3 py-2"
-                    >
+                    <li class="group/card relative">
                         <button
                             type="button"
-                            class="flex min-w-0 flex-1 flex-col items-start text-left"
+                            class="bg-card hover:border-primary/40 hover:bg-accent/40 flex w-full items-center gap-3 rounded-lg border p-2.5 text-left transition-colors"
                             onclick={() => playlistStore.openPlaylist(playlist.id)}
                         >
-                            <span class="truncate text-sm font-medium">
-                                {playlist.name}
-                            </span>
-                            <span class="text-muted-foreground text-xs">
-                                {playlist.trackCount}
-                                {playlist.trackCount === 1 ? "track" : "tracks"}
+                            <!-- The art is generated from the playlist's name,
+                                 so each one is recognisable at a glance in a
+                                 grid of otherwise identical cards. -->
+                            <CoverArt
+                                seed={`playlist::${playlist.name}`}
+                                class="size-11"
+                                glyph={false}
+                            />
+                            <span class="flex min-w-0 flex-1 flex-col">
+                                <span class="truncate text-sm font-medium">
+                                    {playlist.name}
+                                </span>
+                                <span class="text-muted-foreground text-xs">
+                                    {playlist.trackCount}
+                                    {playlist.trackCount === 1 ? "track" : "tracks"}
+                                </span>
                             </span>
                         </button>
-                        <Button
-                            variant="ghost"
-                            size="icon"
+
+                        <button
+                            type="button"
+                            class="text-muted-foreground hover:bg-accent hover:text-destructive absolute top-2 right-2 grid size-7 place-items-center rounded-md opacity-0 transition-opacity group-hover/card:opacity-100 focus-visible:opacity-100"
                             aria-label="Delete {playlist.name}"
+                            title="Delete {playlist.name}"
                             onclick={() => playlistStore.remove(playlist.id)}
                         >
-                            <Trash2Icon />
-                        </Button>
+                            <Trash2Icon class="size-4" />
+                        </button>
                     </li>
                 {/each}
             </ul>
         {/if}
-    {:else}
-        <!-- Detail view -->
-        <div class="flex items-center gap-2">
-            <Button
-                variant="ghost"
-                size="icon"
+    </PageShell>
+{:else}
+    <PageShell
+        title={detail.playlist.name}
+        badge={playlistStore.filtering
+            ? `${detail.tracks.length} of ${detail.playlist.trackCount}`
+            : `${detail.playlist.trackCount}`}
+        subtitle={playlistStore.filtering
+            ? "Play uses the filtered list. Reordering is off while filtered, because a row's position here is not its position in the playlist."
+            : undefined}
+    >
+        {#snippet leading()}
+            <button
+                type="button"
+                class="text-muted-foreground hover:bg-accent hover:text-foreground grid size-8 place-items-center rounded-md transition-colors"
                 aria-label="Back to playlists"
                 onclick={() => playlistStore.close()}
             >
-                <ChevronLeftIcon />
+                <ChevronLeftIcon class="size-5" />
+            </button>
+        {/snippet}
+
+        {#snippet actions()}
+            <Button
+                variant="ghost"
+                size="sm"
+                disabled={detail.tracks.length === 0}
+                onclick={shuffle}
+            >
+                <ShuffleIcon data-icon="inline-start" />
+                Shuffle
+            </Button>
+            <Button
+                size="sm"
+                disabled={detail.tracks.length === 0}
+                onclick={() => playlistStore.play(0)}
+            >
+                <PlayIcon data-icon="inline-start" />
+                Play
             </Button>
 
-            {#if renaming}
-                <Input
-                    bind:value={renameValue}
-                    class="h-9"
-                    onkeydown={(e) => {
-                        if (e.key === "Enter") commitRename();
-                        if (e.key === "Escape") renaming = false;
-                    }}
-                />
-                <Button variant="ghost" size="icon" aria-label="Save name" onclick={commitRename}>
-                    <CheckIcon />
-                </Button>
-                <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label="Cancel rename"
-                    onclick={() => (renaming = false)}
-                >
-                    <XIcon />
-                </Button>
-            {:else}
-                <h2 class="min-w-0 flex-1 truncate text-lg font-semibold">
-                    {detail.playlist.name}
-                </h2>
-                <Button variant="ghost" size="icon" aria-label="Rename" onclick={startRename}>
-                    <PencilIcon />
-                </Button>
-                <Button
-                    disabled={detail.tracks.length === 0}
-                    onclick={() => playlistStore.play(0)}
-                >
-                    <PlayIcon data-icon="inline-start" />
-                    Play
-                </Button>
-            {/if}
-        </div>
+            <DropdownMenu.Root>
+                <DropdownMenu.Trigger>
+                    {#snippet child({ props })}
+                        <button
+                            {...props}
+                            type="button"
+                            class="text-muted-foreground hover:bg-accent hover:text-foreground grid size-8 place-items-center rounded-md transition-colors"
+                            aria-label="Playlist options"
+                        >
+                            <MoreHorizontalIcon class="size-4" />
+                        </button>
+                    {/snippet}
+                </DropdownMenu.Trigger>
+                <DropdownMenu.Content align="end" class="w-48">
+                    <DropdownMenu.Item onSelect={rename}>
+                        <PencilIcon />
+                        Rename
+                    </DropdownMenu.Item>
+                    <DropdownMenu.Separator />
+                    <DropdownMenu.Item
+                        onSelect={async () => {
+                            await playlistStore.remove(detail.playlist.id);
+                            playlistStore.close();
+                        }}
+                    >
+                        <Trash2Icon />
+                        Delete playlist
+                    </DropdownMenu.Item>
+                </DropdownMenu.Content>
+            </DropdownMenu.Root>
+        {/snippet}
 
-        <!-- Filters this playlist only; the library keeps its own. -->
-        <div class="relative">
-            <SearchIcon
-                class="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2"
-            />
-            <Input
+        {#snippet toolbar()}
+            <!-- Filters this playlist only; the library keeps its own. -->
+            <SearchField
+                class="max-w-md"
                 value={playlistStore.query}
                 placeholder="Filter this playlist…"
-                class="pl-9"
-                oninput={(e) => playlistStore.setQuery(e.currentTarget.value)}
+                oninput={(v) => playlistStore.setQuery(v)}
             />
-        </div>
 
-        <TagFilter
-            selectedIds={playlistStore.selectedTagIds}
-            mode={playlistStore.mode}
-            active={playlistStore.filtering}
-            onToggle={(id) => playlistStore.toggleTag(id)}
-            onModeChange={(m) => playlistStore.setMode(m)}
-            onClear={() => playlistStore.clearFilters()}
-            showCounts={false}
-        />
-
-        {#if playlistStore.filtering}
-            <p class="text-muted-foreground text-xs">
-                Showing {detail.tracks.length} of {detail.playlist.trackCount}.
-                Play uses the filtered list; reordering is off while filtered.
-            </p>
-        {/if}
+            <TagFilter
+                selectedIds={playlistStore.selectedTagIds}
+                mode={playlistStore.mode}
+                active={playlistStore.filtering}
+                onToggle={(id) => playlistStore.toggleTag(id)}
+                onModeChange={(m) => playlistStore.setMode(m)}
+                onClear={() => playlistStore.clearFilters()}
+                showCounts={false}
+            />
+        {/snippet}
 
         {#if detail.tracks.length === 0}
-            <div
-                class="text-muted-foreground rounded-lg border border-dashed px-6 py-8 text-center text-sm"
+            <EmptyState
+                icon={ListMusicIcon}
+                title={playlistStore.filtering
+                    ? "Nothing in this playlist matches"
+                    : "This playlist is empty"}
+                hint={playlistStore.filtering
+                    ? "Clear the filter to see the rest."
+                    : "Add tracks from your library or from a search, using the ⋯ menu on any row."}
             >
-                {playlistStore.filtering
-                    ? "Nothing in this playlist matches."
-                    : "Empty. Add tracks from the library or a YouTube search."}
-            </div>
+                {#if playlistStore.filtering}
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        onclick={() => playlistStore.clearFilters()}
+                    >
+                        Clear filters
+                    </Button>
+                {:else}
+                    <Button variant="outline" size="sm" onclick={() => nav.go("library")}>
+                        Go to library
+                    </Button>
+                {/if}
+            </EmptyState>
         {:else}
             <ul class="flex flex-col">
                 {#each detail.tracks as track, index (track.id)}
-                    {@const isCurrent = player.isCurrent(track.id)}
-                    {@const isPlaying = isCurrent && player.state === "playing"}
-                    <li
-                        class="flex items-center gap-2 border-b py-1 text-sm last:border-b-0"
-                        class:opacity-50={unavailable(track.state)}
-                        class:bg-muted={dragOver === index}
-                        draggable={reorderable}
-                        ondragstart={() => (dragFrom = index)}
-                        ondragover={(e) => {
-                            e.preventDefault();
-                            dragOver = index;
-                        }}
-                        ondragleave={() => {
-                            if (dragOver === index) dragOver = null;
-                        }}
-                        ondrop={(e) => {
-                            e.preventDefault();
-                            drop(index);
-                        }}
-                        ondragend={() => {
-                            dragFrom = null;
-                            dragOver = null;
+                    <TrackRow
+                        {track}
+                        {index}
+                        onPlay={() => playlistStore.play(index)}
+                        reorder={{
+                            enabled: reorderable,
+                            over: dragOver === index,
+                            onStart: () => (dragFrom = index),
+                            onOver: () => (dragOver = index),
+                            onLeave: () => {
+                                if (dragOver === index) dragOver = null;
+                            },
+                            onDrop: () => drop(index),
+                            onEnd: () => {
+                                dragFrom = null;
+                                dragOver = null;
+                            },
                         }}
                     >
-                        <GripVerticalIcon
-                            class="text-muted-foreground size-4 shrink-0 {reorderable
-                                ? 'cursor-grab'
-                                : 'opacity-30'}"
-                        />
-
-                        <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label={isPlaying
-                                ? `Pause ${track.title}`
-                                : `Play ${track.title} from here`}
-                            onclick={() =>
-                                isCurrent
-                                    ? player.togglePlayPause()
-                                    : playlistStore.play(index)}
-                        >
-                            {#if isPlaying}
-                                <PauseIcon />
-                            {:else}
-                                <PlayIcon />
-                            {/if}
-                        </Button>
-
-                        <span class="min-w-0 flex-1 truncate">
-                            <span class:font-medium={isCurrent}>{track.title}</span>
-                            <span class="text-muted-foreground">
-                                — {track.artist ?? "Unknown artist"}
-                            </span>
-                            <SourceBadge
-                                source={track.source}
-                                state={track.state}
-                                durationSecs={track.durationSecs}
-                                cached={cacheStore.isCached(track.id)}
-                            />
-                        </span>
-
-                        <span class="text-muted-foreground shrink-0 text-xs">
-                            {formatDuration(track.durationSecs)}
-                        </span>
-
-                        <TrackActions
-                            resolveTrackId={async () => track.id}
-                            label="Queue {track.title}"
-                        />
-
-                        <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label="Remove {track.title} from playlist"
-                            onclick={() =>
-                                playlistStore.removeTrack(detail.playlist.id, track.id)}
-                        >
-                            <XIcon />
-                        </Button>
-                    </li>
+                        {#snippet extra()}
+                            <DropdownMenu.Item
+                                onSelect={() =>
+                                    playlistStore.removeTrack(
+                                        detail.playlist.id,
+                                        track.id,
+                                    )}
+                            >
+                                <XIcon />
+                                Remove from this playlist
+                            </DropdownMenu.Item>
+                        {/snippet}
+                    </TrackRow>
                 {/each}
             </ul>
         {/if}
-    {/if}
-</section>
+    </PageShell>
+{/if}

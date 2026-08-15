@@ -14,8 +14,13 @@
       {
         "label": "main",
         "title": "music-app",
-        "width": 800,
-        "height": 600
+        "width": 1180,
+        "height": 760,
+        "minWidth": 720,
+        "minHeight": 520,
+        "center": true,
+        "decorations": false,
+        "visible": false
       }
     ],
     "security": {

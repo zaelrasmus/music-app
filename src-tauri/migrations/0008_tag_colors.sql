@@ -1,0 +1,12 @@
+-- A colour for each tag.
+--
+-- Stored as a palette *name* ("emerald"), never a hex value. A hex would be
+-- fixed at the moment it was picked and would then have to survive a theme
+-- switch: a colour chosen against a white background is unreadable on a dark
+-- one. A name is resolved at render time, so the same tag stays legible in
+-- both themes and the palette can be retuned later without a data migration.
+--
+-- NULL means "not chosen". Those are coloured automatically from the tag's id,
+-- so no tag is ever grey and existing libraries gain colour without anyone
+-- having to sit down and assign one to each.
+ALTER TABLE tags ADD COLUMN color TEXT;

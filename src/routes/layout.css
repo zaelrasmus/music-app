@@ -5,77 +5,158 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/*
+ * The palette.
+ *
+ * Neutrals carry a small amount of chroma on a fixed hue (285, a cool violet)
+ * rather than being pure grey. Pure grey next to a saturated accent reads as
+ * dirty; a neutral that shares the accent's hue reads as deliberate. The cost
+ * is one number repeated, which is why it is written down here once.
+ *
+ * Every value is oklch because lightness there is perceptual: 0.55 in violet
+ * and 0.55 in emerald genuinely look equally bright, so a tag palette built by
+ * varying only the hue stays legible across all of it. That property is what
+ * makes `--tag-h` below work at all.
+ */
 :root {
-	--background: oklch(1 0 0);
-	--foreground: oklch(0.145 0 0);
+	--background: oklch(0.985 0.002 285);
+	--foreground: oklch(0.21 0.015 285);
+
+	/* Raised above the background: rows, panels, the player bar. */
 	--card: oklch(1 0 0);
-	--card-foreground: oklch(0.145 0 0);
+	--card-foreground: oklch(0.21 0.015 285);
 	--popover: oklch(1 0 0);
-	--popover-foreground: oklch(0.145 0 0);
-	--primary: oklch(0.205 0 0);
-	--primary-foreground: oklch(0.985 0 0);
-	--secondary: oklch(0.97 0 0);
-	--secondary-foreground: oklch(0.205 0 0);
-	--muted: oklch(0.97 0 0);
-	--muted-foreground: oklch(0.556 0 0);
-	--accent: oklch(0.97 0 0);
-	--accent-foreground: oklch(0.205 0 0);
-	--destructive: oklch(0.577 0.245 27.325);
-	--border: oklch(0.922 0 0);
-	--input: oklch(0.922 0 0);
-	--ring: oklch(0.708 0 0);
-	--chart-1: oklch(0.87 0 0);
-	--chart-2: oklch(0.556 0 0);
-	--chart-3: oklch(0.439 0 0);
-	--chart-4: oklch(0.371 0 0);
-	--chart-5: oklch(0.269 0 0);
+	--popover-foreground: oklch(0.21 0.015 285);
+
+	--primary: oklch(0.53 0.215 296);
+	--primary-foreground: oklch(0.99 0 0);
+
+	--secondary: oklch(0.955 0.005 285);
+	--secondary-foreground: oklch(0.25 0.015 285);
+
+	--muted: oklch(0.955 0.005 285);
+	--muted-foreground: oklch(0.52 0.014 285);
+
+	--accent: oklch(0.95 0.008 285);
+	--accent-foreground: oklch(0.25 0.02 296);
+
+	--destructive: oklch(0.575 0.22 27);
+	--destructive-foreground: oklch(0.99 0 0);
+
+	/*
+	 * "This works without a connection." Its own colour, not the accent:
+	 * offline-readiness is a fact about a track, while the accent means
+	 * "this is the one you picked". Sharing a colour would blur both.
+	 */
+	--signal: oklch(0.52 0.13 165);
+
+	--border: oklch(0.91 0.005 285);
+	--input: oklch(0.90 0.006 285);
+	--ring: oklch(0.53 0.215 296);
+
+	--chart-1: oklch(0.53 0.215 296);
+	--chart-2: oklch(0.62 0.16 250);
+	--chart-3: oklch(0.66 0.15 195);
+	--chart-4: oklch(0.70 0.16 145);
+	--chart-5: oklch(0.72 0.17 85);
+
 	--radius: 0.625rem;
-	--sidebar: oklch(0.985 0 0);
-	--sidebar-foreground: oklch(0.145 0 0);
-	--sidebar-primary: oklch(0.205 0 0);
-	--sidebar-primary-foreground: oklch(0.985 0 0);
-	--sidebar-accent: oklch(0.97 0 0);
-	--sidebar-accent-foreground: oklch(0.205 0 0);
-	--sidebar-border: oklch(0.922 0 0);
-	--sidebar-ring: oklch(0.708 0 0);
+
+	--sidebar: oklch(0.968 0.004 285);
+	--sidebar-foreground: oklch(0.21 0.015 285);
+	--sidebar-primary: oklch(0.53 0.215 296);
+	--sidebar-primary-foreground: oklch(0.99 0 0);
+	--sidebar-accent: oklch(0.93 0.008 285);
+	--sidebar-accent-foreground: oklch(0.25 0.02 296);
+	--sidebar-border: oklch(0.90 0.005 285);
+	--sidebar-ring: oklch(0.53 0.215 296);
+
+	/* The window frame we draw ourselves. */
+	--titlebar: oklch(0.968 0.004 285);
+	--titlebar-foreground: oklch(0.42 0.014 285);
+
+	/* Tag chips: lightness and chroma are fixed, only `--tag-h` varies. */
+	--tag-bg-l: 0.955;
+	--tag-bg-c: 0.045;
+	--tag-fg-l: 0.44;
+	--tag-fg-c: 0.155;
+	--tag-border-l: 0.88;
+	--tag-border-c: 0.07;
+
+	color-scheme: light;
 }
 
 .dark {
-	--background: oklch(0.145 0 0);
-	--foreground: oklch(0.985 0 0);
-	--card: oklch(0.205 0 0);
-	--card-foreground: oklch(0.985 0 0);
-	--popover: oklch(0.205 0 0);
-	--popover-foreground: oklch(0.985 0 0);
-	--primary: oklch(0.922 0 0);
-	--primary-foreground: oklch(0.205 0 0);
-	--secondary: oklch(0.269 0 0);
-	--secondary-foreground: oklch(0.985 0 0);
-	--muted: oklch(0.269 0 0);
-	--muted-foreground: oklch(0.708 0 0);
-	--accent: oklch(0.269 0 0);
-	--accent-foreground: oklch(0.985 0 0);
-	--destructive: oklch(0.704 0.191 22.216);
-	--border: oklch(1 0 0 / 10%);
-	--input: oklch(1 0 0 / 15%);
-	--ring: oklch(0.556 0 0);
-	--chart-1: oklch(0.87 0 0);
-	--chart-2: oklch(0.556 0 0);
-	--chart-3: oklch(0.439 0 0);
-	--chart-4: oklch(0.371 0 0);
-	--chart-5: oklch(0.269 0 0);
-	--sidebar: oklch(0.205 0 0);
-	--sidebar-foreground: oklch(0.985 0 0);
-	--sidebar-primary: oklch(0.488 0.243 264.376);
-	--sidebar-primary-foreground: oklch(0.985 0 0);
-	--sidebar-accent: oklch(0.269 0 0);
-	--sidebar-accent-foreground: oklch(0.985 0 0);
-	--sidebar-border: oklch(1 0 0 / 10%);
-	--sidebar-ring: oklch(0.556 0 0);
+	/*
+	 * Not pure black. An OLED-black background makes every raised surface
+	 * look like it is glowing, and a player is mostly raised surfaces.
+	 */
+	--background: oklch(0.165 0.011 285);
+	--foreground: oklch(0.96 0.003 285);
+
+	--card: oklch(0.205 0.013 285);
+	--card-foreground: oklch(0.96 0.003 285);
+	--popover: oklch(0.225 0.014 285);
+	--popover-foreground: oklch(0.96 0.003 285);
+
+	/* Lifted and desaturated, because the same violet on a dark ground
+	   reads far more intense than it does on white. */
+	--primary: oklch(0.72 0.165 296);
+	--primary-foreground: oklch(0.17 0.03 296);
+
+	--secondary: oklch(0.27 0.014 285);
+	--secondary-foreground: oklch(0.96 0.003 285);
+
+	--muted: oklch(0.27 0.014 285);
+	--muted-foreground: oklch(0.68 0.014 285);
+
+	--accent: oklch(1 0 0 / 7%);
+	--accent-foreground: oklch(0.97 0.01 296);
+
+	--destructive: oklch(0.68 0.19 24);
+	--destructive-foreground: oklch(0.15 0.02 24);
+
+	--signal: oklch(0.76 0.14 165);
+
+	--border: oklch(1 0 0 / 9%);
+	--input: oklch(1 0 0 / 13%);
+	--ring: oklch(0.72 0.165 296);
+
+	--chart-1: oklch(0.72 0.165 296);
+	--chart-2: oklch(0.70 0.14 250);
+	--chart-3: oklch(0.74 0.13 195);
+	--chart-4: oklch(0.78 0.14 145);
+	--chart-5: oklch(0.80 0.15 85);
+
+	--sidebar: oklch(0.185 0.012 285);
+	--sidebar-foreground: oklch(0.96 0.003 285);
+	--sidebar-primary: oklch(0.72 0.165 296);
+	--sidebar-primary-foreground: oklch(0.17 0.03 296);
+	--sidebar-accent: oklch(1 0 0 / 7%);
+	--sidebar-accent-foreground: oklch(0.97 0.01 296);
+	--sidebar-border: oklch(1 0 0 / 8%);
+	--sidebar-ring: oklch(0.72 0.165 296);
+
+	--titlebar: oklch(0.185 0.012 285);
+	--titlebar-foreground: oklch(0.70 0.014 285);
+
+	--tag-bg-l: 0.30;
+	--tag-bg-c: 0.055;
+	--tag-fg-l: 0.83;
+	--tag-fg-c: 0.125;
+	--tag-border-l: 0.40;
+	--tag-border-c: 0.075;
+
+	color-scheme: dark;
 }
 
 @theme inline {
 	--font-sans: 'Inter Variable', sans-serif;
+
+	--color-signal: var(--signal);
+	--color-titlebar: var(--titlebar);
+	--color-titlebar-foreground: var(--titlebar-foreground);
+
 	--color-sidebar-ring: var(--sidebar-ring);
 	--color-sidebar-border: var(--sidebar-border);
 	--color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -92,6 +173,7 @@
 	--color-ring: var(--ring);
 	--color-input: var(--input);
 	--color-border: var(--border);
+	--color-destructive-foreground: var(--destructive-foreground);
 	--color-destructive: var(--destructive);
 	--color-accent-foreground: var(--accent-foreground);
 	--color-accent: var(--accent);
@@ -107,6 +189,7 @@
 	--color-card: var(--card);
 	--color-foreground: var(--foreground);
 	--color-background: var(--background);
+
 	--radius-sm: calc(var(--radius) * 0.6);
 	--radius-md: calc(var(--radius) * 0.8);
 	--radius-lg: var(--radius);
@@ -120,10 +203,116 @@
 	* {
 		@apply border-border outline-ring/50;
 	}
-	body {
-		@apply bg-background text-foreground;
-	}
+
 	html {
 		@apply font-sans;
+		/* The window never scrolls; individual panes do. Otherwise the
+		   titlebar and player bar can be scrolled out of reach. */
+		overflow: hidden;
+	}
+
+	body {
+		@apply bg-background text-foreground;
+		overflow: hidden;
+		/*
+		 * Desktop apps do not let you drag-select the chrome. Text that is
+		 * genuinely worth copying opts back in via `.selectable` below.
+		 */
+		user-select: none;
+		-webkit-user-select: none;
+		/* Stops the whole page nudging when a drag overshoots a scroller. */
+		overscroll-behavior: none;
+	}
+
+	input,
+	textarea,
+	[contenteditable] {
+		user-select: text;
+		-webkit-user-select: text;
+	}
+
+	img {
+		-webkit-user-drag: none;
+	}
+
+	/*
+	 * Scrollbars. The platform default is a wide opaque strip that ruins a
+	 * dark surface; this is a thin overlay that only earns attention on hover.
+	 */
+	::-webkit-scrollbar {
+		width: 10px;
+		height: 10px;
+	}
+
+	::-webkit-scrollbar-track {
+		background: transparent;
+	}
+
+	::-webkit-scrollbar-thumb {
+		background-color: color-mix(in oklch, var(--foreground) 18%, transparent);
+		border-radius: 999px;
+		/* Padding drawn as a transparent border, so the thumb floats. */
+		border: 3px solid transparent;
+		background-clip: content-box;
+	}
+
+	::-webkit-scrollbar-thumb:hover {
+		background-color: color-mix(in oklch, var(--foreground) 32%, transparent);
+	}
+
+	::-webkit-scrollbar-corner {
+		background: transparent;
+	}
+}
+
+@layer components {
+	/** Text worth copying: titles, artists, file paths, error messages. */
+	.selectable {
+		user-select: text;
+		-webkit-user-select: text;
+	}
+
+	/**
+	 * A tag chip.
+	 *
+	 * Only the hue changes between tags -- `--tag-h` is set inline. Lightness
+	 * and chroma come from the theme, so every colour stays legible in both
+	 * modes and a new tag colour costs one number rather than six.
+	 */
+	.tag-chip {
+		background-color: oklch(var(--tag-bg-l) var(--tag-bg-c) var(--tag-h));
+		color: oklch(var(--tag-fg-l) var(--tag-fg-c) var(--tag-h));
+		border-color: oklch(var(--tag-border-l) var(--tag-border-c) var(--tag-h));
+	}
+
+	/**
+	 * Hairline separator that fades at both ends.
+	 *
+	 * A full-width 1px line boxes a layout in; this reads as a seam.
+	 */
+	.seam {
+		background-image: linear-gradient(
+			to right,
+			transparent,
+			var(--border) 12%,
+			var(--border) 88%,
+			transparent
+		);
+	}
+}
+
+/*
+ * Respect the OS "reduce motion" setting.
+ *
+ * The playing-track equaliser and the sidebar slide are the only motion that
+ * carries meaning, and both remain readable frozen.
+ */
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
 	}
 }

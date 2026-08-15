@@ -6,12 +6,20 @@ export type Tag = {
   id: number;
   name: string;
   trackCount: number;
+  /** A palette name, or null for "colour this one automatically". */
+  color: string | null;
 };
 
-export type TrackTag = {
+/** A tag as it appears on a track: enough to draw a chip, and no more. */
+export type TagRef = {
+  id: number;
+  name: string;
+  color: string | null;
+};
+
+export type TrackTag = TagRef & {
   trackId: number;
   tagId: number;
-  name: string;
 };
 
 /**
@@ -23,7 +31,9 @@ export type TrackTag = {
 class TagStore {
   tags = $state<Tag[]>([]);
   /** trackId -> its tags, rebuilt whenever the pairs change. */
-  byTrack = new SvelteMap<number, Tag[]>();
+  byTrack = new SvelteMap<number, TagRef[]>();
+  /** The colours the backend will accept, so the picker cannot offer others. */
+  palette = $state<string[]>([]);
 
   async load() {
     try {
@@ -37,7 +47,7 @@ class TagStore {
       this.byTrack.clear();
       for (const pair of pairs) {
         const list = this.byTrack.get(pair.trackId) ?? [];
-        list.push({ id: pair.tagId, name: pair.name, trackCount: 0 });
+        list.push({ id: pair.tagId, name: pair.name, color: pair.color });
         this.byTrack.set(pair.trackId, list);
       }
     } catch (e) {
@@ -45,7 +55,17 @@ class TagStore {
     }
   }
 
-  forTrack(trackId: number): Tag[] {
+  /** Fixed for the life of the process, so it is fetched once. */
+  async loadPalette() {
+    if (this.palette.length > 0) return;
+    try {
+      this.palette = await invoke<string[]>("list_tag_colors");
+    } catch (e) {
+      console.debug("could not load the tag palette", e);
+    }
+  }
+
+  forTrack(trackId: number): TagRef[] {
     return this.byTrack.get(trackId) ?? [];
   }
 
@@ -76,6 +96,22 @@ class TagStore {
     } catch (e) {
       toast.error(String(e));
       return false;
+    }
+  }
+
+  /**
+   * Sets a tag's colour, or clears it with `null`.
+   *
+   * Reloads everything afterwards rather than patching the one row: the same
+   * tag is drawn on every track that carries it, and those chips live in
+   * `byTrack`, not in `tags`.
+   */
+  async setColor(tagId: number, color: string | null) {
+    try {
+      await invoke("set_tag_color", { tagId, color });
+      await this.load();
+    } catch (e) {
+      toast.error(String(e));
     }
   }
 

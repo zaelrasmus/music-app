@@ -1,16 +1,18 @@
 <script lang="ts">
-    import { Button } from "$components/ui/button";
-    import { Input } from "$components/ui/input";
+    import PageShell from "$components/page-shell.svelte";
+    import EmptyState from "$components/empty-state.svelte";
+    import SearchField from "$components/search-field.svelte";
+    import CoverArt from "$components/cover-art.svelte";
+    import TrackMenu from "$components/track-menu.svelte";
     import {
         providerSearch,
         looksLikePreview,
         type SearchResult,
     } from "$lib/provider-search.svelte";
-    import SearchIcon from "@lucide/svelte/icons/search";
     import PlayIcon from "@lucide/svelte/icons/play";
     import LoaderIcon from "@lucide/svelte/icons/loader-circle";
-    import AddToPlaylist from "$components/add-to-playlist.svelte";
-    import TrackActions from "$components/track-actions.svelte";
+    import SearchIcon from "@lucide/svelte/icons/search";
+    import RadioIcon from "@lucide/svelte/icons/radio";
 
     /** Whole minutes and seconds; hours only when there are hours. */
     function formatDuration(secs: number | null) {
@@ -45,8 +47,8 @@
     /** SoundCloud artwork is square; YouTube thumbnails are 16:9. */
     const artClass = $derived(
         providerSearch.provider === "soundcloud"
-            ? "aspect-square w-20"
-            : "aspect-video w-32",
+            ? "aspect-square w-16"
+            : "aspect-video w-[7rem]",
     );
 
     function uploaderLabel(result: SearchResult) {
@@ -59,108 +61,132 @@
     }
 </script>
 
-<section class="flex flex-col gap-3">
-    <div class="flex flex-col gap-1">
-        <h2 class="text-lg font-semibold">
-            Search {providerSearch.providerName}
-        </h2>
-        <p class="text-muted-foreground text-sm">
-            Raw results, exactly as uploaded — the duration and uploader are how
-            you tell a song from a ten-hour loop.
-        </p>
-    </div>
+<PageShell
+    title="Search"
+    badge={providerSearch.results.length > 0
+        ? `${providerSearch.results.length}`
+        : null}
+    subtitle="Raw results, exactly as uploaded — the duration and uploader are how you tell a song from a ten-hour loop."
+>
+    {#snippet toolbar()}
+        <div class="flex items-center gap-2">
+            <SearchField
+                class="max-w-lg flex-1"
+                value={providerSearch.query}
+                placeholder="Search {providerSearch.providerName} for a song…"
+                oninput={(v) => providerSearch.queueSearch(v)}
+                onenter={() => providerSearch.searchNow()}
+            />
 
-    {#if providerSearch.providers.length > 1}
-        <div class="flex items-center gap-1">
-            {#each providerSearch.providers as provider (provider.id)}
-                {@const selected = providerSearch.provider === provider.id}
-                <button
-                    type="button"
-                    class="rounded-full border px-3 py-1 text-xs"
-                    class:bg-primary={selected}
-                    class:text-primary-foreground={selected}
-                    class:border-primary={selected}
-                    class:text-muted-foreground={!selected}
-                    aria-pressed={selected}
-                    onclick={() => providerSearch.setProvider(provider.id)}
+            {#if providerSearch.providers.length > 1}
+                <!-- A segmented control rather than chips: these are mutually
+                     exclusive and one is always on, which chips do not say. -->
+                <div
+                    class="bg-muted flex items-center gap-0.5 rounded-lg p-0.5"
+                    role="tablist"
+                    aria-label="Search provider"
                 >
-                    {provider.name}
-                </button>
-            {/each}
+                    {#each providerSearch.providers as provider (provider.id)}
+                        {@const selected = providerSearch.provider === provider.id}
+                        <button
+                            type="button"
+                            role="tab"
+                            aria-selected={selected}
+                            class="rounded-md px-3 py-1.5 text-xs font-medium transition-colors
+                                   {selected
+                                ? 'bg-background text-foreground shadow-sm'
+                                : 'text-muted-foreground hover:text-foreground'}"
+                            onclick={() => providerSearch.setProvider(provider.id)}
+                        >
+                            {provider.name}
+                        </button>
+                    {/each}
+                </div>
+            {/if}
         </div>
-    {/if}
 
-    <div class="relative">
-        <SearchIcon
-            class="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2"
-        />
-        <Input
-            value={providerSearch.query}
-            placeholder="Search for a song…"
-            class="pl-9"
-            oninput={(e) => providerSearch.queueSearch(e.currentTarget.value)}
-            onkeydown={(e) => {
-                if (e.key === "Enter") providerSearch.searchNow();
-            }}
-        />
-    </div>
+        {#if providerSearch.error}
+            <p
+                class="border-destructive/50 bg-destructive/5 text-destructive selectable rounded-md border px-3 py-2 text-sm"
+                role="alert"
+            >
+                {providerSearch.error}
+            </p>
+        {/if}
+    {/snippet}
 
-    {#if providerSearch.error}
-        <p
-            class="border-destructive/50 text-destructive rounded-md border px-3 py-2 text-sm"
-            role="alert"
-        >
-            {providerSearch.error}
-        </p>
-    {/if}
-
-    {#if providerSearch.searching}
-        <p class="text-muted-foreground text-sm">Searching…</p>
+    {#if providerSearch.searching && providerSearch.results.length === 0}
+        <p class="text-muted-foreground px-2 py-6 text-sm">Searching…</p>
     {:else if providerSearch.searched && providerSearch.results.length === 0}
-        <p class="text-muted-foreground text-sm">No results.</p>
-    {/if}
-
-    {#if providerSearch.results.length > 0}
+        <EmptyState
+            icon={SearchIcon}
+            title="No results"
+            hint="Try fewer words, or switch provider — the catalogues barely overlap."
+        />
+    {:else if providerSearch.results.length === 0}
+        <EmptyState
+            icon={SearchIcon}
+            title="Search {providerSearch.providerName}"
+            hint="Anything you play from here is saved to your library and streams; download it later if you want to keep it."
+        />
+    {:else}
         <ul
-            class="flex flex-col gap-2"
-            class:opacity-50={providerSearch.searching}
+            class="flex flex-col gap-1"
+            class:opacity-60={providerSearch.searching}
         >
             {#each providerSearch.results as result (result.remoteId)}
                 {@const duration = formatDuration(result.durationSecs)}
                 {@const count = formatCount(result.viewCount, countNoun)}
                 {@const busy = providerSearch.saving === result.remoteId}
                 {@const preview = looksLikePreview(result)}
-                <li class="bg-card flex items-start gap-3 rounded-lg border p-2">
-                    <div
-                        class="bg-muted relative shrink-0 overflow-hidden rounded {artClass}"
-                    >
-                        {#if result.thumbnailUrl}
-                            <img
-                                src={result.thumbnailUrl}
-                                alt=""
-                                loading="lazy"
-                                class="size-full object-cover"
-                            />
-                        {/if}
+                <li
+                    class="group/result hover:bg-accent/50 flex items-start gap-3 rounded-lg px-2 py-2 transition-colors"
+                >
+                    <div class="relative shrink-0 {artClass}">
+                        <CoverArt
+                            seed={`${result.channel ?? ""}::${result.title}`}
+                            src={result.thumbnailUrl}
+                            class="size-full"
+                            glyph={false}
+                        />
                         {#if result.isLive}
                             <span
-                                class="bg-destructive text-destructive-foreground absolute right-1 bottom-1 rounded px-1 text-[10px] font-medium"
+                                class="bg-destructive text-destructive-foreground absolute right-1 bottom-1 flex items-center gap-1 rounded px-1 text-[10px] font-medium"
                             >
+                                <RadioIcon class="size-2.5" />
                                 LIVE
                             </span>
                         {:else if duration}
                             <span
-                                class="absolute right-1 bottom-1 rounded bg-black/80 px-1 text-[10px] font-medium text-white tabular-nums"
+                                class="absolute right-1 bottom-1 rounded bg-black/75 px-1 text-[10px] font-medium text-white tabular-nums"
                             >
                                 {duration}
                             </span>
                         {/if}
+
+                        <!-- The play control sits on the art, where the eye
+                             already is when deciding between two results. -->
+                        <button
+                            type="button"
+                            class="absolute inset-0 grid place-items-center rounded-md bg-black/45 opacity-0 backdrop-blur-[1px] transition-opacity group-hover/result:opacity-100 focus-visible:opacity-100 focus-visible:outline-none"
+                            aria-label="Play {result.title}"
+                            disabled={busy}
+                            onclick={() => providerSearch.playResult(result)}
+                        >
+                            {#if busy}
+                                <LoaderIcon class="size-6 animate-spin text-white" />
+                            {:else}
+                                <PlayIcon class="size-6 fill-white text-white" />
+                            {/if}
+                        </button>
                     </div>
 
-                    <div class="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <div class="flex min-w-0 flex-1 flex-col gap-0.5 pt-0.5">
                         <!-- Full title, not truncated to one line: the tail is
                              often what distinguishes an edit from the original. -->
-                        <span class="text-sm leading-snug">{result.title}</span>
+                        <span class="selectable text-sm leading-snug">
+                            {result.title}
+                        </span>
                         <span class="text-muted-foreground truncate text-xs">
                             {uploaderLabel(result)}
                             {#if count}
@@ -172,7 +198,7 @@
                             <!-- Worth saying before the click, not after: this
                                  saves and plays fine, it just stops at 0:30. -->
                             <span
-                                class="text-muted-foreground border-muted-foreground/40 mt-0.5 w-fit rounded border px-1 text-[10px]"
+                                class="text-muted-foreground border-border mt-0.5 w-fit rounded-full border px-1.5 text-[10px]"
                                 title="SoundCloud only serves a 30-second snippet for this upload (Go+ gated). Another upload of the same song may be full length."
                             >
                                 likely a 30s preview
@@ -182,32 +208,13 @@
 
                     <!-- Queueing saves the result first: the queue holds track
                          ids, and a search result is not a track yet. -->
-                    <TrackActions
+                    <TrackMenu
                         resolveTrackId={() => providerSearch.saveResult(result)}
-                        label="Queue {result.title}"
+                        label="More actions for {result.title}"
+                        trigger="opacity-0 transition-opacity group-hover/result:opacity-100 focus-visible:opacity-100 data-open:opacity-100"
                     />
-
-                    <AddToPlaylist
-                        resolveTrackId={() => providerSearch.saveResult(result)}
-                        label="Add {result.title} to a playlist"
-                    />
-
-                    <Button
-                        variant="ghost"
-                        size="icon"
-                        class="shrink-0"
-                        aria-label="Play {result.title}"
-                        disabled={busy}
-                        onclick={() => providerSearch.playResult(result)}
-                    >
-                        {#if busy}
-                            <LoaderIcon class="animate-spin" />
-                        {:else}
-                            <PlayIcon />
-                        {/if}
-                    </Button>
                 </li>
             {/each}
         </ul>
     {/if}
-</section>
+</PageShell>

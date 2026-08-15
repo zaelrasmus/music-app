@@ -1,9 +1,12 @@
 <script lang="ts">
-    import { Button } from "$components/ui/button";
-    import { Slider } from "$components/ui/slider";
+    import ScrubBar from "$components/scrub-bar.svelte";
+    import CoverArt from "$components/cover-art.svelte";
+    import SourceBadge from "$components/source-badge.svelte";
+    import { coverSeed } from "$lib/cover";
     import { player } from "$lib/player.svelte";
     import { queueStore } from "$lib/queue.svelte";
     import { trackStore } from "$lib/tracks.svelte";
+    import { cacheStore } from "$lib/cache.svelte";
     import ListMusicIcon from "@lucide/svelte/icons/list-music";
     import PlayIcon from "@lucide/svelte/icons/play";
     import PauseIcon from "@lucide/svelte/icons/pause";
@@ -16,6 +19,7 @@
     import Volume1Icon from "@lucide/svelte/icons/volume-1";
     import VolumeXIcon from "@lucide/svelte/icons/volume-x";
     import LoaderIcon from "@lucide/svelte/icons/loader-circle";
+    import WifiOffIcon from "@lucide/svelte/icons/wifi-off";
 
     /**
      * The backend hydrates the queue payload itself, so it knows about a
@@ -44,7 +48,7 @@
         totalSecs > 0 && player.state !== "stopped" && !loading,
     );
 
-    // Kept within [0, max] so the slider never has to snap a value back at us.
+    // Kept within [0, max] so the bar never has to snap a value back at us.
     // On VBR files the real position can drift past the tag-reported duration.
     const sliderMax = $derived(Math.max(totalSecs, 1));
     const sliderValue = $derived(
@@ -66,170 +70,208 @@
         const s = total % 60;
         return `${m}:${String(s).padStart(2, "0")}`;
     }
+
+    /** Ghost buttons in the transport row; the play button is separate. */
+    const ghost =
+        "grid size-8 shrink-0 place-items-center rounded-md transition-colors hover:bg-accent focus-visible:outline-none focus-visible:bg-accent disabled:opacity-40 disabled:hover:bg-transparent";
+    const on = "text-primary";
+    const off = "text-muted-foreground hover:text-foreground";
 </script>
 
-<div class="bg-card fixed inset-x-0 bottom-0 border-t">
-    <div class="mx-auto flex max-w-4xl flex-col gap-1 px-4 py-2">
-        <!-- Progress -->
-        <div class="flex items-center gap-3">
+<footer
+    class="bg-card border-border/70 relative flex h-[74px] shrink-0 items-center gap-3 border-t px-3"
+>
+    <!-- Left: what is playing. Sized as a third so the transport stays centred
+         in the window rather than centred in whatever is left over. -->
+    <div class="flex w-[30%] min-w-0 items-center gap-3">
+        {#if nowPlaying}
+            <CoverArt seed={coverSeed(nowPlaying)} class="size-12" />
+            <div class="flex min-w-0 flex-col gap-0.5">
+                <span class="selectable truncate text-[13px] leading-tight font-medium">
+                    {nowPlaying.title}
+                </span>
+                <span class="text-muted-foreground flex items-center gap-1.5 text-xs leading-tight">
+                    {#if stalled}
+                        <span class="text-foreground/80 flex items-center gap-1">
+                            <WifiOffIcon class="size-3" />
+                            Reconnecting…
+                        </span>
+                    {:else if loading}
+                        <span>Loading…</span>
+                    {:else}
+                        <span class="selectable truncate">
+                            {nowPlaying.artist ?? "Unknown artist"}
+                        </span>
+                        <SourceBadge
+                            source={nowPlaying.source}
+                            state={nowPlaying.state}
+                            durationSecs={nowPlaying.durationSecs}
+                            cached={player.trackId !== null &&
+                                cacheStore.isCached(player.trackId)}
+                            compact
+                        />
+                    {/if}
+                </span>
+            </div>
+        {:else}
+            <div class="bg-muted grid size-12 shrink-0 place-items-center rounded-md">
+                <ListMusicIcon class="text-muted-foreground size-5" />
+            </div>
+            <span class="text-muted-foreground text-[13px]">Nothing playing</span>
+        {/if}
+    </div>
+
+    <!-- Centre: transport over the seek bar. -->
+    <div class="flex min-w-0 flex-1 flex-col items-center gap-1">
+        <div class="flex items-center gap-1">
+            <button
+                type="button"
+                class="{ghost} {player.shuffle ? on : off}"
+                aria-label="Shuffle"
+                title={player.shuffle ? "Shuffle on" : "Shuffle off"}
+                aria-pressed={player.shuffle}
+                onclick={() => player.toggleShuffle()}
+            >
+                <ShuffleIcon class="size-4" />
+            </button>
+
+            <button
+                type="button"
+                class="{ghost} {off}"
+                aria-label="Previous track"
+                title="Previous"
+                onclick={() => player.previous()}
+            >
+                <SkipBackIcon class="size-[18px] fill-current" />
+            </button>
+
+            <!-- The one solid control. Everything else on this bar is a
+                 modifier; this is the verb. -->
+            <button
+                type="button"
+                class="bg-foreground text-background grid size-9 shrink-0 place-items-center rounded-full transition-transform hover:scale-105 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-card active:scale-95 disabled:opacity-50 disabled:hover:scale-100"
+                aria-label={loading
+                    ? "Loading"
+                    : player.state === "playing"
+                      ? "Pause"
+                      : "Play"}
+                disabled={loading || !nowPlaying}
+                onclick={() => player.togglePlayPause()}
+            >
+                {#if loading}
+                    <LoaderIcon class="size-4 animate-spin" />
+                {:else if player.state === "playing"}
+                    <PauseIcon class="size-4 fill-current" />
+                {:else}
+                    <PlayIcon class="size-4 translate-x-[1px] fill-current" />
+                {/if}
+            </button>
+
+            <button
+                type="button"
+                class="{ghost} {off}"
+                aria-label="Next track"
+                title="Next"
+                onclick={() => player.next()}
+            >
+                <SkipForwardIcon class="size-[18px] fill-current" />
+            </button>
+
+            <button
+                type="button"
+                class="{ghost} {player.repeat !== 'off' ? on : off}"
+                aria-label={repeatLabel}
+                title={repeatLabel}
+                aria-pressed={player.repeat !== "off"}
+                onclick={() => player.cycleRepeat()}
+            >
+                {#if player.repeat === "one"}
+                    <Repeat1Icon class="size-4" />
+                {:else}
+                    <RepeatIcon class="size-4" />
+                {/if}
+            </button>
+        </div>
+
+        <div class="flex w-full max-w-[32rem] items-center gap-2">
             <span
-                class="text-muted-foreground w-10 shrink-0 text-right text-xs tabular-nums"
+                class="text-muted-foreground w-9 shrink-0 text-right text-[11px] tabular-nums"
             >
                 {formatTime(player.displaySecs)}
             </span>
 
-            <Slider
-                type="single"
+            <ScrubBar
                 value={sliderValue}
-                min={0}
                 max={sliderMax}
-                step={1}
+                step={5}
                 disabled={!seekable}
-                aria-label="Seek"
-                onValueChange={(v) => player.scrubTo(v)}
-                onValueCommit={(v) => player.commitScrub(v)}
+                label="Seek"
+                valueText="{formatTime(player.displaySecs)} of {formatTime(totalSecs)}"
+                onScrub={(v) => player.scrubTo(v)}
+                onCommit={(v) => player.commitScrub(v)}
             />
 
-            <span
-                class="text-muted-foreground w-10 shrink-0 text-xs tabular-nums"
-            >
+            <span class="text-muted-foreground w-9 shrink-0 text-[11px] tabular-nums">
                 {formatTime(totalSecs)}
             </span>
         </div>
+    </div>
 
-        <!-- Transport -->
-        <div class="flex items-center gap-2">
-            <div class="flex min-w-0 flex-1 items-baseline gap-2 text-sm">
-                {#if nowPlaying}
-                    <span class="truncate font-medium">{nowPlaying.title}</span>
-                    <span class="text-muted-foreground truncate text-xs">
-                        {#if stalled}
-                            Reconnecting…
-                        {:else if loading}
-                            Loading…
-                        {:else}
-                            {nowPlaying.artist ?? "Unknown artist"}
-                        {/if}
-                    </span>
-                {:else}
-                    <span class="text-muted-foreground">Nothing playing</span>
-                {/if}
-            </div>
+    <!-- Right: volume and the queue. -->
+    <div class="flex w-[30%] min-w-0 items-center justify-end gap-1">
+        <button
+            type="button"
+            class="{ghost} {off}"
+            aria-label={player.muted ? "Unmute" : "Mute"}
+            title={player.muted ? "Unmute" : "Mute"}
+            onclick={() => player.toggleMute()}
+        >
+            {#if player.muted || player.volume === 0}
+                <VolumeXIcon class="size-4" />
+            {:else if player.volume < 0.5}
+                <Volume1Icon class="size-4" />
+            {:else}
+                <Volume2Icon class="size-4" />
+            {/if}
+        </button>
 
-            <div class="flex shrink-0 items-center gap-1">
-                <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label="Shuffle"
-                    aria-pressed={player.shuffle}
-                    class={player.shuffle ? "text-primary" : ""}
-                    onclick={() => player.toggleShuffle()}
-                >
-                    <ShuffleIcon />
-                </Button>
-                <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label="Previous track"
-                    onclick={() => player.previous()}
-                >
-                    <SkipBackIcon />
-                </Button>
-                <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label={loading ? "Loading" : player.state === "playing" ? "Pause" : "Play"}
-                    disabled={loading}
-                    onclick={() => player.togglePlayPause()}
-                >
-                    {#if loading}
-                        <LoaderIcon class="animate-spin" />
-                    {:else if player.state === "playing"}
-                        <PauseIcon />
-                    {:else}
-                        <PlayIcon />
-                    {/if}
-                </Button>
-                <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label="Next track"
-                    onclick={() => player.next()}
-                >
-                    <SkipForwardIcon />
-                </Button>
-                <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label={repeatLabel}
-                    title={repeatLabel}
-                    aria-pressed={player.repeat !== "off"}
-                    class={player.repeat !== "off" ? "text-primary" : ""}
-                    onclick={() => player.cycleRepeat()}
-                >
-                    {#if player.repeat === "one"}
-                        <Repeat1Icon />
-                    {:else}
-                        <RepeatIcon />
-                    {/if}
-                </Button>
-            </div>
+        <ScrubBar
+            class="w-24 shrink-0"
+            value={player.muted ? 0 : player.volume}
+            max={1}
+            step={0.05}
+            label="Volume"
+            valueText="{Math.round((player.muted ? 0 : player.volume) * 100)}%"
+            onScrub={(v) => player.setVolume(v)}
+        />
 
-            <div class="flex w-36 shrink-0 items-center gap-1">
-                <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label={player.muted ? "Unmute" : "Mute"}
-                    onclick={() => player.toggleMute()}
-                >
-                    {#if player.muted || player.volume === 0}
-                        <VolumeXIcon />
-                    {:else if player.volume < 0.5}
-                        <Volume1Icon />
-                    {:else}
-                        <Volume2Icon />
-                    {/if}
-                </Button>
-                <Slider
-                    type="single"
-                    value={player.muted ? 0 : player.volume}
-                    min={0}
-                    max={1}
-                    step={0.01}
-                    aria-label="Volume"
-                    onValueChange={(v) => player.setVolume(v)}
-                />
-            </div>
+        <div class="ml-2 flex shrink-0 items-center gap-1">
+            <button
+                type="button"
+                class="{ghost} {queueStore.open ? on : off}"
+                aria-label="Up next"
+                title="Up next"
+                aria-pressed={queueStore.open}
+                onclick={() => queueStore.toggle()}
+            >
+                <ListMusicIcon class="size-4" />
+            </button>
 
-            <div class="flex shrink-0 items-center gap-1">
-                <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label="Up next"
-                    title="Up next"
-                    aria-pressed={queueStore.open}
-                    class={queueStore.open ? "text-primary" : ""}
-                    onclick={() => queueStore.toggle()}
+            {#if player.manualLength > 0}
+                <!-- The queue is the thing worth a badge; the context position
+                     is not, and would read as a total. -->
+                <span
+                    class="bg-primary text-primary-foreground min-w-4 rounded-full px-1 text-center text-[10px] leading-4 font-medium tabular-nums"
                 >
-                    <ListMusicIcon />
-                </Button>
-
-                {#if player.manualLength > 0}
-                    <!-- The queue is the thing worth a badge; the context
-                         position is not, and would read as a total. -->
-                    <span
-                        class="bg-primary text-primary-foreground rounded-full px-1.5 text-[10px] tabular-nums"
-                    >
-                        {player.manualLength}
-                    </span>
-                {:else if player.contextLength > 0}
-                    <span
-                        class="text-muted-foreground w-12 text-right text-xs tabular-nums"
-                    >
-                        {player.contextPosition + 1}/{player.contextLength}
-                    </span>
-                {/if}
-            </div>
+                    {player.manualLength}
+                </span>
+            {:else if player.contextLength > 0}
+                <span
+                    class="text-muted-foreground w-12 text-right text-[11px] tabular-nums"
+                >
+                    {player.contextPosition + 1}/{player.contextLength}
+                </span>
+            {/if}
         </div>
     </div>
-</div>
+</footer>

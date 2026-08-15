@@ -1,0 +1,20 @@
+/**
+ * Which view is on screen.
+ *
+ * Deliberately a store rather than SvelteKit routes. Every view here owns
+ * expensive, long-lived state -- a page of search results, an open playlist, a
+ * scroll position -- and routing would either throw that away on each
+ * navigation or force every store to re-fetch to rebuild it. Nothing in this
+ * app is linkable or back-buttonable, so routing would buy nothing in return.
+ */
+export type View = "library" | "search" | "playlists" | "history" | "settings";
+
+class NavStore {
+  view = $state<View>("library");
+
+  go(view: View) {
+    this.view = view;
+  }
+}
+
+export const nav = new NavStore();
