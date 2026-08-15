@@ -21,6 +21,8 @@ export type PlayerStatus = {
   contextLength: number;
   contextPosition: number;
   manualLength: number;
+  /** The stream has run dry without ending: the connection is not keeping up. */
+  stalled: boolean;
 };
 
 export type PlayerProgress = {
@@ -49,6 +51,7 @@ class PlayerStore {
   contextLength = $state(0);
   contextPosition = $state(0);
   manualLength = $state(0);
+  stalled = $state(false);
 
   /** Authoritative position from the backend, in seconds. */
   positionSecs = $state(0);
@@ -88,6 +91,7 @@ class PlayerStore {
       this.contextLength = s.contextLength;
       this.contextPosition = s.contextPosition;
       this.manualLength = s.manualLength;
+      this.stalled = s.stalled;
 
       // Only when nothing is shown at all. A stopped state with a track
       // still in the bar is where the user left off -- including the one

@@ -41,6 +41,23 @@
         </Button>
     </div>
 
+    <label class="flex items-start gap-2 text-xs">
+        <input
+            type="checkbox"
+            class="mt-0.5"
+            checked={cacheStore.keepAbandoned}
+            onchange={(e) =>
+                cacheStore.setKeepAbandoned(e.currentTarget.checked)}
+        />
+        <span class="text-muted-foreground">
+            Keep songs you leave part-way through
+            <span class="opacity-70">
+                — uses extra data. Songs you play to the end are kept either
+                way, at no cost.
+            </span>
+        </span>
+    </label>
+
     <div class="bg-muted h-1.5 overflow-hidden rounded-full">
         <div
             class="bg-primary h-full rounded-full transition-[width]"

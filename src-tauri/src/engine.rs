@@ -1,7 +1,8 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rodio::stream::DeviceSinkBuilder;
@@ -11,6 +12,13 @@ use tokio::sync::oneshot;
 
 use crate::playable::PlayableSource;
 use crate::transcode::{FfmpegInput, FfmpegSource};
+
+/// How long a decoder must be starved before it is reported as stalled.
+///
+/// Long enough to ride out the ordinary hiccup the buffer exists to absorb --
+/// reporting every momentary underrun would make the UI flicker for something
+/// nobody hears.
+const STALL_REPORT_AFTER: Duration = Duration::from_secs(1);
 
 /// How often the thread wakes to notice a track finished on its own, and so
 /// the upper bound on how late `Finished` can be.
@@ -59,6 +67,11 @@ pub enum EngineEvent {
     /// while actually playing -- never while paused or stopped, so the UI
     /// stops updating on its own without needing to be told.
     Progress { epoch: u64, position: Duration },
+    /// The decoder has run dry without ending, or has recovered.
+    ///
+    /// Repeated roughly once a second while it lasts, so the coordinator can
+    /// time it without running a clock of its own.
+    Stalled { epoch: u64, stalled: bool },
 }
 
 enum Command {
@@ -71,7 +84,7 @@ enum Command {
         /// thread while a track is playing. When the coordinator has prepared
         /// the next track ahead of time it arrives here ready to append, which
         /// is what makes the handover between tracks quick.
-        decoded: Option<Box<dyn Source + Send>>,
+        decoded: Option<BuiltSource>,
         /// Where in the track to begin.
         ///
         /// Carried into the decode rather than applied as a seek afterwards:
@@ -132,7 +145,7 @@ impl AudioEngine {
     pub async fn play(
         &self,
         source: PlayableSource,
-        decoded: Option<Box<dyn Source + Send>>,
+        decoded: Option<BuiltSource>,
         start_at: Duration,
         epoch: u64,
     ) -> Result<(), String> {
@@ -241,6 +254,10 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
     // track they skipped.
     let mut highest_epoch: u64 = 0;
     let mut ticks: u32 = 0;
+    // When the current decoder began starving, and whether that has been
+    // reported yet.
+    let mut starving_since: Option<std::time::Instant> = None;
+    let mut reported_stall = false;
 
     loop {
         match rx.recv_timeout(POLL_INTERVAL) {
@@ -260,13 +277,19 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                 }
                 highest_epoch = new_epoch;
 
+                let mut starved = None;
                 let result = match &device {
                     Ok(sink) => match decoded {
                         // Prepared ahead of time: nothing left to do but hand
                         // it to the mixer.
-                        Some(ready) => Ok(start(sink, ready, volume)),
-                        None => build_source(&source, ffmpeg.as_deref(), start_at)
-                            .map(|built| start(sink, built, volume)),
+                        Some(ready) => {
+                            starved = ready.starved;
+                            Ok(start(sink, ready.decoded, volume))
+                        }
+                        None => build_source(&source, ffmpeg.as_deref(), start_at).map(|built| {
+                            starved = built.starved;
+                            start(sink, built.decoded, volume)
+                        }),
                     },
                     Err(e) => Err(e.clone()),
                 };
@@ -280,6 +303,7 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                         epoch = Some(new_epoch);
                         loaded = Some(Loaded {
                             source,
+                            starved,
                             // The decode began here, so this is what the
                             // player's own position has to be added to.
                             offset: start_at,
@@ -347,7 +371,41 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                         let _ = events.send(EngineEvent::Finished { epoch: current });
                     } else if !p.is_paused() {
                         ticks = ticks.wrapping_add(1);
-                        if ticks % PROGRESS_EVERY == 0 {
+
+                        let starving = loaded
+                            .as_ref()
+                            .and_then(|l| l.starved.as_ref())
+                            .is_some_and(|flag| flag.load(Ordering::Relaxed));
+
+                        if starving {
+                            let since = *starving_since.get_or_insert_with(std::time::Instant::now);
+
+                            // Repeated while it lasts, so the coordinator can
+                            // decide when enough is enough without a clock.
+                            if since.elapsed() >= STALL_REPORT_AFTER
+                                && (!reported_stall || ticks % PROGRESS_EVERY == 0)
+                            {
+                                reported_stall = true;
+                                let _ = events.send(EngineEvent::Stalled {
+                                    epoch: current,
+                                    stalled: true,
+                                });
+                            }
+                        } else {
+                            if reported_stall {
+                                let _ = events.send(EngineEvent::Stalled {
+                                    epoch: current,
+                                    stalled: false,
+                                });
+                            }
+                            starving_since = None;
+                            reported_stall = false;
+                        }
+
+                        // Silence is not progress: leaving the bar moving
+                        // while nothing is arriving is exactly the lie this
+                        // whole path exists to stop telling.
+                        if ticks % PROGRESS_EVERY == 0 && !starving {
                             let _ = events.send(EngineEvent::Progress {
                                 epoch: current,
                                 position: position_of(&player, &loaded),
@@ -366,6 +424,8 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
 /// What the thread is currently playing, retained so a seek can rebuild it.
 struct Loaded {
     source: PlayableSource,
+    /// Set while this decoder is starving. `None` when it cannot.
+    starved: Option<Arc<AtomicBool>>,
     /// Where the current decode was started from.
     ///
     /// A restarted ffmpeg reports its own position from zero, so this is what
@@ -426,8 +486,13 @@ fn seek(
         p.pause();
     }
 
-    match build_source(&l.source, ffmpeg, position).map(|built| start(sink, built, volume)) {
-        Ok(replacement) => {
+    let rebuilt = build_source(&l.source, ffmpeg, position).map(|built| {
+        let starved = built.starved;
+        (start(sink, built.decoded, volume), starved)
+    });
+
+    match rebuilt {
+        Ok((replacement, starved)) => {
             // Seeking while paused must not start playback.
             if was_paused {
                 replacement.pause();
@@ -436,6 +501,7 @@ fn seek(
             // once -- the old one has been silent since the pause above.
             *player = Some(replacement);
             l.offset = position;
+            l.starved = starved;
             Ok(())
         }
         Err(e) => {
@@ -447,6 +513,19 @@ fn seek(
             Err(e)
         }
     }
+}
+
+/// A decoder, plus what the engine needs to know about it once it has been
+/// boxed into a trait object.
+///
+/// The boxing is what makes preparing a track ahead of time possible, but it
+/// also erases everything specific to the decoder -- including whether it can
+/// tell us it is starving. This carries that back out.
+pub struct BuiltSource {
+    pub decoded: Box<dyn Source + Send>,
+    /// `None` for a source that cannot meaningfully starve, such as a file
+    /// rodio decodes itself.
+    pub starved: Option<Arc<AtomicBool>>,
 }
 
 /// Connects a ready decoder to the output. Cheap -- no process, no waiting.
@@ -467,7 +546,7 @@ pub fn build_source(
     source: &PlayableSource,
     ffmpeg: Option<&Path>,
     start_at: Duration,
-) -> Result<Box<dyn Source + Send>, String> {
+) -> Result<BuiltSource, String> {
     match source {
         PlayableSource::LocalFile(path) => {
             // Native first, seeking it in place when a start was asked for: a
@@ -476,7 +555,12 @@ pub fn build_source(
             match native_decoder(path) {
                 Ok(mut decoder) => {
                     if start_at.is_zero() || decoder.try_seek(start_at).is_ok() {
-                        return Ok(Box::new(decoder));
+                        // A file rodio reads directly cannot starve on the
+                        // network, which is the only starvation worth naming.
+                        return Ok(BuiltSource {
+                            decoded: Box::new(decoder),
+                            starved: None,
+                        });
                     }
                     // Decoded but would not seek. ffmpeg can start anywhere.
                 }
@@ -492,12 +576,11 @@ pub fn build_source(
                 "This file needs ffmpeg to play, and ffmpeg was not found. \
                  See src-tauri/binaries/README.md.",
             )?;
-            Ok(Box::new(FfmpegSource::open_at(
-                ffmpeg,
-                FfmpegInput::File(path),
-                start_at,
-                None,
-            )?))
+            let source = FfmpegSource::open_at(ffmpeg, FfmpegInput::File(path), start_at, None)?;
+            Ok(BuiltSource {
+                starved: Some(source.starvation_flag()),
+                decoded: Box::new(source),
+            })
         }
 
         PlayableSource::Transcoded(path) => {
@@ -505,12 +588,11 @@ pub fn build_source(
                 "This file needs ffmpeg to play, and ffmpeg was not found. \
                  See src-tauri/binaries/README.md.",
             )?;
-            Ok(Box::new(FfmpegSource::open_at(
-                ffmpeg,
-                FfmpegInput::File(path),
-                start_at,
-                None,
-            )?))
+            let source = FfmpegSource::open_at(ffmpeg, FfmpegInput::File(path), start_at, None)?;
+            Ok(BuiltSource {
+                starved: Some(source.starvation_flag()),
+                decoded: Box::new(source),
+            })
         }
 
         PlayableSource::Stream { url, cache } => {
@@ -518,14 +600,18 @@ pub fn build_source(
                 "Streaming needs ffmpeg, and ffmpeg was not found. \
                  See src-tauri/binaries/README.md.",
             )?;
-            Ok(Box::new(FfmpegSource::open_at(
+            let source = FfmpegSource::open_at(
                 ffmpeg,
                 FfmpegInput::Url(url),
                 start_at,
                 // A seeked decode begins partway in, so what it would write is
                 // not the whole song. Only a fresh start can fill the cache.
                 if start_at.is_zero() { cache.clone() } else { None },
-            )?))
+            )?;
+            Ok(BuiltSource {
+                starved: Some(source.starvation_flag()),
+                decoded: Box::new(source),
+            })
         }
     }
 }
@@ -563,6 +649,7 @@ mod tests {
         f.write_all(&b).unwrap();
     }
 
+
     #[tokio::test]
     async fn progress_events_advance_while_a_track_plays() {
         let dir = std::env::temp_dir().join("music-app-engine-progress");
@@ -574,7 +661,9 @@ mod tests {
         // No ffmpeg needed: this test plays a plain WAV, which rodio decodes.
         let engine = spawn(tx, None);
 
-        let played = engine.play(PlayableSource::LocalFile(wav), None, Duration::ZERO, 1).await;
+        let played = engine
+            .play(PlayableSource::LocalFile(wav), None, Duration::ZERO, 1)
+            .await;
         if let Err(e) = &played {
             eprintln!("SKIP: {e}");
             return;

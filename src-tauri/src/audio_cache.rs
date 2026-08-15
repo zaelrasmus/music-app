@@ -178,6 +178,36 @@ impl AudioCache {
         })
     }
 
+    /// A place for a *separate* fetch to write this track.
+    ///
+    /// Its own temporary name, deliberately: the decode may already be
+    /// writing its own copy of the same track, and two producers sharing a
+    /// temp file would interleave into something that plays halfway and
+    /// stops. They share only the destination, and the rename onto it is
+    /// atomic -- whichever lands last wins, and both hold identical bytes.
+    ///
+    /// `None` when the track is already cached, since there would be nothing
+    /// to gain.
+    pub fn reserve_fetch(&self, source: &str, remote_id: &str) -> Option<PendingCache> {
+        if self.lookup(source, remote_id).is_some() {
+            return None;
+        }
+        std::fs::create_dir_all(&self.dir).ok()?;
+
+        let complete = self.dir.join(file_name(source, remote_id, EXTENSION));
+        let partial = self
+            .dir
+            .join(file_name(source, remote_id, &format!("dl.part.{EXTENSION}")));
+
+        let _ = std::fs::remove_file(&partial);
+        Some(PendingCache {
+            partial,
+            complete,
+            dir: self.dir.clone(),
+            max_bytes: Arc::clone(&self.max_bytes),
+        })
+    }
+
     pub fn used_bytes(&self) -> u64 {
         std::fs::read_dir(&self.dir)
             .into_iter()

@@ -33,6 +33,12 @@
     // is None for several formats.
     const totalSecs = $derived(nowPlaying?.durationSecs ?? 0);
     const loading = $derived(player.state === "loading");
+    /**
+     * Nothing is arriving. Deliberately not shown as an error: the buffer
+     * absorbs short drops, so by the time this appears it is worth saying, and
+     * it usually recovers on its own.
+     */
+    const stalled = $derived(player.stalled);
     // Nothing to seek within until audio is actually flowing.
     const seekable = $derived(
         totalSecs > 0 && player.state !== "stopped" && !loading,
@@ -97,7 +103,13 @@
                 {#if nowPlaying}
                     <span class="truncate font-medium">{nowPlaying.title}</span>
                     <span class="text-muted-foreground truncate text-xs">
-                        {loading ? "Loading…" : (nowPlaying.artist ?? "Unknown artist")}
+                        {#if stalled}
+                            Reconnecting…
+                        {:else if loading}
+                            Loading…
+                        {:else}
+                            {nowPlaying.artist ?? "Unknown artist"}
+                        {/if}
                     </span>
                 {:else}
                     <span class="text-muted-foreground">Nothing playing</span>

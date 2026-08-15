@@ -145,6 +145,53 @@ pub async fn download_track(
     Ok(())
 }
 
+/// Fetches a complete copy of a track into the cache.
+///
+/// Separate from [`download_track`] in intent rather than mechanism: a
+/// download is a permanent choice the user made and appears in the library as
+/// "offline", whereas this is disposable and invisible, subject to the cache's
+/// size cap like anything else in it.
+///
+/// Used only when the free path -- the copy the decoder writes as it plays --
+/// cannot produce a valid file: the listen was abandoned, or a seek meant the
+/// decode never covered the whole track.
+///
+/// Everything about it is best effort. Failure leaves the track exactly as
+/// uncached as it already was.
+pub async fn fetch_into_cache(
+    yt_dlp: &Path,
+    ffmpeg: &Path,
+    page_url: &str,
+    pending: crate::audio_cache::PendingCache,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+
+    for attempt in 1..=FETCH_ATTEMPTS {
+        // A fresh URL each time: the signed links are short-lived enough that
+        // retrying the same one just fails again.
+        let (url, _extension) = resolve_format(yt_dlp.to_path_buf(), page_url).await?;
+
+        match copy_stream(ffmpeg.to_path_buf(), &url, &pending.partial).await {
+            Ok(()) => {
+                pending.commit();
+                return Ok(());
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&pending.partial);
+
+                if !crate::transcode::is_transient(&e) || attempt == FETCH_ATTEMPTS {
+                    return Err(e);
+                }
+
+                last_error = e;
+                tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
+            }
+        }
+    }
+
+    Err(last_error)
+}
+
 /// How many times to re-resolve and refetch before giving up.
 ///
 /// YouTube rejects a large minority of these fetches outright, and a fresh URL

@@ -1174,3 +1174,169 @@ async fn a_position_at_the_end_of_a_track_is_not_restored() {
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Leaving a track part-way through fetches a complete copy of it.
+///
+/// The negative cases matter more than the positive one: this spends the
+/// user's bandwidth, so it must fire only when the free path has genuinely
+/// failed and the listen was long enough to mean something.
+#[tokio::test]
+async fn a_track_left_part_way_through_is_fetched_for_offline() {
+    let _network = NETWORK.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-keep-abandoned");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let cache_dir = base.join("cache");
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    // A 19-second clip, so "half of it" arrives quickly and the duration cap
+    // is comfortably clear.
+    let stream: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks (source, title, state, remote_id, remote_url, duration_secs) \
+         VALUES ('youtube', 'Me at the zoo', 'saved', 'jNQXAC9IVRw', \
+                 'https://www.youtube.com/watch?v=jNQXAC9IVRw', 19) RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        Some(std::path::PathBuf::from("ffmpeg")),
+        Some(std::path::PathBuf::from("yt-dlp")),
+        Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
+    );
+
+    handle
+        .send(PlayerCommand::SetKeepAbandoned(true))
+        .unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![stream],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Play past halfway, then walk away.
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        if recorder.0.errors.lock().unwrap().iter().any(|e| {
+            e.contains("No audio output device")
+                || e.contains("internet connection")
+                || e.contains("Could not find yt-dlp")
+                || e.contains("Could not start")
+                || e.contains("YouTube refused")
+        }) {
+            eprintln!("SKIP: upstream/environment condition");
+            return;
+        }
+        if recorder.0.progress.lock().unwrap().iter().any(|p| *p > 11.0) {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            eprintln!("SKIP: never reached the halfway mark");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    handle.send(PlayerCommand::Stop).unwrap();
+
+    // The fetch is a fresh resolve plus a download of the whole clip.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut cached = false;
+    while std::time::Instant::now() < deadline {
+        cached = std::fs::read_dir(&cache_dir)
+            .map(|d| {
+                d.flatten()
+                    .any(|e| e.file_name().to_string_lossy().ends_with("jNQXAC9IVRw.mka"))
+            })
+            .unwrap_or(false);
+        if cached {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    let leftovers: Vec<_> = std::fs::read_dir(&cache_dir)
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    eprintln!("cache contents: {leftovers:?}");
+
+    assert!(cached, "an abandoned track was not fetched for offline use");
+    assert!(
+        !leftovers
+            .iter()
+            .any(|n| n.to_string_lossy().contains(".part.")),
+        "a partial file was left behind: {leftovers:?}"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The guards, which are what keep this from spending data it should not.
+///
+/// Each of these would otherwise trigger a full download of a track the user
+/// showed no real interest in, or that cannot benefit.
+#[tokio::test]
+async fn the_offline_copy_guards_hold() {
+    let base = std::env::temp_dir().join("music-app-keep-guards");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let cache_dir = base.join("cache");
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    let wav = base.join("tone.wav");
+    write_wav_secs(&wav, 60);
+
+    // A local track: nothing to fetch, whatever else is true.
+    let local: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+         VALUES ('local', 'Tone', ?, 'present', 60) RETURNING id",
+    )
+    .bind(wav.to_str().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        None,
+        None,
+        Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
+    );
+
+    handle.send(PlayerCommand::SetKeepAbandoned(true)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![local],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    handle.send(PlayerCommand::Stop).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let entries: Vec<_> = std::fs::read_dir(&cache_dir)
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+
+    assert!(
+        entries.is_empty(),
+        "a local track needs no offline copy, but something was written: {entries:?}"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -31,6 +31,14 @@ export function formatBytes(bytes: number) {
  * would mean taking on a dependency for a number people can just be shown.
  */
 class CacheStore {
+  /**
+   * Whether to fetch a complete copy of tracks left part-way through.
+   *
+   * Off by default: it spends data the user cannot see being spent. The free
+   * path -- the copy written while a track plays to its end -- happens either
+   * way, so turning this off does not mean nothing is kept.
+   */
+  keepAbandoned = $state(false);
   usedBytes = $state(0);
   limitBytes = $state(1024 * MB);
   busy = $state(false);
@@ -55,6 +63,16 @@ class CacheStore {
     await this.run("audio_cache_stats");
   }
 
+  async setKeepAbandoned(enabled: boolean) {
+    this.keepAbandoned = enabled;
+    try {
+      await invoke("set_keep_abandoned", { enabled });
+      await writeSetting("keepAbandoned", enabled);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
   /**
    * Pushes the saved limit to the backend, then reads back what it accepted.
    *
@@ -64,6 +82,13 @@ class CacheStore {
   async restore() {
     const saved = await readSetting("audioCacheLimitBytes", 1024 * MB);
     await this.run("set_audio_cache_limit", { limitBytes: saved });
+
+    this.keepAbandoned = await readSetting("keepAbandoned", false);
+    try {
+      await invoke("set_keep_abandoned", { enabled: this.keepAbandoned });
+    } catch (e) {
+      toast.error(String(e));
+    }
   }
 
   async setLimit(limitBytes: number) {

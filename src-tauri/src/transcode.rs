@@ -52,6 +52,15 @@ pub struct FfmpegSource {
     consumer: Consumer<Sample>,
     /// Set by the reader thread once ffmpeg's output ends.
     finished: Arc<AtomicBool>,
+    /// Set while the buffer has run dry but the source has *not* ended --
+    /// which for a network stream means the connection has stopped keeping
+    /// up.
+    ///
+    /// Distinct from `finished` on purpose: silence because nothing is
+    /// arriving and silence because the song is over need completely
+    /// different responses, and they are indistinguishable from the samples
+    /// alone.
+    starved: Arc<AtomicBool>,
     child: Child,
     /// A cache copy being written alongside playback, committed on `Drop`
     /// only if ffmpeg got all the way to the end.
@@ -153,6 +162,7 @@ impl FfmpegSource {
 
         let (producer, consumer) = RingBuffer::<Sample>::new(input.buffer_samples());
         let finished = Arc::new(AtomicBool::new(false));
+        let starved = Arc::new(AtomicBool::new(false));
 
         spawn_reader(stdout, producer, finished.clone());
         let errors = stderr.map(spawn_stderr_drain);
@@ -160,6 +170,7 @@ impl FfmpegSource {
         let source = Self {
             consumer,
             finished,
+            starved,
             child,
             pending_cache: cache,
         };
@@ -178,6 +189,14 @@ impl FfmpegSource {
         }
 
         Ok(source)
+    }
+
+    /// Whether the decoder is currently starved of input.
+    ///
+    /// Handed to the engine so it can tell a stalled connection from a track
+    /// that simply ended, without reaching into the source rodio owns.
+    pub fn starvation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.starved)
     }
 
     fn wait_for_prefill(&self) -> Result<(), String> {
@@ -286,11 +305,23 @@ impl Iterator for FfmpegSource {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match self.consumer.pop() {
-            Ok(sample) => Some(sample),
+            Ok(sample) => {
+                // A relaxed load per sample is a plain memory read; the store
+                // only happens on the edge out of starvation.
+                if self.starved.load(Ordering::Relaxed) {
+                    self.starved.store(false, Ordering::Relaxed);
+                }
+                Some(sample)
+            }
             Err(_) if self.finished.load(Ordering::Acquire) => None,
             // Underrun: ffmpeg has not kept up. A moment of silence beats
-            // ending the track, which is what returning None would do.
-            Err(_) => Some(0.0),
+            // ending the track, which is what returning None would do -- but
+            // the engine is told, so a long one can be reported as what it is
+            // rather than played as silence forever.
+            Err(_) => {
+                self.starved.store(true, Ordering::Relaxed);
+                Some(0.0)
+            }
         }
     }
 }

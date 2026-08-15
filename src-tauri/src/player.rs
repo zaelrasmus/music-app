@@ -23,6 +23,29 @@ pub const PLAYER_QUEUE_EVENT: &str = "player-queue";
 /// restarts the current one. Matches what every other player does.
 const RESTART_THRESHOLD: Duration = Duration::from_secs(3);
 
+/// How much of a track must have played before an abandoned listen is worth
+/// fetching a complete copy of.
+///
+/// Half is already a strong signal, and there is no over-triggering to guard
+/// against: this is only ever evaluated at the moment a track is *left*, so a
+/// listen that runs to the end never reaches it -- the decoder's own copy has
+/// already been committed for free.
+const OFFLINE_COPY_AFTER: f64 = 0.5;
+
+/// Longest track worth fetching a second time.
+///
+/// The cost here is the *whole* track, not the remainder, so the guard is on
+/// total length. An hour-long upload someone sampled is not worth fifty
+/// megabytes of background traffic.
+const OFFLINE_COPY_MAX_SECS: f64 = 20.0 * 60.0;
+
+/// How long a stall may last before playback is abandoned.
+///
+/// Generous, because the buffer already absorbs anything short and a wifi
+/// handover can take a while -- but bounded, because silence forever is not a
+/// state anyone should have to sit in.
+const STALL_GIVE_UP: Duration = Duration::from_secs(30);
+
 /// How many upcoming context tracks the preview carries.
 ///
 /// Capped because the context is often the whole library: shipping thousands
@@ -79,6 +102,10 @@ pub struct PlayerStatus {
     /// Enough for a badge on the queue button without subscribing to the
     /// heavier queue event.
     pub manual_length: usize,
+    /// The stream has run dry without ending -- the connection has stopped
+    /// keeping up. Distinct from loading, which is a track that has not
+    /// started yet.
+    pub stalled: bool,
 }
 
 /// Sent frequently while playing, so it is deliberately small and separate
@@ -160,6 +187,7 @@ pub enum PlayerCommand {
     SetMuted(bool),
     SetRepeat(RepeatMode),
     SetShuffle(bool),
+    SetKeepAbandoned(bool),
     Seek(f64),
 }
 
@@ -268,6 +296,18 @@ struct Coordinator<E: PlayerEvents> {
     prepared: Option<Prepared>,
     /// Where prepare tasks deliver.
     prepares: UnboundedSender<Prepared>,
+    /// Whether to fetch a complete copy of tracks abandoned part-way.
+    ///
+    /// Off unless asked for: it spends data the user cannot see being spent.
+    keep_abandoned: bool,
+    /// How far the current track has played, for judging that.
+    last_position: Duration,
+    /// Tracks already being fetched, so leaving the same one twice does not
+    /// start two downloads of it.
+    fetching: Arc<Mutex<std::collections::HashSet<i64>>>,
+    /// Whether the current decoder is starving, and since when.
+    stalled: bool,
+    stalled_since: Option<std::time::Instant>,
     /// Where to begin the next load, when the track is being resumed.
     ///
     /// Applied by the load rather than as a seek afterwards, so a stream does
@@ -309,6 +349,11 @@ pub fn spawn<E: PlayerEvents>(
             ffmpeg,
             prepared: None,
             prepares: prepares_tx,
+            keep_abandoned: false,
+            last_position: Duration::ZERO,
+            fetching: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            stalled: false,
+            stalled_since: None,
             resume_at: None,
             events,
         }
@@ -361,6 +406,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // Deliberately does not clear the manual queue: tracks the
                 // user interposed are a separate intention from "play this
                 // playlist".
+                self.consider_offline_copy();
                 let target = self.queue.set_context(track_ids, start_index, context_name);
                 self.start(target);
             }
@@ -414,6 +460,7 @@ impl<E: PlayerEvents> Coordinator<E> {
             },
 
             PlayerCommand::Next => {
+                self.consider_offline_copy();
                 // The same call the natural end uses, so pressing Next and
                 // letting a track run out cannot disagree about what is next.
                 match self.queue.on_next() {
@@ -437,7 +484,10 @@ impl<E: PlayerEvents> Coordinator<E> {
                 self.rewind_or_start(target).await;
             }
 
-            PlayerCommand::Stop => self.halt(),
+            PlayerCommand::Stop => {
+                self.consider_offline_copy();
+                self.halt();
+            }
 
             PlayerCommand::SetVolume(volume) => {
                 self.volume = volume.clamp(0.0, 1.0);
@@ -457,6 +507,8 @@ impl<E: PlayerEvents> Coordinator<E> {
             // Both change the preview, so both re-emit the queue.
             PlayerCommand::SetRepeat(mode) => self.queue.set_repeat(mode),
             PlayerCommand::SetShuffle(on) => self.queue.set_shuffle(on),
+
+            PlayerCommand::SetKeepAbandoned(enabled) => self.keep_abandoned = enabled,
 
             PlayerCommand::Seek(seconds) => {
                 if self.state != PlaybackState::Stopped {
@@ -520,13 +572,56 @@ impl<E: PlayerEvents> Coordinator<E> {
                 self.prefetch_next();
             }
 
+            EngineEvent::Stalled { epoch, stalled } => {
+                if epoch == self.epoch {
+                    self.handle_stall(stalled);
+                }
+            }
+
             EngineEvent::Progress { epoch, position } => {
                 // Progress deliberately does not emit full state: at five ticks
                 // a second that would churn the whole UI.
                 if epoch == self.epoch {
+                    self.last_position = position;
                     self.emit_progress(position);
                 }
             }
+        }
+    }
+
+    /// The decoder has run dry, or recovered.
+    ///
+    /// Playing silence with the bar still moving is the worst of both: it
+    /// looks like the track is fine and it sounds like nothing. So a stall is
+    /// shown for what it is, and one that goes on long enough stops rather
+    /// than advancing -- skipping to the next track while offline just fails
+    /// three more times and reports something unrelated.
+    fn handle_stall(&mut self, stalled: bool) {
+        if !stalled {
+            self.stalled_since = None;
+            if self.stalled {
+                self.stalled = false;
+                self.emit_state();
+            }
+            return;
+        }
+
+        let since = *self.stalled_since.get_or_insert_with(std::time::Instant::now);
+
+        if !self.stalled {
+            self.stalled = true;
+            self.emit_state();
+        }
+
+        if since.elapsed() >= STALL_GIVE_UP {
+            self.stalled = false;
+            self.stalled_since = None;
+            self.halt();
+            self.emit_state();
+            self.events.error(
+                "Lost connection to the stream. Check your internet and try again."
+                    .to_string(),
+            );
         }
     }
 
@@ -676,6 +771,8 @@ impl<E: PlayerEvents> Coordinator<E> {
             Ok(()) => {
                 self.loaded = Some(outcome.track_id);
                 self.state = PlaybackState::Playing;
+                self.stalled = false;
+                self.stalled_since = None;
                 self.apply_volume();
                 // Set the bar immediately; the first tick is up to a poll
                 // interval away, and for a resume starting from zero would
@@ -825,6 +922,101 @@ impl<E: PlayerEvents> Coordinator<E> {
         self.emit_progress(Duration::from_secs_f64(position));
     }
 
+    /// A track is being left part-way through. Decide whether to keep it.
+    ///
+    /// Only ever called when the user abandons a track, never on a natural
+    /// end -- which is the whole reason it wastes nothing. A listen that runs
+    /// to completion has already produced a cache entry for free, as a second
+    /// output of the decode; this exists for the listens that cannot, because
+    /// they were cut short or because a seek meant the decode never covered
+    /// the track from its start.
+    fn consider_offline_copy(&mut self) {
+        if !self.keep_abandoned {
+            return;
+        }
+
+        let Some(track_id) = self.loaded else {
+            return;
+        };
+        let position = self.last_position.as_secs_f64();
+
+        // Reset now: whatever happens next belongs to a different track.
+        self.last_position = Duration::ZERO;
+
+        let (Some(yt_dlp), Some(ffmpeg), Some(cache)) = (
+            self.yt_dlp.clone(),
+            self.ffmpeg.clone(),
+            self.audio_cache.clone(),
+        ) else {
+            return;
+        };
+
+        let pool = self.pool.clone();
+        let fetching = Arc::clone(&self.fetching);
+
+        tauri::async_runtime::spawn(async move {
+            let Ok(Some(row)) = sqlx::query(
+                "SELECT source, state, remote_id, remote_url, duration_secs \
+                 FROM tracks WHERE id = ?",
+            )
+            .bind(track_id)
+            .fetch_optional(&pool)
+            .await
+            else {
+                return;
+            };
+
+            let source: String = row.get("source");
+            let state: String = row.get("state");
+            // Local files need nothing, and a downloaded track already has a
+            // permanent copy the user asked for.
+            if Provider::from_source(&source).is_none() || state != "saved" {
+                return;
+            }
+
+            // No duration means a live stream, which has no "whole track" to
+            // fetch.
+            let Some(duration) = row.get::<Option<i64>, _>("duration_secs") else {
+                return;
+            };
+            let duration = duration as f64;
+            if duration <= 0.0 || duration > OFFLINE_COPY_MAX_SECS {
+                return;
+            }
+            if position < duration * OFFLINE_COPY_AFTER {
+                return;
+            }
+
+            let (Some(remote_id), Some(remote_url)) = (
+                row.get::<Option<String>, _>("remote_id"),
+                row.get::<Option<String>, _>("remote_url"),
+            ) else {
+                return;
+            };
+
+            // Already cached, or already being fetched.
+            let Some(pending) = cache.reserve_fetch(&source, &remote_id) else {
+                return;
+            };
+            {
+                let Ok(mut active) = fetching.lock() else {
+                    return;
+                };
+                if !active.insert(track_id) {
+                    return;
+                }
+            }
+
+            // Silent either way: the user did not ask for this and must not be
+            // told off for it failing.
+            let _ = crate::download::fetch_into_cache(&yt_dlp, &ffmpeg, &remote_url, pending).await;
+
+            if let Ok(mut active) = fetching.lock() {
+                active.remove(&track_id);
+            }
+        });
+    }
+
     /// Starts decoding the next track before it is needed.
     ///
     /// The remaining gap between tracks was ffmpeg's own start -- spawning the
@@ -873,6 +1065,8 @@ impl<E: PlayerEvents> Coordinator<E> {
     }
 
     fn halt(&mut self) {
+        self.stalled = false;
+        self.stalled_since = None;
         // Bump the epoch so any in-flight `Finished` for the stopped track is
         // discarded rather than triggering an advance.
         self.epoch += 1;
@@ -915,6 +1109,7 @@ impl<E: PlayerEvents> Coordinator<E> {
             context_length: self.queue.context_len(),
             context_position: self.queue.context_position(),
             manual_length: self.queue.manual_len(),
+            stalled: self.stalled,
         });
     }
 
@@ -1015,7 +1210,7 @@ const MAX_LOAD_ATTEMPTS: usize = 3;
 pub struct Prepared {
     track_id: i64,
     source: PlayableSource,
-    decoded: Box<dyn rodio::Source + Send>,
+    decoded: engine::BuiltSource,
 }
 
 impl std::fmt::Debug for Prepared {
@@ -1268,6 +1463,19 @@ pub async fn clear_queue(player: State<'_, PlayerHandle>) -> Result<(), String> 
 #[tauri::command]
 pub async fn request_queue_state(player: State<'_, PlayerHandle>) -> Result<(), String> {
     player.send(PlayerCommand::RequestQueueState)
+}
+
+/// Whether to keep a complete copy of tracks abandoned part-way through.
+///
+/// A data-usage decision, so it belongs to the user rather than to us. The
+/// free path -- the copy written while a track plays to its end -- is
+/// unaffected either way.
+#[tauri::command]
+pub async fn set_keep_abandoned(
+    enabled: bool,
+    player: State<'_, PlayerHandle>,
+) -> Result<(), String> {
+    player.send(PlayerCommand::SetKeepAbandoned(enabled))
 }
 
 /// Puts the last session's track back in the bar, at its position.
