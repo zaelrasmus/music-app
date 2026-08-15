@@ -89,7 +89,11 @@ class PlayerStore {
       this.contextPosition = s.contextPosition;
       this.manualLength = s.manualLength;
 
-      if (s.state === "stopped") this.positionSecs = 0;
+      // Only when nothing is shown at all. A stopped state with a track
+      // still in the bar is where the user left off -- including the one
+      // restored at startup, which would otherwise be wiped the moment it
+      // arrived.
+      if (s.state === "stopped" && s.trackId === null) this.positionSecs = 0;
     });
 
     const unlistenProgress = await listen<PlayerProgress>(
@@ -100,6 +104,7 @@ class PlayerStore {
         if (this.scrubbing) return;
         if (e.payload.trackId !== this.trackId) return;
         this.positionSecs = e.payload.positionSecs;
+        this.rememberPosition();
       },
     );
 
@@ -114,6 +119,49 @@ class PlayerStore {
       unlistenProgress();
       unlistenError();
     };
+  }
+
+  /**
+   * How often the resume point is written.
+   *
+   * Ticks arrive several times a second; persisting each one would be a
+   * write per tick for a value nobody reads until the next launch. Losing at
+   * most a few seconds of position is imperceptible.
+   */
+  #lastSaved = 0;
+
+  private rememberPosition() {
+    if (this.trackId === null || this.positionSecs <= 0) return;
+
+    const now = Date.now();
+    if (now - this.#lastSaved < 5000) return;
+    this.#lastSaved = now;
+
+    void writeSetting("resume", {
+      trackId: this.trackId,
+      positionSecs: this.positionSecs,
+    });
+  }
+
+  /**
+   * Puts the last session's track back in the bar, where it was left.
+   *
+   * Nothing is fetched: the backend holds the position and applies it to the
+   * load only if the user actually presses play. Resolving a stream here
+   * would cost seconds before the window was even usable.
+   */
+  async restorePlayback() {
+    const saved = await readSetting<{
+      trackId: number;
+      positionSecs: number;
+    } | null>("resume", null);
+
+    if (!saved) return;
+
+    await this.run("restore_playback", {
+      trackId: saved.trackId,
+      positionSecs: saved.positionSecs,
+    });
   }
 
   /** Restores persisted preferences and pushes them to the backend. */

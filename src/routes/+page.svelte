@@ -26,7 +26,7 @@
         libraryView.refresh();
         providerSearch.loadProviders();
         cacheStore.restore();
-        player.restorePreferences();
+        player.restorePreferences().then(() => player.restorePlayback());
 
         const scans = trackStore.listenForScans();
         const playback = player.listenForPlayer();

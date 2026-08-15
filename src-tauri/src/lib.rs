@@ -120,6 +120,7 @@ pub fn run() {
             player::reorder_queue,
             player::clear_queue,
             player::request_queue_state,
+            player::restore_playback,
             player::toggle_play_pause,
             player::next_track,
             player::previous_track,

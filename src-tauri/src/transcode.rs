@@ -83,11 +83,6 @@ impl FfmpegInput<'_> {
 }
 
 impl FfmpegSource {
-    /// Starts ffmpeg on `input` and waits for enough audio to begin smoothly.
-    pub fn open(ffmpeg: &Path, input: FfmpegInput<'_>) -> Result<Self, String> {
-        Self::open_at(ffmpeg, input, Duration::ZERO, None)
-    }
-
     /// Same, but beginning `start` into the audio.
     ///
     /// This is how seeking works for anything ffmpeg decodes. rodio drives

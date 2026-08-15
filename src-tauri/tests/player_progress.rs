@@ -1030,3 +1030,147 @@ async fn commands_are_answered_while_a_track_is_loading() {
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Restoring the last session's track, and resuming it.
+///
+/// Two things matter and neither is visible from the command API alone.
+/// Restoring must not *load* anything -- resolving a stream at startup would
+/// cost seconds before the window is usable -- and pressing play afterwards
+/// must begin at the saved position rather than at the beginning.
+#[tokio::test]
+async fn a_restored_track_waits_in_the_bar_then_resumes_where_it_was() {
+    const RESUME_AT: f64 = 90.0;
+
+    let base = std::env::temp_dir().join("music-app-resume");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    // Long enough that a resume position is well inside it.
+    let wav = base.join("tone.wav");
+    write_wav_secs(&wav, 180);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    let track_id: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+         VALUES ('local', 'Tone', ?, 'present', 180) RETURNING id",
+    )
+    .bind(wav.to_str().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+
+    handle
+        .send(PlayerCommand::Restore {
+            track_id,
+            position_secs: RESUME_AT,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // The track is in the bar, at its position, and nothing is playing.
+    let latest = recorder
+        .0
+        .states
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("restore emits a state");
+
+    assert_eq!(latest.track_id, Some(track_id), "the track should be shown");
+    assert_eq!(
+        latest.state,
+        music_app_lib::player::PlaybackState::Stopped,
+        "restoring must not start playback"
+    );
+    assert!(
+        recorder
+            .0
+            .progress
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| (*p - RESUME_AT).abs() < 1.0),
+        "the bar should show the saved position"
+    );
+    assert!(
+        recorder.0.errors.lock().unwrap().is_empty(),
+        "restoring should touch nothing that can fail"
+    );
+
+    // Now press play: it must pick up where it left off.
+    recorder.0.progress.lock().unwrap().clear();
+    handle.send(PlayerCommand::TogglePlayPause).unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    if recorder
+        .0
+        .errors
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.contains("No audio output device"))
+    {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    let after = recorder.0.progress.lock().unwrap().clone();
+    eprintln!("positions after resume: {after:?}");
+
+    assert!(
+        after.iter().any(|p| *p >= RESUME_AT),
+        "playback restarted from the beginning instead of resuming (got {after:?})"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A position at the very end is not worth resuming: it would play a moment of
+/// silence and skip on.
+#[tokio::test]
+async fn a_position_at_the_end_of_a_track_is_not_restored() {
+    let base = std::env::temp_dir().join("music-app-resume-end");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let wav = base.join("tone.wav");
+    write_wav_secs(&wav, 60);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    let track_id: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+         VALUES ('local', 'Tone', ?, 'present', 60) RETURNING id",
+    )
+    .bind(wav.to_str().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+
+    // Two seconds from the end.
+    handle
+        .send(PlayerCommand::Restore {
+            track_id,
+            position_secs: 58.0,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let progress = recorder.0.progress.lock().unwrap().clone();
+    assert!(
+        progress.iter().all(|p| *p < 1.0),
+        "a position at the end should reset to the start (got {progress:?})"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}

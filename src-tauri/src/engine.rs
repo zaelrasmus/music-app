@@ -5,16 +5,27 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use rodio::stream::DeviceSinkBuilder;
-use rodio::{Decoder, Player};
+use rodio::{Decoder, Player, Source};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 use crate::playable::PlayableSource;
 use crate::transcode::{FfmpegInput, FfmpegSource};
 
-/// How often the thread wakes to notice a track finished on its own. Also the
-/// upper bound on how late `Finished` can be.
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// How often the thread wakes to notice a track finished on its own, and so
+/// the upper bound on how late `Finished` can be.
+///
+/// Short, because with the next track prepared in advance this *is* the gap
+/// between tracks -- everything else in the handover is already done by the
+/// time the first one ends.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Progress is reported every this many polls.
+///
+/// Decoupled from the poll rate on purpose: noticing the end quickly is worth
+/// waking often, but telling the UI twenty times a second would re-render it
+/// for movement no one can see.
+const PROGRESS_EVERY: u32 = 4;
 
 /// Ceiling on how long a caller waits for the thread to answer.
 ///
@@ -53,6 +64,20 @@ pub enum EngineEvent {
 enum Command {
     Play {
         source: PlayableSource,
+        /// A decoder already built and buffering.
+        ///
+        /// Building one spawns ffmpeg and waits for it to produce half a
+        /// second of audio -- seconds of work that must not happen on this
+        /// thread while a track is playing. When the coordinator has prepared
+        /// the next track ahead of time it arrives here ready to append, which
+        /// is what makes the handover between tracks quick.
+        decoded: Option<Box<dyn Source + Send>>,
+        /// Where in the track to begin.
+        ///
+        /// Carried into the decode rather than applied as a seek afterwards:
+        /// for a stream, seeking means restarting ffmpeg, so resuming at a
+        /// position would otherwise start the process twice.
+        start_at: Duration,
         /// Echoed back in `Finished`, so the coordinator can discard a report
         /// about a track it has already moved on from.
         ///
@@ -104,10 +129,18 @@ impl AudioEngine {
     /// Async rather than blocking: opening a stream legitimately takes
     /// seconds, and a blocking wait here would park a runtime worker for the
     /// whole of it.
-    pub async fn play(&self, source: PlayableSource, epoch: u64) -> Result<(), String> {
+    pub async fn play(
+        &self,
+        source: PlayableSource,
+        decoded: Option<Box<dyn Source + Send>>,
+        start_at: Duration,
+        epoch: u64,
+    ) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
         self.send(Command::Play {
             source,
+            decoded,
+            start_at,
             epoch,
             reply,
         })?;
@@ -207,11 +240,14 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
     // overwrite the newer -- the user presses Next, waits, and then hears the
     // track they skipped.
     let mut highest_epoch: u64 = 0;
+    let mut ticks: u32 = 0;
 
     loop {
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok(Command::Play {
                 source,
+                decoded,
+                start_at,
                 epoch: new_epoch,
                 reply,
             }) => {
@@ -225,9 +261,13 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                 highest_epoch = new_epoch;
 
                 let result = match &device {
-                    Ok(sink) => {
-                        start(sink, &source, volume, ffmpeg.as_deref(), Duration::ZERO)
-                    }
+                    Ok(sink) => match decoded {
+                        // Prepared ahead of time: nothing left to do but hand
+                        // it to the mixer.
+                        Some(ready) => Ok(start(sink, ready, volume)),
+                        None => build_source(&source, ffmpeg.as_deref(), start_at)
+                            .map(|built| start(sink, built, volume)),
+                    },
                     Err(e) => Err(e.clone()),
                 };
 
@@ -240,7 +280,9 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                         epoch = Some(new_epoch);
                         loaded = Some(Loaded {
                             source,
-                            offset: Duration::ZERO,
+                            // The decode began here, so this is what the
+                            // player's own position has to be added to.
+                            offset: start_at,
                         });
                         let _ = reply.send(Ok(()));
                     }
@@ -304,10 +346,13 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                         epoch = None;
                         let _ = events.send(EngineEvent::Finished { epoch: current });
                     } else if !p.is_paused() {
-                        let _ = events.send(EngineEvent::Progress {
-                            epoch: current,
-                            position: position_of(&player, &loaded),
-                        });
+                        ticks = ticks.wrapping_add(1);
+                        if ticks % PROGRESS_EVERY == 0 {
+                            let _ = events.send(EngineEvent::Progress {
+                                epoch: current,
+                                position: position_of(&player, &loaded),
+                            });
+                        }
                     }
                 }
             }
@@ -381,7 +426,7 @@ fn seek(
         p.pause();
     }
 
-    match start(sink, &l.source, volume, ffmpeg, position) {
+    match build_source(&l.source, ffmpeg, position).map(|built| start(sink, built, volume)) {
         Ok(replacement) => {
             // Seeking while paused must not start playback.
             if was_paused {
@@ -404,42 +449,68 @@ fn seek(
     }
 }
 
-fn start(
-    sink: &rodio::MixerDeviceSink,
-    source: &PlayableSource,
-    volume: f32,
-    ffmpeg: Option<&Path>,
-    start_at: Duration,
-) -> Result<Player, String> {
+/// Connects a ready decoder to the output. Cheap -- no process, no waiting.
+fn start(sink: &rodio::MixerDeviceSink, decoded: Box<dyn Source + Send>, volume: f32) -> Player {
     let player = Player::connect_new(sink.mixer());
     player.set_volume(volume);
+    player.append(decoded);
+    player
+}
 
+/// Builds the decoder for a source, ready to be appended.
+///
+/// Deliberately separate from [`start`], and public, because this is the
+/// expensive half: for anything ffmpeg handles it spawns a process and waits
+/// for the first half second of audio. Splitting it lets the coordinator do
+/// that work early, on another thread, for a track that has not started yet.
+pub fn build_source(
+    source: &PlayableSource,
+    ffmpeg: Option<&Path>,
+    start_at: Duration,
+) -> Result<Box<dyn Source + Send>, String> {
     match source {
-        // A non-zero start means rodio's own seek was unavailable, so skip the
-        // native decoder -- it can only begin at zero -- and let ffmpeg start
-        // wherever it was asked to.
-        PlayableSource::LocalFile(path) if start_at.is_zero() => match native_decoder(path) {
-            Ok(decoder) => player.append(decoder),
-            // The seam's guess was wrong, or the file is something neither of
-            // us anticipated. ffmpeg understands far more formats than rodio,
-            // so it is worth one attempt before giving up.
-            Err(native_error) => {
-                let ffmpeg = ffmpeg.ok_or(native_error)?;
-                player.append(FfmpegSource::open(ffmpeg, FfmpegInput::File(path))?);
+        PlayableSource::LocalFile(path) => {
+            // Native first, seeking it in place when a start was asked for: a
+            // file seeks cheaply and rodio can do it, so resuming partway
+            // through one should not need ffmpeg at all.
+            match native_decoder(path) {
+                Ok(mut decoder) => {
+                    if start_at.is_zero() || decoder.try_seek(start_at).is_ok() {
+                        return Ok(Box::new(decoder));
+                    }
+                    // Decoded but would not seek. ffmpeg can start anywhere.
+                }
+                // The seam's guess was wrong, or the file is something neither
+                // of us anticipated. ffmpeg understands far more formats than
+                // rodio, so it is worth one attempt before giving up -- but
+                // with no ffmpeg the native failure is the real answer.
+                Err(native_error) if ffmpeg.is_none() => return Err(native_error),
+                Err(_) => {}
             }
-        },
 
-        PlayableSource::LocalFile(path) | PlayableSource::Transcoded(path) => {
             let ffmpeg = ffmpeg.ok_or(
                 "This file needs ffmpeg to play, and ffmpeg was not found. \
                  See src-tauri/binaries/README.md.",
             )?;
-            player.append(FfmpegSource::open_at(
+            Ok(Box::new(FfmpegSource::open_at(
                 ffmpeg,
                 FfmpegInput::File(path),
                 start_at,
                 None,
-            )?);
+            )?))
+        }
+
+        PlayableSource::Transcoded(path) => {
+            let ffmpeg = ffmpeg.ok_or(
+                "This file needs ffmpeg to play, and ffmpeg was not found. \
+                 See src-tauri/binaries/README.md.",
+            )?;
+            Ok(Box::new(FfmpegSource::open_at(
+                ffmpeg,
+                FfmpegInput::File(path),
+                start_at,
+                None,
+            )?))
         }
 
         PlayableSource::Stream { url, cache } => {
@@ -447,18 +518,16 @@ fn start(
                 "Streaming needs ffmpeg, and ffmpeg was not found. \
                  See src-tauri/binaries/README.md.",
             )?;
-            player.append(FfmpegSource::open_at(
+            Ok(Box::new(FfmpegSource::open_at(
                 ffmpeg,
                 FfmpegInput::Url(url),
                 start_at,
                 // A seeked decode begins partway in, so what it would write is
                 // not the whole song. Only a fresh start can fill the cache.
                 if start_at.is_zero() { cache.clone() } else { None },
-            )?);
+            )?))
         }
     }
-
-    Ok(player)
 }
 
 fn native_decoder(path: &Path) -> Result<Decoder<std::io::BufReader<File>>, String> {
@@ -505,7 +574,7 @@ mod tests {
         // No ffmpeg needed: this test plays a plain WAV, which rodio decodes.
         let engine = spawn(tx, None);
 
-        let played = engine.play(PlayableSource::LocalFile(wav), 1).await;
+        let played = engine.play(PlayableSource::LocalFile(wav), None, Duration::ZERO, 1).await;
         if let Err(e) = &played {
             eprintln!("SKIP: {e}");
             return;

@@ -9,7 +9,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::engine::{self, AudioEngine, EngineEvent, SUPERSEDED};
 use crate::audio_cache::AudioCache;
-use crate::playable::{get_playable_source, PlayableTrack};
+use crate::playable::{get_playable_source, PlayableSource, PlayableTrack};
 use crate::providers::Provider;
 use crate::queue::{PlayerQueue, RepeatMode};
 use crate::stream_urls::StreamUrlCache;
@@ -146,6 +146,12 @@ pub enum PlayerCommand {
     ClearQueue,
     /// Asks for a `player-queue` event, for a panel that just mounted.
     RequestQueueState,
+    /// Puts a track back in the bar at the position it was left, without
+    /// loading it. Sent once at startup.
+    Restore {
+        track_id: i64,
+        position_secs: f64,
+    },
     TogglePlayPause,
     Next,
     Previous,
@@ -253,6 +259,20 @@ struct Coordinator<E: PlayerEvents> {
     prefetching: Arc<Mutex<Option<i64>>>,
     /// Disposable on-disk copies of streamed audio. None disables caching.
     audio_cache: Option<AudioCache>,
+    /// Needed to build a decoder here rather than on the audio thread.
+    ffmpeg: Option<std::path::PathBuf>,
+    /// The next track, already decoding.
+    ///
+    /// One at a time: each holds an ffmpeg process and a full ring buffer, and
+    /// only the immediate next track is worth that.
+    prepared: Option<Prepared>,
+    /// Where prepare tasks deliver.
+    prepares: UnboundedSender<Prepared>,
+    /// Where to begin the next load, when the track is being resumed.
+    ///
+    /// Applied by the load rather than as a seek afterwards, so a stream does
+    /// not start ffmpeg once at zero and again at the real position.
+    resume_at: Option<Duration>,
     events: E,
 }
 
@@ -265,10 +285,11 @@ pub fn spawn<E: PlayerEvents>(
     audio_cache: Option<AudioCache>,
 ) -> PlayerHandle {
     let (engine_tx, engine_rx) = mpsc::unbounded_channel();
-    let engine = engine::spawn(engine_tx, ffmpeg);
+    let engine = engine::spawn(engine_tx, ffmpeg.clone());
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (loads_tx, loads_rx) = mpsc::unbounded_channel();
+    let (prepares_tx, prepares_rx) = mpsc::unbounded_channel();
 
     tauri::async_runtime::spawn(async move {
         Coordinator {
@@ -285,9 +306,13 @@ pub fn spawn<E: PlayerEvents>(
             stream_urls: Arc::new(StreamUrlCache::default()),
             prefetching: Arc::new(Mutex::new(None)),
             audio_cache,
+            ffmpeg,
+            prepared: None,
+            prepares: prepares_tx,
+            resume_at: None,
             events,
         }
-        .run(command_rx, engine_rx, loads_rx)
+        .run(command_rx, engine_rx, loads_rx, prepares_rx)
         .await;
     });
 
@@ -300,14 +325,27 @@ impl<E: PlayerEvents> Coordinator<E> {
         mut commands: UnboundedReceiver<PlayerCommand>,
         mut engine_events: UnboundedReceiver<EngineEvent>,
         mut loads: UnboundedReceiver<LoadOutcome>,
+        mut prepares: UnboundedReceiver<Prepared>,
     ) {
         loop {
             tokio::select! {
                 Some(command) = commands.recv() => self.handle_command(command).await,
                 Some(event) = engine_events.recv() => self.handle_engine_event(event).await,
                 Some(outcome) = loads.recv() => self.handle_load(outcome).await,
+                Some(ready) = prepares.recv() => self.keep_prepared(ready),
                 else => break,
             }
+        }
+    }
+
+    /// Files a decoder that finished preparing.
+    ///
+    /// Discarded if the queue moved on while it was building -- dropping it
+    /// kills its ffmpeg, so a stale one costs nothing but the work already
+    /// done.
+    fn keep_prepared(&mut self, ready: Prepared) {
+        if self.queue.peek_next() == Some(ready.track_id) {
+            self.prepared = Some(ready);
         }
     }
 
@@ -348,6 +386,11 @@ impl<E: PlayerEvents> Coordinator<E> {
             PlayerCommand::ClearQueue => self.queue.clear_manual(),
 
             PlayerCommand::RequestQueueState => {}
+
+            PlayerCommand::Restore {
+                track_id,
+                position_secs,
+            } => self.restore(track_id, position_secs).await,
 
             PlayerCommand::TogglePlayPause => match self.state {
                 PlaybackState::Playing => {
@@ -553,6 +596,39 @@ impl<E: PlayerEvents> Coordinator<E> {
         self.epoch += 1;
         let epoch = self.epoch;
 
+        // Consumed here: a resume applies to the track being resumed, and
+        // must not leak into whatever plays after it.
+        let start_at = self.resume_at.take().unwrap_or(Duration::ZERO);
+
+        // Prepared while the previous track was still playing: the process is
+        // running and the buffer is full, so this is a hand-off rather than a
+        // load. Everything the slow path does has already happened.
+        //
+        // Never used for a resume: a prepared decoder always starts at zero.
+        if let Some(ready) = self
+            .prepared
+            .take()
+            .filter(|r| r.track_id == track_id && start_at.is_zero())
+        {
+            let engine = Arc::clone(&self.engine);
+            let loads = self.loads.clone();
+
+            tauri::async_runtime::spawn(async move {
+                let result = engine
+                    .play(ready.source, Some(ready.decoded), Duration::ZERO, epoch)
+                    .await;
+
+                let _ = loads.send(LoadOutcome {
+                    epoch,
+                    track_id,
+                    start_at: Duration::ZERO,
+                    attempt,
+                    result,
+                });
+            });
+            return;
+        }
+
         // Without this the UI would sit on "stopped" and look broken while a
         // stream is being fetched.
         self.state = PlaybackState::Loading;
@@ -573,6 +649,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                 cache.as_ref(),
                 yt_dlp.as_deref(),
                 track_id,
+                start_at,
                 epoch,
             )
             .await;
@@ -580,6 +657,7 @@ impl<E: PlayerEvents> Coordinator<E> {
             let _ = loads.send(LoadOutcome {
                 epoch,
                 track_id,
+                start_at,
                 attempt,
                 result,
             });
@@ -599,9 +677,10 @@ impl<E: PlayerEvents> Coordinator<E> {
                 self.loaded = Some(outcome.track_id);
                 self.state = PlaybackState::Playing;
                 self.apply_volume();
-                // Reset the bar immediately; the first tick is up to a poll
-                // interval away.
-                self.emit_progress(Duration::ZERO);
+                // Set the bar immediately; the first tick is up to a poll
+                // interval away, and for a resume starting from zero would
+                // show the wrong place until it arrived.
+                self.emit_progress(outcome.start_at);
                 self.emit_state();
             }
 
@@ -645,10 +724,21 @@ impl<E: PlayerEvents> Coordinator<E> {
     /// Best effort throughout: failures are silent, because the real play
     /// resolves normally and reports anything that genuinely matters. The
     /// worst case is that a track starts exactly as slowly as it used to.
-    fn prefetch_next(&self) {
+    fn prefetch_next(&mut self) {
         let Some(track_id) = self.queue.peek_next() else {
+            // Nothing follows: release whatever was held for a track that is
+            // no longer next, so its ffmpeg does not linger.
+            self.prepared = None;
             return;
         };
+
+        // What is held no longer matches what is coming.
+        if self.prepared.as_ref().is_some_and(|r| r.track_id != track_id) {
+            self.prepared = None;
+        }
+
+        self.prepare_next(track_id);
+
         let Some(yt_dlp) = self.yt_dlp.clone() else {
             return;
         };
@@ -677,6 +767,107 @@ impl<E: PlayerEvents> Coordinator<E> {
             // later prefetch.
             if let Ok(mut slot) = slot.lock() {
                 *slot = None;
+            }
+        });
+    }
+
+    /// Puts a track back in the bar where it was left, without loading it.
+    ///
+    /// Loading here would mean a yt-dlp resolve before the window is usable --
+    /// seconds of work for a track the user may never press play on. The
+    /// position is held instead and applied to the load if and when they do.
+    async fn restore(&mut self, track_id: i64, position_secs: f64) {
+        // Only worth restoring a position the user would notice losing, and
+        // never one at the very end -- resuming there just plays silence and
+        // skips on.
+        const MIN_POSITION: f64 = 10.0;
+        const END_MARGIN: f64 = 15.0;
+
+        let duration: Option<f64> =
+            sqlx::query_scalar("SELECT duration_secs FROM tracks WHERE id = ?")
+                .bind(track_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten()
+                .map(|secs: i64| secs as f64);
+
+        // A track deleted since the last session would otherwise sit in the
+        // bar as a phantom that fails only when pressed.
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM tracks WHERE id = ?")
+            .bind(track_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+        if exists.is_none() {
+            return;
+        }
+
+        let near_end = duration.is_some_and(|total| position_secs > total - END_MARGIN);
+        let position = if position_secs < MIN_POSITION || near_end {
+            0.0
+        } else {
+            position_secs
+        };
+
+        self.queue
+            .set_context(vec![track_id], 0, Some("where you left off".to_string()));
+        self.resume_at =
+            (position > 0.0).then(|| Duration::from_secs_f64(position));
+
+        // Stopped, not Loading: nothing has been fetched, and the bar should
+        // show a track ready to play rather than one that is starting.
+        self.state = PlaybackState::Stopped;
+        // State first: the frontend discards a progress tick whose track it
+        // does not yet know about, and it learns the track from the state.
+        self.emit_state();
+        self.emit_progress(Duration::from_secs_f64(position));
+    }
+
+    /// Starts decoding the next track before it is needed.
+    ///
+    /// The remaining gap between tracks was ffmpeg's own start -- spawning the
+    /// process and waiting for it to buffer. Doing that while the current
+    /// track still plays turns the handover into an append.
+    ///
+    /// Best effort: if it fails or arrives late the ordinary load path runs
+    /// exactly as before.
+    fn prepare_next(&mut self, track_id: i64) {
+        // Already held, or already building for this track.
+        if self.prepared.as_ref().is_some_and(|r| r.track_id == track_id) {
+            return;
+        }
+
+        let pool = self.pool.clone();
+        let urls = Arc::clone(&self.stream_urls);
+        let cache = self.audio_cache.clone();
+        let yt_dlp = self.yt_dlp.clone();
+        let ffmpeg = self.ffmpeg.clone();
+        let prepares = self.prepares.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let Ok(source) =
+                resolve_track(&pool, &urls, cache.as_ref(), yt_dlp.as_deref(), track_id).await
+            else {
+                return;
+            };
+
+            // Blocking: building a decoder waits for ffmpeg to produce its
+            // first half second. On a worker thread that is fine; on the
+            // runtime it would stall every other task.
+            let source_for_build = source.clone();
+            let built = tauri::async_runtime::spawn_blocking(move || {
+                engine::build_source(&source_for_build, ffmpeg.as_deref(), Duration::ZERO)
+            })
+            .await;
+
+            if let Ok(Ok(decoded)) = built {
+                let _ = prepares.send(Prepared {
+                    track_id,
+                    source,
+                    decoded,
+                });
             }
         });
     }
@@ -727,12 +918,18 @@ impl<E: PlayerEvents> Coordinator<E> {
         });
     }
 
-    async fn emit_queue(&self) {
-        self.events.queue(self.queue_state().await);
+    /// Takes `&mut self` rather than `&self` deliberately.
+    ///
+    /// A shared reference held across an await makes the whole future require
+    /// `Sync`, and the prepared decoder is a trait object that is `Send` but
+    /// not `Sync`. An exclusive reference only asks for `Send`, which it has.
+    async fn emit_queue(&mut self) {
+        let state = self.queue_state().await;
+        self.events.queue(state);
     }
 
     /// Builds the panel payload, hydrating titles in one query.
-    async fn queue_state(&self) -> QueueState {
+    async fn queue_state(&mut self) -> QueueState {
         let manual: Vec<(Option<u64>, i64)> = self
             .queue
             .manual()
@@ -767,7 +964,7 @@ impl<E: PlayerEvents> Coordinator<E> {
         }
     }
 
-    async fn load_details(&self, ids: &[i64]) -> HashMap<i64, TrackDetail> {
+    async fn load_details(&mut self, ids: &[i64]) -> HashMap<i64, TrackDetail> {
         if ids.is_empty() {
             return HashMap::new();
         }
@@ -811,6 +1008,24 @@ impl<E: PlayerEvents> Coordinator<E> {
 /// dead links would leave playback stalled for minutes with no explanation.
 const MAX_LOAD_ATTEMPTS: usize = 3;
 
+/// A decoder built ahead of time for the track that comes next.
+///
+/// Holding one keeps an ffmpeg process and a full ring buffer alive, which is
+/// why there is only ever one. Dropping it kills the process.
+pub struct Prepared {
+    track_id: i64,
+    source: PlayableSource,
+    decoded: Box<dyn rodio::Source + Send>,
+}
+
+impl std::fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Prepared")
+            .field("track_id", &self.track_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// What a spawned load reports back.
 #[derive(Debug)]
 pub struct LoadOutcome {
@@ -818,6 +1033,9 @@ pub struct LoadOutcome {
     /// epoch is a load the user has already moved past.
     epoch: u64,
     track_id: i64,
+    /// Where the decode began, so the bar can show it at once rather than
+    /// flashing zero before the first tick corrects it.
+    start_at: Duration,
     /// How many tracks have already been skipped in this run, so the retry
     /// stays bounded across the tasks it is now spread over.
     attempt: usize,
@@ -841,6 +1059,7 @@ async fn load_track(
     cache: Option<&AudioCache>,
     yt_dlp: Option<&std::path::Path>,
     track_id: i64,
+    start_at: Duration,
     epoch: u64,
 ) -> Result<(), String> {
     const ATTEMPTS: usize = 2;
@@ -850,7 +1069,7 @@ async fn load_track(
     for attempt in 0..ATTEMPTS {
         let source = resolve_track(pool, urls, cache, yt_dlp, track_id).await?;
 
-        match engine.play(source, epoch).await {
+        match engine.play(source, None, start_at, epoch).await {
             Ok(()) => return Ok(()),
             // Another load won while this one was resolving. Retrying would
             // only lose again, and the caller must not treat it as a fault.
@@ -1049,6 +1268,22 @@ pub async fn clear_queue(player: State<'_, PlayerHandle>) -> Result<(), String> 
 #[tauri::command]
 pub async fn request_queue_state(player: State<'_, PlayerHandle>) -> Result<(), String> {
     player.send(PlayerCommand::RequestQueueState)
+}
+
+/// Puts the last session's track back in the bar, at its position.
+///
+/// Deliberately does not start playing: reopening an app should not make
+/// noise, and nothing is fetched until the user asks for it.
+#[tauri::command]
+pub async fn restore_playback(
+    track_id: i64,
+    position_secs: f64,
+    player: State<'_, PlayerHandle>,
+) -> Result<(), String> {
+    player.send(PlayerCommand::Restore {
+        track_id,
+        position_secs,
+    })
 }
 
 #[tauri::command]
