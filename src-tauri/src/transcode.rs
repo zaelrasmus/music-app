@@ -16,8 +16,19 @@ const OUTPUT_CHANNELS: u16 = 2;
 
 const SAMPLES_PER_SECOND: usize = OUTPUT_RATE as usize * OUTPUT_CHANNELS as usize;
 
-/// Roughly five seconds of slack between ffmpeg and the speakers.
-const BUFFER_SAMPLES: usize = SAMPLES_PER_SECOND * 5;
+/// Slack between ffmpeg and the speakers, for a local file.
+///
+/// Small on purpose: a disk read that stalls for five seconds has bigger
+/// problems than audio, so more headroom would just be idle memory.
+const BUFFER_SECONDS_FILE: usize = 5;
+
+/// The same, for a network stream.
+///
+/// Much larger because the failure it guards against is real and common:
+/// congestion, a wifi handover, a provider throttling mid-track. Anything
+/// longer than the buffer becomes audible silence. Thirty seconds costs about
+/// 10 MB of memory and makes ordinary hiccups invisible.
+const BUFFER_SECONDS_NETWORK: usize = 30;
 
 /// Filled before playback starts so the opening moments cannot underrun.
 const PREFILL_SAMPLES: usize = SAMPLES_PER_SECOND / 2;
@@ -50,6 +61,20 @@ pub struct FfmpegSource {
 pub enum FfmpegInput<'a> {
     File(&'a Path),
     Url(&'a str),
+}
+
+impl FfmpegInput<'_> {
+    /// How much decoded audio to hold ahead of the speakers.
+    ///
+    /// A network stream needs far more slack than a file: the buffer is
+    /// exactly what a stall has to outlast before it becomes silence.
+    fn buffer_samples(self) -> usize {
+        let seconds = match self {
+            FfmpegInput::File(_) => BUFFER_SECONDS_FILE,
+            FfmpegInput::Url(_) => BUFFER_SECONDS_NETWORK,
+        };
+        SAMPLES_PER_SECOND * seconds
+    }
 }
 
 impl FfmpegSource {
@@ -113,7 +138,7 @@ impl FfmpegSource {
             .ok_or("ffmpeg produced no output stream.")?;
         let stderr = child.stderr.take();
 
-        let (producer, consumer) = RingBuffer::<Sample>::new(BUFFER_SAMPLES);
+        let (producer, consumer) = RingBuffer::<Sample>::new(input.buffer_samples());
         let finished = Arc::new(AtomicBool::new(false));
 
         spawn_reader(stdout, producer, finished.clone());

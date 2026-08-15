@@ -5,12 +5,21 @@
 //! working perfectly while the progress bar sits at zero. That is exactly the
 //! failure this test exists to catch.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use music_app_lib::player::{
     self, PlayerCommand, PlayerEvents, PlayerProgress, PlayerStatus, QueueState,
 };
+
+/// Serialises the tests that touch the network.
+///
+/// Run in parallel they compete for the same things -- several yt-dlp
+/// resolves against YouTube at once, and the one audio device -- which makes
+/// the timing assertions measure contention rather than the code under test.
+/// A tokio mutex rather than a std one because it is held across awaits.
+static NETWORK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Default)]
 struct Captured {
@@ -44,9 +53,13 @@ impl PlayerEvents for Recorder {
 
 /// A real 3-second PCM WAV, so the engine has something genuine to decode.
 fn write_wav(path: &std::path::Path) {
+    write_wav_secs(path, 3);
+}
+
+fn write_wav_secs(path: &std::path::Path, seconds: u32) {
     use std::io::Write;
 
-    let samples: u32 = 44100 * 3;
+    let samples: u32 = 44100 * seconds;
     let data_len = samples * 2;
     let mut b = Vec::new();
     b.extend_from_slice(b"RIFF");
@@ -223,6 +236,8 @@ async fn an_opus_file_plays_through_ffmpeg() {
 /// convincingly, so it either works against YouTube or it does not work.
 #[tokio::test]
 async fn a_saved_youtube_track_streams() {
+    let _network = NETWORK.lock().await;
+
     let base = std::env::temp_dir().join("music-app-youtube-stream");
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
@@ -302,6 +317,8 @@ async fn a_saved_youtube_track_streams() {
 /// plays, the generalised schema and the provider-driven seam are both real.
 #[tokio::test]
 async fn a_saved_soundcloud_track_streams() {
+    let _network = NETWORK.lock().await;
+
     let base = std::env::temp_dir().join("music-app-soundcloud-stream");
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
@@ -379,6 +396,8 @@ async fn a_saved_soundcloud_track_streams() {
 /// thought the track had restarted.
 #[tokio::test]
 async fn a_stream_can_be_seeked_and_reports_the_real_position() {
+    let _network = NETWORK.lock().await;
+
     const TARGET_SECS: f64 = 100.0;
 
     let base = std::env::temp_dir().join("music-app-stream-seek");
@@ -533,6 +552,238 @@ async fn a_local_file_still_seeks_natively() {
     assert!(
         after.iter().any(|p| *p >= 2.0),
         "a local seek should land at the target (got {after:?})"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Replaying a stream must not pay the resolve cost twice.
+///
+/// A yt-dlp resolve measured 6.5-7.4s against the live service, and it was
+/// being paid on every play -- including replaying the track that just
+/// finished. The URLs carry hours of validity, so the second start should be
+/// dominated by ffmpeg alone.
+///
+/// Asserted as a ratio rather than an absolute: the point is that a whole
+/// process launch and network round trip disappeared, and that survives a slow
+/// machine or a slow connection in a way that a fixed millisecond budget would
+/// not.
+#[tokio::test]
+async fn replaying_a_stream_skips_the_resolve() {
+    let _network = NETWORK.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-url-cache");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, state, remote_id, remote_url) \
+         VALUES ('youtube', 'Never Gonna Give You Up', 'saved', 'dQw4w9WgXcQ', \
+                 'https://www.youtube.com/watch?v=dQw4w9WgXcQ')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let track_id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        Some(std::path::PathBuf::from("ffmpeg")),
+        Some(std::path::PathBuf::from("yt-dlp")),
+    );
+
+    let skippable = |e: &String| {
+        e.contains("No audio output device")
+            || e.contains("internet connection")
+            || e.contains("Could not find yt-dlp")
+            || e.contains("Could not start")
+            || e.contains("YouTube refused")
+            || e.contains("no longer available")
+    };
+
+    // Playing is what actually reaches the resolver, so each start is timed by
+    // waiting for audio to move rather than by instrumenting the cache.
+    let play_and_time = |label: &'static str| {
+        let handle = &handle;
+        let recorder = &recorder;
+        async move {
+            recorder.0.progress.lock().unwrap().clear();
+            let started = std::time::Instant::now();
+
+            handle
+                .send(PlayerCommand::PlayQueue {
+                    track_ids: vec![track_id],
+                    start_index: 0,
+                    context_name: None,
+                })
+                .unwrap();
+
+            loop {
+                if recorder.0.progress.lock().unwrap().iter().any(|p| *p > 0.0) {
+                    break Some(started.elapsed());
+                }
+                if recorder.0.errors.lock().unwrap().iter().any(skippable) {
+                    break None;
+                }
+                if started.elapsed() > Duration::from_secs(40) {
+                    break None;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            .inspect(|taken| eprintln!("{label}: {taken:?}"))
+        }
+    };
+
+    let Some(cold) = play_and_time("cold start (resolve + ffmpeg)").await else {
+        eprintln!("SKIP: upstream/environment condition");
+        return;
+    };
+
+    handle.send(PlayerCommand::Stop).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let Some(warm) = play_and_time("warm start (cached URL)").await else {
+        eprintln!("SKIP: upstream/environment condition");
+        return;
+    };
+
+    assert!(
+        warm < cold,
+        "the replay was not faster: cold {cold:?}, warm {warm:?}"
+    );
+    assert!(
+        warm * 2 < cold,
+        "the resolve does not look skipped -- a cached start should be far \
+         cheaper than a cold one (cold {cold:?}, warm {warm:?})"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The gap between two tracks, when the second one streams.
+///
+/// A resolve measured 6-7s against the live service, and it used to be paid
+/// *after* the previous track ended -- silence with nothing to show for it.
+/// Prefetching moves that work under the track already playing.
+///
+/// The threshold is what makes this meaningful: four seconds is unreachable
+/// without a prefetch, because the resolve alone exceeds it.
+#[tokio::test]
+async fn the_next_stream_is_ready_before_the_current_track_ends() {
+    let _network = NETWORK.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-prefetch");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    // Deliberately longer than a resolve takes (~7s measured). A real song
+    // is minutes long, so this is the realistic case; a first track *shorter*
+    // than a resolve simply cannot be covered, and falls back to the old
+    // behaviour of resolving at the handover.
+    let wav = base.join("tone.wav");
+    write_wav_secs(&wav, 12);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    let local: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks (source, title, local_path, state) \
+         VALUES ('local', 'Tone', ?, 'present') RETURNING id",
+    )
+    .bind(wav.to_str().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let stream: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks (source, title, state, remote_id, remote_url) \
+         VALUES ('youtube', 'Never Gonna Give You Up', 'saved', 'dQw4w9WgXcQ', \
+                 'https://www.youtube.com/watch?v=dQw4w9WgXcQ') RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        Some(std::path::PathBuf::from("ffmpeg")),
+        Some(std::path::PathBuf::from("yt-dlp")),
+    );
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![local, stream],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    let skippable = |e: &String| {
+        e.contains("No audio output device")
+            || e.contains("internet connection")
+            || e.contains("Could not find yt-dlp")
+            || e.contains("Could not start")
+            || e.contains("YouTube refused")
+            || e.contains("no longer available")
+    };
+
+    // Wait for the local track to hand over, then time how long the stream
+    // takes to make a sound.
+    let mut handover: Option<std::time::Instant> = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+
+    let gap = loop {
+        if std::time::Instant::now() > deadline {
+            eprintln!("SKIP: timed out waiting for the handover");
+            return;
+        }
+        if recorder.0.errors.lock().unwrap().iter().any(skippable) {
+            eprintln!("SKIP: upstream/environment condition");
+            return;
+        }
+
+        let current = recorder
+            .0
+            .states
+            .lock()
+            .unwrap()
+            .last()
+            .and_then(|s| s.track_id);
+
+        if handover.is_none() && current == Some(stream) {
+            // The previous track's ticks are still in the buffer. Clearing
+            // here is what makes the next non-zero value mean *this* track --
+            // without it the gap measures as instant no matter how slow the
+            // handover really was.
+            recorder.0.progress.lock().unwrap().clear();
+            handover = Some(std::time::Instant::now());
+        }
+
+        if let Some(started) = handover {
+            let playing = recorder.0.progress.lock().unwrap().iter().any(|p| *p > 0.0);
+            if playing && current == Some(stream) {
+                break started.elapsed();
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    eprintln!("gap between tracks: {gap:?}");
+    assert!(
+        gap < Duration::from_secs(4),
+        "the stream took {gap:?} to start, which means its URL was resolved \
+         after the handover rather than prefetched underneath the track before"
     );
 
     db.pool.close().await;

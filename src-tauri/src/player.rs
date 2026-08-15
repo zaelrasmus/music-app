@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -8,7 +9,9 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::engine::{self, AudioEngine, EngineEvent};
 use crate::playable::{get_playable_source, PlayableTrack};
+use crate::providers::Provider;
 use crate::queue::{PlayerQueue, RepeatMode};
+use crate::stream_urls::StreamUrlCache;
 
 pub const PLAYER_STATE_EVENT: &str = "player-state";
 pub const PLAYER_ERROR_EVENT: &str = "player-error";
@@ -234,6 +237,16 @@ struct Coordinator<E: PlayerEvents> {
     /// Handed in at startup: the coordinator has no `AppHandle` to resolve it
     /// from, and doing so per play would repeat the lookup needlessly.
     yt_dlp: Option<std::path::PathBuf>,
+    /// Resolved stream URLs, reused for their stated lifetime.
+    ///
+    /// Shared because prefetching writes into it from a spawned task.
+    stream_urls: Arc<StreamUrlCache>,
+    /// The track a prefetch is currently resolving, if any.
+    ///
+    /// One slot, not a set: the point is to warm the *next* track, and
+    /// allowing several at once would mean skipping through a queue spawns a
+    /// yt-dlp process per keypress, all but one of them wasted.
+    prefetching: Arc<Mutex<Option<i64>>>,
     events: E,
 }
 
@@ -260,6 +273,8 @@ pub fn spawn<E: PlayerEvents>(
             engine,
             pool,
             yt_dlp,
+            stream_urls: Arc::new(StreamUrlCache::default()),
+            prefetching: Arc::new(Mutex::new(None)),
             events,
         }
         .run(command_rx, engine_rx)
@@ -417,6 +432,9 @@ impl<E: PlayerEvents> Coordinator<E> {
         self.emit_state();
         if affects_queue {
             self.emit_queue().await;
+            // What plays next may have just changed -- `play_next` inserts
+            // ahead of everything, so a start-only trigger would miss it.
+            self.prefetch_next();
         }
     }
 
@@ -441,6 +459,7 @@ impl<E: PlayerEvents> Coordinator<E> {
 
                 self.emit_state();
                 self.emit_queue().await;
+                self.prefetch_next();
             }
 
             EngineEvent::Progress { epoch, position } => {
@@ -518,21 +537,15 @@ impl<E: PlayerEvents> Coordinator<E> {
             self.state = PlaybackState::Loading;
             self.emit_state();
 
-            match self.resolve(track_id).await {
-                Ok(source) => {
-                    self.epoch += 1;
-                    match self.engine.play(source, self.epoch) {
-                        Ok(()) => {
-                            self.loaded = Some(track_id);
-                            self.state = PlaybackState::Playing;
-                            self.apply_volume();
-                            // Reset the bar immediately; the first tick is up
-                            // to a poll interval away.
-                            self.emit_progress(Duration::ZERO);
-                            return;
-                        }
-                        Err(e) => last_error = Some(e),
-                    }
+            match self.load(track_id).await {
+                Ok(()) => {
+                    self.loaded = Some(track_id);
+                    self.state = PlaybackState::Playing;
+                    self.apply_volume();
+                    // Reset the bar immediately; the first tick is up to a
+                    // poll interval away.
+                    self.emit_progress(Duration::ZERO);
+                    return;
                 }
                 Err(e) => last_error = Some(e),
             }
@@ -548,6 +561,99 @@ impl<E: PlayerEvents> Coordinator<E> {
         if let Some(error) = last_error {
             self.events.error(error);
         }
+    }
+
+    /// Resolves `track_id` and hands it to the engine.
+    ///
+    /// Retries once when a *cached* stream URL fails. Providers can revoke a
+    /// link before its stated expiry, and the alternative -- skipping to the
+    /// next track -- would punish the user for an optimisation they cannot
+    /// see. Only worth doing when something was actually cached: a first-time
+    /// failure is the provider's answer, and asking again just fails slower.
+    async fn load(&mut self, track_id: i64) -> Result<(), String> {
+        const ATTEMPTS: usize = 2;
+
+        let mut last_error = String::new();
+
+        for attempt in 0..ATTEMPTS {
+            let source = self.resolve(track_id).await?;
+
+            self.epoch += 1;
+            match self.engine.play(source, self.epoch) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_error = e;
+
+                    let stale = attempt + 1 < ATTEMPTS && self.forget_stream_url(track_id).await;
+                    if !stale {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Err(last_error)
+    }
+
+    /// Resolves the next track's stream while the current one is still
+    /// playing.
+    ///
+    /// The gap between two streamed tracks *was* the resolve -- six or seven
+    /// seconds of silence with nothing to show for it. Doing that work ahead
+    /// of time removes it, because by the time the track ends its URL is
+    /// already in the cache and only ffmpeg's own start remains.
+    ///
+    /// Best effort throughout: failures are silent, because the real play
+    /// resolves normally and reports anything that genuinely matters. The
+    /// worst case is that a track starts exactly as slowly as it used to.
+    fn prefetch_next(&self) {
+        let Some(track_id) = self.queue.peek_next() else {
+            return;
+        };
+        let Some(yt_dlp) = self.yt_dlp.clone() else {
+            return;
+        };
+
+        // Claim the single slot, or leave it to whoever holds it.
+        {
+            let Ok(mut slot) = self.prefetching.lock() else {
+                return;
+            };
+            if slot.is_some() {
+                return;
+            }
+            *slot = Some(track_id);
+        }
+
+        let pool = self.pool.clone();
+        let urls = Arc::clone(&self.stream_urls);
+        let slot = Arc::clone(&self.prefetching);
+
+        // Spawned rather than awaited: the coordinator must stay responsive,
+        // and nothing depends on the result arriving.
+        tauri::async_runtime::spawn(async move {
+            prefetch(&pool, &urls, &yt_dlp, track_id).await;
+
+            // Released whatever happened, so one failure cannot wedge every
+            // later prefetch.
+            if let Ok(mut slot) = slot.lock() {
+                *slot = None;
+            }
+        });
+    }
+
+    /// Drops any cached stream URL for `track_id`, reporting whether there was
+    /// one to drop.
+    async fn forget_stream_url(&self, track_id: i64) -> bool {
+        let url: Option<String> =
+            sqlx::query_scalar("SELECT remote_url FROM tracks WHERE id = ?")
+                .bind(track_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+
+        url.is_some_and(|url| self.stream_urls.invalidate(&url))
     }
 
     async fn resolve(&self, track_id: i64) -> Result<crate::playable::PlayableSource, String> {
@@ -567,6 +673,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                 remote_url: row.get("remote_url"),
             },
             self.yt_dlp.as_deref(),
+            &self.stream_urls,
         )
         .await
     }
@@ -694,6 +801,49 @@ impl<E: PlayerEvents> Coordinator<E> {
             })
             .collect()
     }
+}
+
+/// Warms the URL cache for `track_id`, if it is something that streams.
+///
+/// A free function rather than a method because it runs on a spawned task
+/// that outlives the borrow -- it owns everything it touches.
+async fn prefetch(
+    pool: &SqlitePool,
+    urls: &StreamUrlCache,
+    yt_dlp: &std::path::Path,
+    track_id: i64,
+) {
+    let Ok(Some(row)) =
+        sqlx::query("SELECT source, local_path, remote_url FROM tracks WHERE id = ?")
+            .bind(track_id)
+            .fetch_optional(pool)
+            .await
+    else {
+        return;
+    };
+
+    // A local file has nothing to resolve, and a downloaded track plays from
+    // disk -- prefetching either would spend a process on nothing.
+    let source: String = row.get("source");
+    let Some(provider) = Provider::from_source(&source) else {
+        return;
+    };
+    if row.get::<Option<String>, _>("local_path").is_some() {
+        return;
+    }
+
+    let Some(url) = row.get::<Option<String>, _>("remote_url") else {
+        return;
+    };
+    // The same check the real path makes. Nobody is watching this result, so
+    // a corrupt row must not reach a subprocess just because it is quiet here.
+    if !provider.accepts_url(&url) {
+        return;
+    }
+
+    // Already cached and still fresh costs nothing -- `resolve` returns
+    // without spawning anything.
+    let _ = urls.resolve(yt_dlp, &url).await;
 }
 
 struct TrackDetail {

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+cduse std::collections::VecDeque;
 
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};

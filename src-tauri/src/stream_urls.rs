@@ -1,0 +1,220 @@
+//! Short-lived cache of resolved stream URLs.
+//!
+//! Resolving one costs a yt-dlp process and 6-7 seconds, and it was being paid
+//! on *every* play -- including replaying the track that just finished, or
+//! coming back to one skipped past a moment ago.
+//!
+//! The URLs are good for far longer than that: measured against live services,
+//! a YouTube link carried five hours of validity and a SoundCloud link ninety
+//! minutes. Both state it plainly in their query string, so the lifetime is
+//! read rather than guessed.
+//!
+//! Correctness does not depend on the expiry being right. A link can be
+//! revoked early, and a cached one that fails is invalidated and re-resolved,
+//! so the worst case is the old behaviour plus one wasted attempt.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Trimmed off any parsed expiry, so a URL is never handed out moments before
+/// it dies -- a stream that starts and then stops is worse than a slow start.
+const SAFETY_MARGIN: Duration = Duration::from_secs(300);
+
+/// Used when the URL states no expiry we recognise.
+///
+/// Short enough to be safe against a policy we cannot see, long enough to
+/// still cover the replays and skip-backs that motivate the cache at all.
+const DEFAULT_TTL: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Clone)]
+struct Entry {
+    url: String,
+    good_until: SystemTime,
+}
+
+/// Keyed by the provider's page URL, which is what identifies a track across
+/// both services and is what the caller already holds.
+#[derive(Default)]
+pub struct StreamUrlCache {
+    entries: Mutex<HashMap<String, Entry>>,
+}
+
+impl StreamUrlCache {
+    /// Returns a playable stream URL, resolving only when necessary.
+    pub async fn resolve(&self, yt_dlp: &Path, page_url: &str) -> Result<String, String> {
+        if let Some(url) = self.lookup(page_url, SystemTime::now()) {
+            return Ok(url);
+        }
+
+        let url = crate::youtube::resolve_stream_url(yt_dlp, page_url).await?;
+        self.store(page_url, url.clone(), SystemTime::now());
+        Ok(url)
+    }
+
+    /// Forgets any cached URL for `page_url`.
+    ///
+    /// Returns whether there was one. The caller uses that to decide whether
+    /// retrying is worthwhile: a failure with nothing cached was not our
+    /// staleness, so retrying would just fail again more slowly.
+    pub fn invalidate(&self, page_url: &str) -> bool {
+        self.entries
+            .lock()
+            .map(|mut entries| entries.remove(page_url).is_some())
+            .unwrap_or(false)
+    }
+
+    /// `now` is a parameter so the expiry logic is testable without waiting.
+    fn lookup(&self, page_url: &str, now: SystemTime) -> Option<String> {
+        let entries = self.entries.lock().ok()?;
+        let entry = entries.get(page_url)?;
+        (entry.good_until > now).then(|| entry.url.clone())
+    }
+
+    fn store(&self, page_url: &str, url: String, now: SystemTime) {
+        let good_until = usable_until(&url, now);
+
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(
+                page_url.to_string(),
+                Entry {
+                    url,
+                    good_until,
+                },
+            );
+        }
+    }
+}
+
+/// How long `url` can be trusted for.
+fn usable_until(url: &str, now: SystemTime) -> SystemTime {
+    match parse_expiry(url) {
+        // A link already inside the safety margin is kept only briefly rather
+        // than being treated as good for the default -- it really is nearly
+        // dead, and `now` is the honest answer.
+        Some(expiry) => expiry.checked_sub(SAFETY_MARGIN).unwrap_or(now).max(now),
+        None => now + DEFAULT_TTL,
+    }
+}
+
+/// Reads the expiry both services put in the query string.
+///
+/// YouTube spells it `expire`, SoundCloud `expires`; both are unix seconds.
+/// Anything else falls back to the default TTL rather than being trusted.
+fn parse_expiry(url: &str) -> Option<SystemTime> {
+    let (_, query) = url.split_once('?')?;
+
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if key != "expire" && key != "expires" {
+            continue;
+        }
+        if let Ok(seconds) = value.parse::<u64>() {
+            return Some(UNIX_EPOCH + Duration::from_secs(seconds));
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    /// The real shapes, taken from live responses.
+    const YT: &str = "https://rr2---sn-x.googlevideo.com/videoplayback?expire=2000000000&ei=abc";
+    const SC: &str = "https://playback.media-streaming.soundcloud.cloud/x/playlist.m3u8?expires=2000000000&Policy=abc";
+
+    #[test]
+    fn both_providers_state_their_expiry_and_it_is_read() {
+        assert_eq!(parse_expiry(YT), Some(at(2_000_000_000)));
+        assert_eq!(parse_expiry(SC), Some(at(2_000_000_000)));
+    }
+
+    #[test]
+    fn a_url_with_no_expiry_yields_none() {
+        assert_eq!(parse_expiry("https://example.test/audio.m4a"), None);
+        assert_eq!(parse_expiry("https://example.test/a?b=c"), None);
+        assert_eq!(parse_expiry("https://example.test/a?expire=soon"), None);
+    }
+
+    #[test]
+    fn a_cached_url_is_returned_without_resolving() {
+        let cache = StreamUrlCache::default();
+        cache.store("page", YT.to_string(), at(1_000_000_000));
+
+        assert_eq!(
+            cache.lookup("page", at(1_000_000_100)),
+            Some(YT.to_string())
+        );
+    }
+
+    /// The whole point: the entry must stop being used before the link dies,
+    /// not after.
+    #[test]
+    fn an_entry_stops_being_used_before_its_link_expires() {
+        let cache = StreamUrlCache::default();
+        cache.store("page", YT.to_string(), at(1_000_000_000));
+
+        // Inside the margin, so already treated as unusable.
+        let just_before = at(2_000_000_000 - SAFETY_MARGIN.as_secs() + 1);
+        assert_eq!(cache.lookup("page", just_before), None);
+
+        // And comfortably before it, still fine.
+        let well_before = at(2_000_000_000 - SAFETY_MARGIN.as_secs() - 60);
+        assert_eq!(cache.lookup("page", well_before), Some(YT.to_string()));
+    }
+
+    #[test]
+    fn a_url_without_an_expiry_gets_the_default_lifetime() {
+        let cache = StreamUrlCache::default();
+        let plain = "https://example.test/audio.m4a";
+        cache.store("page", plain.to_string(), at(1_000));
+
+        assert!(cache.lookup("page", at(1_000 + 60)).is_some());
+        assert_eq!(
+            cache.lookup("page", at(1_000 + DEFAULT_TTL.as_secs() + 1)),
+            None,
+            "an unknown policy must not be trusted indefinitely"
+        );
+    }
+
+    /// A link that is already within the margin when stored must not be
+    /// resurrected by the subtraction underflowing.
+    #[test]
+    fn an_almost_dead_link_is_not_treated_as_fresh() {
+        let cache = StreamUrlCache::default();
+        let now = at(2_000_000_000 - 10);
+        cache.store("page", YT.to_string(), now);
+
+        assert_eq!(cache.lookup("page", now), None);
+    }
+
+    #[test]
+    fn invalidating_reports_whether_anything_was_cached() {
+        let cache = StreamUrlCache::default();
+        cache.store("page", YT.to_string(), at(1_000_000_000));
+
+        assert!(cache.invalidate("page"), "there was an entry");
+        assert!(!cache.invalidate("page"), "and now there is not");
+        assert_eq!(cache.lookup("page", at(1_000_000_100)), None);
+    }
+
+    /// Two tracks must not share a cached URL.
+    #[test]
+    fn entries_are_keyed_per_track() {
+        let cache = StreamUrlCache::default();
+        cache.store("one", YT.to_string(), at(1_000_000_000));
+        cache.store("two", SC.to_string(), at(1_000_000_000));
+
+        assert_eq!(cache.lookup("one", at(1_000_000_100)), Some(YT.to_string()));
+        assert_eq!(cache.lookup("two", at(1_000_000_100)), Some(SC.to_string()));
+    }
+}

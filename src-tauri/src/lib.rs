@@ -10,6 +10,7 @@ mod queue;
 mod scanner;
 mod search;
 mod sidecar;
+mod stream_urls;
 mod tags;
 mod transcode;
 mod tracks;
