@@ -8,6 +8,7 @@ use tauri::{AppHandle, Emitter, Runtime, State};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::engine::{self, AudioEngine, EngineEvent};
+use crate::audio_cache::AudioCache;
 use crate::playable::{get_playable_source, PlayableTrack};
 use crate::providers::Provider;
 use crate::queue::{PlayerQueue, RepeatMode};
@@ -247,6 +248,8 @@ struct Coordinator<E: PlayerEvents> {
     /// allowing several at once would mean skipping through a queue spawns a
     /// yt-dlp process per keypress, all but one of them wasted.
     prefetching: Arc<Mutex<Option<i64>>>,
+    /// Disposable on-disk copies of streamed audio. None disables caching.
+    audio_cache: Option<AudioCache>,
     events: E,
 }
 
@@ -256,6 +259,7 @@ pub fn spawn<E: PlayerEvents>(
     pool: SqlitePool,
     ffmpeg: Option<std::path::PathBuf>,
     yt_dlp: Option<std::path::PathBuf>,
+    audio_cache: Option<AudioCache>,
 ) -> PlayerHandle {
     let (engine_tx, engine_rx) = mpsc::unbounded_channel();
     let engine = engine::spawn(engine_tx, ffmpeg);
@@ -275,6 +279,7 @@ pub fn spawn<E: PlayerEvents>(
             yt_dlp,
             stream_urls: Arc::new(StreamUrlCache::default()),
             prefetching: Arc::new(Mutex::new(None)),
+            audio_cache,
             events,
         }
         .run(command_rx, engine_rx)
@@ -658,7 +663,7 @@ impl<E: PlayerEvents> Coordinator<E> {
 
     async fn resolve(&self, track_id: i64) -> Result<crate::playable::PlayableSource, String> {
         let row =
-            sqlx::query("SELECT source, state, local_path, remote_url FROM tracks WHERE id = ?")
+            sqlx::query("SELECT source, state, remote_id, local_path, remote_url FROM tracks WHERE id = ?")
                 .bind(track_id)
                 .fetch_optional(&self.pool)
                 .await
@@ -669,11 +674,13 @@ impl<E: PlayerEvents> Coordinator<E> {
             &PlayableTrack {
                 source: row.get("source"),
                 state: row.get("state"),
+                remote_id: row.get("remote_id"),
                 local_path: row.get("local_path"),
                 remote_url: row.get("remote_url"),
             },
             self.yt_dlp.as_deref(),
             &self.stream_urls,
+            self.audio_cache.as_ref(),
         )
         .await
     }

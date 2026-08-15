@@ -389,10 +389,11 @@ fn start(
                 ffmpeg,
                 FfmpegInput::File(path),
                 start_at,
+                None,
             )?);
         }
 
-        PlayableSource::Stream(url) => {
+        PlayableSource::Stream { url, cache } => {
             let ffmpeg = ffmpeg.ok_or(
                 "Streaming needs ffmpeg, and ffmpeg was not found. \
                  See src-tauri/binaries/README.md.",
@@ -401,6 +402,9 @@ fn start(
                 ffmpeg,
                 FfmpegInput::Url(url),
                 start_at,
+                // A seeked decode begins partway in, so what it would write is
+                // not the whole song. Only a fresh start can fill the cache.
+                if start_at.is_zero() { cache.clone() } else { None },
             )?);
         }
     }

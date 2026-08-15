@@ -140,7 +140,7 @@ async fn a_queued_track_interrupts_the_context_then_the_context_resumes() {
     let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -181,7 +181,7 @@ async fn changing_context_keeps_the_queue_and_the_panel_shows_it() {
     let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -234,7 +234,7 @@ async fn queueing_with_nothing_playing_starts_playback() {
     let (db, ids) = fixture(&base, 400).await;
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
 
     // No context at all: nothing would ever pick this up without the
     // start-if-idle rule, and "Add to queue" would look broken on a fresh
@@ -276,7 +276,7 @@ async fn skipping_an_unplayable_track_still_honours_the_queue() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {

@@ -106,7 +106,7 @@ async fn progress_reaches_the_ui_while_a_track_plays() {
 
     let recorder = Recorder::default();
     // No ffmpeg: the fixture is a plain WAV, decoded natively by rodio.
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -192,6 +192,7 @@ async fn an_opus_file_plays_through_ffmpeg() {
         Some(std::path::PathBuf::from("ffmpeg")),
         // No yt-dlp: this fixture is a local file.
         None,
+        None,
     );
 
     handle
@@ -265,6 +266,7 @@ async fn a_saved_youtube_track_streams() {
         db.pool.clone(),
         Some(std::path::PathBuf::from("ffmpeg")),
         Some(std::path::PathBuf::from("yt-dlp")),
+        None,
     );
 
     handle
@@ -345,6 +347,7 @@ async fn a_saved_soundcloud_track_streams() {
         db.pool.clone(),
         Some(std::path::PathBuf::from("ffmpeg")),
         Some(std::path::PathBuf::from("yt-dlp")),
+        None,
     );
 
     handle
@@ -425,6 +428,7 @@ async fn a_stream_can_be_seeked_and_reports_the_real_position() {
         db.pool.clone(),
         Some(std::path::PathBuf::from("ffmpeg")),
         Some(std::path::PathBuf::from("yt-dlp")),
+        None,
     );
 
     handle
@@ -518,7 +522,7 @@ async fn a_local_file_still_seeks_natively() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -598,6 +602,7 @@ async fn replaying_a_stream_skips_the_resolve() {
         db.pool.clone(),
         Some(std::path::PathBuf::from("ffmpeg")),
         Some(std::path::PathBuf::from("yt-dlp")),
+        None,
     );
 
     let skippable = |e: &String| {
@@ -718,6 +723,7 @@ async fn the_next_stream_is_ready_before_the_current_track_ends() {
         db.pool.clone(),
         Some(std::path::PathBuf::from("ffmpeg")),
         Some(std::path::PathBuf::from("yt-dlp")),
+        None,
     );
 
     handle
@@ -784,6 +790,134 @@ async fn the_next_stream_is_ready_before_the_current_track_ends() {
         gap < Duration::from_secs(4),
         "the stream took {gap:?} to start, which means its URL was resolved \
          after the handover rather than prefetched underneath the track before"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A streamed track fills the cache as it plays, and the next play uses it.
+///
+/// The cache copy is written by the same ffmpeg that is decoding for playback,
+/// so it costs no extra network traffic. What proves it landed is the replay:
+/// the coordinator is given **no yt-dlp at all** the second time, so if any
+/// audio comes out it can only have come from disk.
+#[tokio::test]
+async fn a_streamed_track_is_cached_and_replays_without_the_network() {
+    let _network = NETWORK.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-audio-cache");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let cache_dir = base.join("cache");
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    // A short track, so it can be played to the end inside a test -- only a
+    // complete decode commits a cache entry.
+    sqlx::query(
+        "INSERT INTO tracks (source, title, state, remote_id, remote_url) \
+         VALUES ('youtube', 'Me at the zoo', 'saved', 'jNQXAC9IVRw', \
+                 'https://www.youtube.com/watch?v=jNQXAC9IVRw')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let track_id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let skippable = |e: &String| {
+        e.contains("No audio output device")
+            || e.contains("internet connection")
+            || e.contains("Could not find yt-dlp")
+            || e.contains("Could not start")
+            || e.contains("YouTube refused")
+            || e.contains("no longer available")
+    };
+
+    // --- first play: over the network, filling the cache ---
+    {
+        let recorder = Recorder::default();
+        let handle = player::spawn(
+            recorder.clone(),
+            db.pool.clone(),
+            Some(std::path::PathBuf::from("ffmpeg")),
+            Some(std::path::PathBuf::from("yt-dlp")),
+            Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
+        );
+
+        handle
+            .send(PlayerCommand::PlayQueue {
+                track_ids: vec![track_id],
+                start_index: 0,
+                context_name: None,
+            })
+            .unwrap();
+
+        // Resolve, then let the whole 19-second clip run to its end.
+        tokio::time::sleep(Duration::from_secs(45)).await;
+
+        let errors = recorder.0.errors.lock().unwrap().clone();
+        if errors.iter().any(skippable) {
+            eprintln!("SKIP: upstream/environment condition ({errors:?})");
+            return;
+        }
+        // Dropping the handle stops playback, which is what commits the entry.
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let cached: Vec<_> = std::fs::read_dir(&cache_dir)
+        .map(|d| d.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    eprintln!("cache contents: {cached:?}");
+
+    assert!(
+        cached.iter().any(|name| name.to_string_lossy().ends_with(".mka")),
+        "nothing was cached; the second ffmpeg output never landed"
+    );
+    assert!(
+        !cached.iter().any(|name| name.to_string_lossy().contains(".part.")),
+        "a partial file was left behind: {cached:?}"
+    );
+
+    // --- second play: no yt-dlp, so the network is not an option ---
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        Some(std::path::PathBuf::from("ffmpeg")),
+        // The whole point: there is no way to resolve a stream now.
+        None,
+        Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
+    );
+
+    let started = std::time::Instant::now();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    let progress = recorder.0.progress.lock().unwrap().clone();
+    eprintln!("replay errors: {errors:?}");
+    eprintln!("replay took: {:?}", started.elapsed());
+
+    assert!(
+        errors.is_empty(),
+        "the cached replay should need nothing external: {errors:?}"
+    );
+    assert!(
+        progress.iter().any(|p| *p > 0.0),
+        "the cached copy did not play (got {progress:?})"
     );
 
     db.pool.close().await;

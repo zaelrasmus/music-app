@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 use rodio::{ChannelCount, Sample, SampleRate, Source};
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 
+use crate::audio_cache::PendingCache;
+
 /// What we ask ffmpeg to produce. Matching rodio's native sample type means the
 /// bytes off the pipe are already the samples we hand to the mixer -- no
 /// conversion, no allocation.
@@ -51,6 +53,9 @@ pub struct FfmpegSource {
     /// Set by the reader thread once ffmpeg's output ends.
     finished: Arc<AtomicBool>,
     child: Child,
+    /// A cache copy being written alongside playback, committed on `Drop`
+    /// only if ffmpeg got all the way to the end.
+    pending_cache: Option<PendingCache>,
 }
 
 /// What ffmpeg should read.
@@ -80,7 +85,7 @@ impl FfmpegInput<'_> {
 impl FfmpegSource {
     /// Starts ffmpeg on `input` and waits for enough audio to begin smoothly.
     pub fn open(ffmpeg: &Path, input: FfmpegInput<'_>) -> Result<Self, String> {
-        Self::open_at(ffmpeg, input, Duration::ZERO)
+        Self::open_at(ffmpeg, input, Duration::ZERO, None)
     }
 
     /// Same, but beginning `start` into the audio.
@@ -93,6 +98,7 @@ impl FfmpegSource {
         ffmpeg: &Path,
         input: FfmpegInput<'_>,
         start: Duration,
+        cache: Option<PendingCache>,
     ) -> Result<Self, String> {
         let mut command = Command::new(ffmpeg);
         command.arg("-hide_banner").args(["-loglevel", "error"]);
@@ -120,12 +126,24 @@ impl FfmpegSource {
             FfmpegInput::Url(url) => command.arg(url),
         };
 
-        let mut child = command
+        command
             // Drop any cover art, then emit bare interleaved f32.
             .args(["-vn", "-f", "f32le", "-acodec", "pcm_f32le"])
             .args(["-ar", &OUTPUT_RATE.to_string()])
             .args(["-ac", &OUTPUT_CHANNELS.to_string()])
-            .arg("-")
+            .arg("-");
+
+        // A second output from the same decode. ffmpeg reads the input once
+        // and writes both, so the cache copy costs no extra network traffic --
+        // it is the bytes already arriving, stream-copied rather than
+        // re-encoded, so what lands is exactly what the provider sent.
+        if let Some(pending) = &cache {
+            command
+                .args(["-vn", "-c", "copy", "-f", "matroska"])
+                .arg(&pending.partial);
+        }
+
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -148,6 +166,7 @@ impl FfmpegSource {
             consumer,
             finished,
             child,
+            pending_cache: cache,
         };
 
         source.wait_for_prefill()?;
@@ -310,9 +329,28 @@ impl Source for FfmpegSource {
 
 impl Drop for FfmpegSource {
     fn drop(&mut self) {
-        // Without this, ffmpeg lives on writing into a pipe nobody reads.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // The reader saw the output end, which only happens when ffmpeg closed
+        // its stdout -- so it is exiting on its own and worth waiting for.
+        // Otherwise this is a skip or a seek, and it has to be killed before it
+        // lives on writing into a pipe nobody reads.
+        let ended = self.finished.load(Ordering::Acquire);
+        if !ended {
+            let _ = self.child.kill();
+        }
+        let status = self.child.wait().ok();
+
+        let Some(pending) = self.pending_cache.take() else {
+            return;
+        };
+
+        // Only a clean, complete run produces a usable cache entry. Anything
+        // else leaves a truncated song, which would be worse than no cache at
+        // all -- it would play and then stop early for no visible reason.
+        if ended && status.is_some_and(|s| s.success()) {
+            pending.commit();
+        } else {
+            pending.discard();
+        }
     }
 }
 

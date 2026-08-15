@@ -1,4 +1,4 @@
-cduse std::collections::VecDeque;
+use std::collections::VecDeque;
 
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -292,6 +292,19 @@ impl PlayerQueue {
 
     pub fn context_upcoming(&self, limit: usize) -> Vec<i64> {
         self.context.upcoming(limit)
+    }
+
+    /// What [`Self::on_next`] would return, without consuming anything.
+    ///
+    /// Same priority rule, read-only: the manual queue first, then the
+    /// context. Exists so the coordinator can resolve the next track's stream
+    /// ahead of time, which is only worth doing if it agrees with what will
+    /// actually play.
+    pub fn peek_next(&self) -> Option<i64> {
+        if let Some(entry) = self.manual.front() {
+            return Some(entry.track_id);
+        }
+        self.context.upcoming(1).first().copied()
     }
 
     /// How many context tracks follow the current one in total, ignoring any
@@ -862,6 +875,52 @@ mod tests {
 
         assert_eq!(q.manual_len(), 0);
         assert_eq!(q.on_finished(), Some(2), "the context is untouched");
+    }
+
+    // --- peeking -----------------------------------------------------------
+
+    /// The peek has to agree with the advance, or prefetching warms the wrong
+    /// track and the gap it was meant to remove comes back.
+    #[test]
+    fn peeking_agrees_with_advancing() {
+        let mut q = queue_of(4);
+        q.enqueue_last(99);
+        q.enqueue_last(98);
+
+        for _ in 0..5 {
+            let peeked = q.peek_next();
+            assert_eq!(peeked, q.on_next(), "peek disagreed with the advance");
+        }
+    }
+
+    #[test]
+    fn peeking_agrees_with_advancing_under_shuffle() {
+        let mut q = queue_of(30);
+        q.set_shuffle(true);
+
+        for _ in 0..10 {
+            let peeked = q.peek_next();
+            assert_eq!(peeked, q.on_next());
+        }
+    }
+
+    #[test]
+    fn peeking_changes_nothing() {
+        let mut q = queue_of(3);
+        q.enqueue_last(99);
+
+        q.peek_next();
+        q.peek_next();
+
+        assert_eq!(q.manual_len(), 1, "peeking consumed a queued track");
+        assert_eq!(q.current(), Some(1), "peeking moved the cursor");
+    }
+
+    #[test]
+    fn there_is_nothing_to_peek_at_the_end() {
+        let mut q = queue_of(2);
+        q.on_next();
+        assert_eq!(q.peek_next(), None);
     }
 
     // --- the preview -------------------------------------------------------

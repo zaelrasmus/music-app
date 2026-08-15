@@ -1,3 +1,4 @@
+pub mod audio_cache;
 pub mod db;
 mod download;
 mod engine;
@@ -69,7 +70,17 @@ pub fn run() {
                 .ok()
                 .map(|found| found.path);
 
-            app.manage(player::spawn(app.handle().clone(), pool, ffmpeg, yt_dlp));
+            // Disposable copies of streamed audio, so replaying or seeking
+            // backwards does not fetch the same bytes twice.
+            let audio_cache = audio_cache::AudioCache::new(data_dir.join("cache").join("audio"));
+
+            app.manage(player::spawn(
+                app.handle().clone(),
+                pool,
+                ffmpeg,
+                yt_dlp,
+                Some(audio_cache),
+            ));
 
             Ok(())
         })

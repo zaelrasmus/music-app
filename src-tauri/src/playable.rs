@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use sqlx::FromRow;
 
+use crate::audio_cache::{AudioCache, PendingCache};
 use crate::providers::Provider;
 use crate::stream_urls::StreamUrlCache;
 
@@ -11,6 +12,7 @@ use crate::stream_urls::StreamUrlCache;
 pub struct PlayableTrack {
     pub source: String,
     pub state: String,
+    pub remote_id: Option<String>,
     pub local_path: Option<String>,
     /// The provider's page for this track. Stored rather than derived: a
     /// SoundCloud URL cannot be rebuilt from its numeric id.
@@ -40,7 +42,11 @@ pub enum PlayableSource {
     /// wrong by tomorrow. It *is* cached in memory for its stated lifetime --
     /// see [`crate::stream_urls`] -- which is what keeps a replay from costing
     /// another seven seconds.
-    Stream(String),
+    Stream {
+        url: String,
+        /// Where to keep a copy, when this is worth caching.
+        cache: Option<PendingCache>,
+    },
 }
 
 /// The single seam between "a track in the database" and "audio to play".
@@ -52,6 +58,7 @@ pub async fn get_playable_source(
     track: &PlayableTrack,
     yt_dlp: Option<&std::path::Path>,
     stream_urls: &StreamUrlCache,
+    audio_cache: Option<&AudioCache>,
 ) -> Result<PlayableSource, String> {
     if track.source != "local" {
         // Any non-local source is a provider. Unknown ones fail here rather
@@ -64,6 +71,18 @@ pub async fn get_playable_source(
         // track and needs no network at all.
         if let Some(path) = track.local_path.as_deref() {
             return Ok(decode_route(PathBuf::from(path)));
+        }
+
+        // Cached from an earlier play: the bytes are already on disk, so this
+        // needs no network at all -- and seeking backwards through it becomes
+        // instant, because a file seeks natively.
+        let cached = track
+            .remote_id
+            .as_deref()
+            .zip(audio_cache)
+            .and_then(|(id, cache)| cache.lookup(&track.source, id));
+        if let Some(path) = cached {
+            return Ok(PlayableSource::Transcoded(path));
         }
 
         // Saved: metadata only. The audio has to be fetched now.
@@ -92,7 +111,15 @@ pub async fn get_playable_source(
         // Cached where possible: resolving costs a yt-dlp process and ~7
         // seconds, and the URLs stay valid for hours.
         let stream = stream_urls.resolve(yt_dlp, url).await?;
-        return Ok(PlayableSource::Stream(stream));
+
+        // Reserved now so the decode can write the cache copy as it plays.
+        let cache = track
+            .remote_id
+            .as_deref()
+            .zip(audio_cache)
+            .and_then(|(id, cache)| cache.reserve(&track.source, id));
+
+        return Ok(PlayableSource::Stream { url: stream, cache });
     }
 
     // Local file.
@@ -133,6 +160,7 @@ mod tests {
         PlayableTrack {
             source: source.to_string(),
             state: state.to_string(),
+            remote_id: None,
             local_path: path.map(str::to_string),
             remote_url: None,
         }
@@ -147,6 +175,7 @@ mod tests {
         PlayableTrack {
             source: source.to_string(),
             state: state.to_string(),
+            remote_id: Some("dQw4w9WgXcQ".to_string()),
             local_path: path.map(str::to_string),
             remote_url: url.map(str::to_string),
         }
@@ -157,7 +186,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_present_local_track_resolves_to_its_file() {
-        let resolved = get_playable_source(&track("local", "present", Some(r"D:\a.mp3")), None, &StreamUrlCache::default())
+        let resolved = get_playable_source(&track("local", "present", Some(r"D:\a.mp3")), None, &StreamUrlCache::default(), None)
             .await
             .expect("should resolve");
 
@@ -171,7 +200,7 @@ mod tests {
     /// marked for ffmpeg rather than handed to rodio.
     #[tokio::test]
     async fn an_opus_track_resolves_to_the_transcode_route() {
-        let resolved = get_playable_source(&track("local", "present", Some(r"D:\a.opus")), None, &StreamUrlCache::default())
+        let resolved = get_playable_source(&track("local", "present", Some(r"D:\a.opus")), None, &StreamUrlCache::default(), None)
             .await
             .expect("should resolve");
 
@@ -183,7 +212,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_local_track_fails_with_a_clear_message() {
-        let error = get_playable_source(&track("local", "missing", Some(r"D:\a.mp3")), None, &StreamUrlCache::default())
+        let error = get_playable_source(&track("local", "missing", Some(r"D:\a.mp3")), None, &StreamUrlCache::default(), None)
             .await
             .expect_err("missing tracks must not resolve");
         assert!(error.contains("missing from disk"), "got: {error}");
@@ -196,7 +225,7 @@ mod tests {
         for (source, url) in [("youtube", YT_URL), ("soundcloud", SC_URL)] {
             let track = remote_track(source, "downloaded", Some(r"D:\yt\abc.m4a"), Some(url));
 
-            let resolved = get_playable_source(&track, None, &StreamUrlCache::default())
+            let resolved = get_playable_source(&track, None, &StreamUrlCache::default(), None)
                 .await
                 .expect("a downloaded track needs no yt-dlp");
 
@@ -213,7 +242,7 @@ mod tests {
     #[tokio::test]
     async fn a_downloaded_opus_track_still_transcodes() {
         let track = remote_track("youtube", "downloaded", Some(r"D:\yt\abc.opus"), Some(YT_URL));
-        let resolved = get_playable_source(&track, None, &StreamUrlCache::default()).await.expect("resolves");
+        let resolved = get_playable_source(&track, None, &StreamUrlCache::default(), None).await.expect("resolves");
 
         assert!(matches!(resolved, PlayableSource::Transcoded(_)));
     }
@@ -221,7 +250,7 @@ mod tests {
     #[tokio::test]
     async fn a_saved_remote_track_needs_yt_dlp() {
         for (source, url) in [("youtube", YT_URL), ("soundcloud", SC_URL)] {
-            let error = get_playable_source(&remote_track(source, "saved", None, Some(url)), None, &StreamUrlCache::default())
+            let error = get_playable_source(&remote_track(source, "saved", None, Some(url)), None, &StreamUrlCache::default(), None)
                 .await
                 .expect_err("streaming without yt-dlp cannot work");
 
@@ -237,6 +266,7 @@ mod tests {
             &remote_track("soundcloud", "saved", None, Some(SC_URL)),
             None,
             &StreamUrlCache::default(),
+            None,
         )
         .await
         .expect_err("no yt-dlp");
@@ -246,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_remote_row_without_a_url_is_reported_as_corrupt() {
-        let error = get_playable_source(&remote_track("youtube", "saved", None, None), None, &StreamUrlCache::default())
+        let error = get_playable_source(&remote_track("youtube", "saved", None, None), None, &StreamUrlCache::default(), None)
             .await
             .expect_err("a saved track with no URL is unplayable");
 
@@ -262,6 +292,7 @@ mod tests {
             &remote_track("soundcloud", "saved", None, Some(YT_URL)),
             Some(std::path::Path::new("yt-dlp")),
         &StreamUrlCache::default(),
+        None,
         )
         .await
         .expect_err("mismatched URL must not resolve");
@@ -271,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_source_fails_instead_of_being_treated_as_local() {
-        let error = get_playable_source(&remote_track("bandcamp", "saved", None, None), None, &StreamUrlCache::default())
+        let error = get_playable_source(&remote_track("bandcamp", "saved", None, None), None, &StreamUrlCache::default(), None)
             .await
             .expect_err("an unknown provider cannot resolve");
 
