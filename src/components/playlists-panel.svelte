@@ -16,6 +16,7 @@
     import TagFilter from "$components/tag-filter.svelte";
     import TrackActions from "$components/track-actions.svelte";
     import SourceBadge from "$components/source-badge.svelte";
+    import { cacheStore } from "$lib/cache.svelte";
 
     let newName = $state("");
     let renaming = $state(false);
@@ -290,6 +291,7 @@
                                 source={track.source}
                                 state={track.state}
                                 durationSecs={track.durationSecs}
+                                cached={cacheStore.isCached(track.id)}
                             />
                         </span>
 

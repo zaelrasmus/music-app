@@ -7,6 +7,8 @@
     import ProviderSearch from "$components/provider-search.svelte";
     import { providerSearch } from "$lib/provider-search.svelte";
     import { cacheStore } from "$lib/cache.svelte";
+    import { historyStore } from "$lib/history.svelte";
+    import HistoryPanel from "$components/history-panel.svelte";
     import CacheSettings from "$components/cache-settings.svelte";
     import PlaylistsPanel from "$components/playlists-panel.svelte";
     import LibraryView from "$components/library-view.svelte";
@@ -26,6 +28,7 @@
         libraryView.refresh();
         providerSearch.loadProviders();
         cacheStore.restore();
+        historyStore.load();
         player.restorePreferences().then(() => player.restorePlayback());
 
         const scans = trackStore.listenForScans();
@@ -125,6 +128,8 @@
             {/if}
         </p>
     {/if}
+
+    <HistoryPanel />
 
     <CacheSettings />
 

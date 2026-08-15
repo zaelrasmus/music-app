@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "svelte-sonner";
 import { readSetting, writeSetting } from "$lib/settings.svelte";
+import { cacheStore } from "$lib/cache.svelte";
+import { historyStore } from "$lib/history.svelte";
 
 export type PlaybackState = "loading" | "playing" | "paused" | "stopped";
 export type RepeatMode = "off" | "all" | "one";
@@ -82,6 +84,7 @@ class PlayerStore {
   async listenForPlayer() {
     const unlistenState = await listen<PlayerStatus>("player-state", (e) => {
       const s = e.payload;
+      const previousTrack = this.trackId;
       this.state = s.state;
       this.trackId = s.trackId;
       this.repeat = s.repeat;
@@ -92,6 +95,15 @@ class PlayerStore {
       this.contextPosition = s.contextPosition;
       this.manualLength = s.manualLength;
       this.stalled = s.stalled;
+
+      // Leaving a track is when one most often becomes cached, so this is the
+      // moment the badges elsewhere go stale.
+      if (s.trackId !== previousTrack) {
+        void cacheStore.refreshCached();
+        // The track just left may have become a history entry; the backend
+        // decides whether it counted, so ask rather than guess.
+        void historyStore.load();
+      }
 
       // Only when nothing is shown at all. A stopped state with a track
       // still in the bar is where the user left off -- including the one

@@ -28,6 +28,14 @@ pub const PLAYER_QUEUE_EVENT: &str = "player-queue";
 /// restarts the current one. Matches what every other player does.
 const RESTART_THRESHOLD: Duration = Duration::from_secs(3);
 
+/// How long a track must play before it counts as played.
+///
+/// Counting on *start* would fill the history with everything skipped past
+/// while looking for something, which is the opposite of what a recently
+/// played list is for. Thirty seconds is the convention, and short tracks are
+/// covered by counting a natural end regardless.
+const PLAY_COUNTS_AFTER: Duration = Duration::from_secs(30);
+
 /// How much of a track must have played before an abandoned listen is worth
 /// fetching a complete copy of.
 ///
@@ -307,6 +315,9 @@ struct Coordinator<E: PlayerEvents> {
     keep_abandoned: bool,
     /// How far the current track has played, for judging that.
     last_position: Duration,
+    /// Whether this play has already been recorded, so a long listen counts
+    /// once rather than on every tick.
+    recorded_play: bool,
     /// Whether the current decode began at the very start of the track.
     ///
     /// Only such a decode writes a cache copy, so a track that was seeked in
@@ -362,6 +373,7 @@ pub fn spawn<E: PlayerEvents>(
             prepares: prepares_tx,
             keep_abandoned: false,
             last_position: Duration::ZERO,
+            recorded_play: false,
             covered_from_zero: true,
             fetching: Arc::new(Mutex::new(std::collections::HashSet::new())),
             stalled: false,
@@ -574,6 +586,9 @@ impl<E: PlayerEvents> Coordinator<E> {
                     return;
                 }
 
+                // Reaching the end counts however short the track was.
+                self.record_play();
+
                 // A track that was seeked in reaches its end having written
                 // nothing: the decode never covered it from the start. That is
                 // not an abandonment, so only this notices.
@@ -606,6 +621,9 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // a second that would churn the whole UI.
                 if epoch == self.epoch {
                     self.last_position = position;
+                    if position >= PLAY_COUNTS_AFTER {
+                        self.record_play();
+                    }
                     self.emit_progress(position);
                 }
             }
@@ -718,6 +736,7 @@ impl<E: PlayerEvents> Coordinator<E> {
         // must not leak into whatever plays after it.
         let start_at = self.resume_at.take().unwrap_or(Duration::ZERO);
         self.covered_from_zero = start_at.is_zero();
+        self.recorded_play = false;
 
         // Prepared while the previous track was still playing: the process is
         // running and the buffer is full, so this is a hand-off rather than a
@@ -944,6 +963,31 @@ impl<E: PlayerEvents> Coordinator<E> {
         // does not yet know about, and it learns the track from the state.
         self.emit_state();
         self.emit_progress(Duration::from_secs_f64(position));
+    }
+
+    /// Notes that the current track was really listened to.
+    ///
+    /// Fire-and-forget: a history entry is not worth making anyone wait for,
+    /// and losing one to a failed write costs nothing that matters.
+    fn record_play(&mut self) {
+        if self.recorded_play {
+            return;
+        }
+        let Some(track_id) = self.loaded else {
+            return;
+        };
+        self.recorded_play = true;
+
+        let pool = self.pool.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = sqlx::query(
+                "UPDATE tracks SET last_played = unixepoch(), \
+                 play_count = play_count + 1 WHERE id = ?",
+            )
+            .bind(track_id)
+            .execute(&pool)
+            .await;
+        });
     }
 
     /// A track is being left part-way through. Decide whether to keep it.

@@ -4,6 +4,7 @@
     import AddToPlaylist from "$components/add-to-playlist.svelte";
     import TrackActions from "$components/track-actions.svelte";
     import SourceBadge from "$components/source-badge.svelte";
+    import { cacheStore } from "$lib/cache.svelte";
     import { player } from "$lib/player.svelte";
     import { trackStore, type Track } from "$lib/tracks.svelte";
     import { tagStore } from "$lib/tags.svelte";
@@ -139,6 +140,7 @@
                     source={track.source}
                     state={track.state}
                     durationSecs={track.durationSecs}
+                    cached={cacheStore.isCached(track.id)}
                 />
             </span>
 

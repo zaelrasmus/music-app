@@ -1340,3 +1340,105 @@ async fn the_offline_copy_guards_hold() {
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A play is recorded once it means something, and only once.
+///
+/// The threshold matters more than it looks: counting a play on *start* would
+/// fill the history with everything skipped past while hunting for a song,
+/// which is the opposite of what a recently-played list is for. Reaching the
+/// end counts regardless, so short tracks are not excluded by it.
+#[tokio::test]
+async fn a_play_is_recorded_only_once_it_has_been_listened_to() {
+    let base = std::env::temp_dir().join("music-app-history");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    // Short enough to finish inside the test, and far below the 30s threshold,
+    // so only the natural end can record it.
+    let short = base.join("short.wav");
+    write_wav_secs(&short, 1);
+    let short_id: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+         VALUES ('local', 'Short', ?, 'present', 1) RETURNING id",
+    )
+    .bind(short.to_str().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    // Long, and abandoned almost immediately: it must not be recorded.
+    let long = base.join("long.wav");
+    write_wav_secs(&long, 120);
+    let long_id: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+         VALUES ('local', 'Long', ?, 'present', 120) RETURNING id",
+    )
+    .bind(long.to_str().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+
+    // Play the short one through to its end.
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![short_id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    if recorder
+        .0
+        .errors
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.contains("No audio output device"))
+    {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    // Then start the long one and walk away almost at once.
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![long_id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    handle.send(PlayerCommand::Stop).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let plays: Vec<(i64, i64, Option<i64>)> =
+        sqlx::query_as("SELECT id, play_count, last_played FROM tracks ORDER BY id")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    eprintln!("plays: {plays:?}");
+
+    let short_row = plays.iter().find(|(id, _, _)| *id == short_id).unwrap();
+    let long_row = plays.iter().find(|(id, _, _)| *id == long_id).unwrap();
+
+    assert_eq!(
+        short_row.1, 1,
+        "a track played to its end should count once, however short"
+    );
+    assert!(short_row.2.is_some(), "and should carry a played-at time");
+
+    assert_eq!(
+        long_row.1, 0,
+        "a track abandoned after a moment must not enter the history"
+    );
+    assert!(long_row.2.is_none());
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}

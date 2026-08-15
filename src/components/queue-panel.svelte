@@ -2,6 +2,7 @@
     import { Button } from "$components/ui/button";
     import { queueStore, type QueueEntry } from "$lib/queue.svelte";
     import SourceBadge from "$components/source-badge.svelte";
+    import { cacheStore } from "$lib/cache.svelte";
     import { player } from "$lib/player.svelte";
     import XIcon from "@lucide/svelte/icons/x";
     import GripVerticalIcon from "@lucide/svelte/icons/grip-vertical";
@@ -48,6 +49,7 @@
         source={entry.source}
         state={entry.state}
         durationSecs={entry.durationSecs}
+        cached={cacheStore.isCached(entry.trackId)}
         compact
     />
 {/snippet}

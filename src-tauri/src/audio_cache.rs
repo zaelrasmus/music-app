@@ -238,6 +238,20 @@ impl AudioCache {
         })
     }
 
+    /// Every entry currently in the cache, by file name.
+    ///
+    /// One directory read rather than a `lookup` per track: answering "which
+    /// of these hundreds of tracks are cached" one `is_file` at a time is a
+    /// syscall per row for a question the directory listing answers once.
+    pub fn cached_names(&self) -> std::collections::HashSet<String> {
+        std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect()
+    }
+
     pub fn used_bytes(&self) -> u64 {
         std::fs::read_dir(&self.dir)
             .into_iter()
@@ -294,6 +308,14 @@ fn evict(dir: &std::path::Path, max_bytes: u64) {
             }
         }
     }
+}
+
+/// The file name a track would have if it were cached.
+///
+/// Public so a caller can ask about a track without a filesystem hit per row,
+/// and shared with the writers so the two can never disagree about naming.
+pub fn entry_name(source: &str, remote_id: &str) -> String {
+    file_name(source, remote_id, EXTENSION)
 }
 
 /// Removes `base` and anything that extends it, which is how a decode's
@@ -373,6 +395,35 @@ pub async fn set_audio_cache_limit(
 pub async fn clear_audio_cache(cache: tauri::State<'_, AudioCache>) -> Result<CacheStats, String> {
     cache.clear();
     Ok(cache.stats())
+}
+
+/// Which of the user's tracks currently have a cached copy.
+///
+/// Recomputed on every call rather than stored: an entry can be evicted at any
+/// moment, and a remembered answer would be another silently-wrong cache --
+/// a track shown as playable offline that is not.
+#[tauri::command]
+pub async fn cached_track_ids(
+    db: tauri::State<'_, crate::db::Db>,
+    cache: tauri::State<'_, AudioCache>,
+) -> Result<Vec<i64>, String> {
+    let names = cache.cached_names();
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id, source, remote_id FROM tracks WHERE remote_id IS NOT NULL",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(rows
+        .into_iter()
+        .filter(|(_, source, remote_id)| names.contains(&entry_name(source, remote_id)))
+        .map(|(id, _, _)| id)
+        .collect())
 }
 
 #[cfg(test)]

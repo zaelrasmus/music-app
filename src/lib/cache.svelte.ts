@@ -39,6 +39,14 @@ class CacheStore {
    * way, so turning this off does not mean nothing is kept.
    */
   keepAbandoned = $state(false);
+  /**
+   * Tracks with a cached copy right now.
+   *
+   * Refetched rather than remembered: an entry can be evicted at any moment,
+   * and showing a track as playable offline when it is not would be the same
+   * silent wrongness the cache rules exist to prevent.
+   */
+  cachedIds = $state<Set<number>>(new Set());
   usedBytes = $state(0);
   limitBytes = $state(1024 * MB);
   busy = $state(false);
@@ -61,6 +69,21 @@ class CacheStore {
 
   async refresh() {
     await this.run("audio_cache_stats");
+    await this.refreshCached();
+  }
+
+  /** Cheap: one directory read and one query, not a lookup per row. */
+  async refreshCached() {
+    try {
+      const ids = await invoke<number[]>("cached_track_ids");
+      this.cachedIds = new Set(ids);
+    } catch {
+      // Purely decorative. A failure here must not disturb playback.
+    }
+  }
+
+  isCached(trackId: number) {
+    return this.cachedIds.has(trackId);
   }
 
   async setKeepAbandoned(enabled: boolean) {

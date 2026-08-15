@@ -16,11 +16,22 @@
          * as exactly 30 seconds.
          */
         durationSecs?: number | null;
+        /**
+         * A cached copy exists, so this plays without a connection -- but only
+         * until the cache needs the room back.
+         */
+        cached?: boolean;
         /** Smaller type, for the queue panel's tighter rows. */
         compact?: boolean;
     }
 
-    let { source, state, durationSecs = null, compact = false }: Props = $props();
+    let {
+        source,
+        state,
+        durationSecs = null,
+        cached = false,
+        compact = false,
+    }: Props = $props();
 
     const PROVIDER_NAMES: Record<string, string> = {
         youtube: "YouTube",
@@ -46,6 +57,16 @@
         <span
             class="text-primary border-primary/40 rounded border px-1 {size}"
             title="Saved to disk from {providerName}; plays offline"
+        >
+            {providerName} · offline
+        </span>
+    {:else if cached}
+        <!-- The same promise as a download -- it plays offline -- but
+             deliberately not the same weight, because this copy is ours to
+             reclaim rather than the listener's to keep. -->
+        <span
+            class="text-muted-foreground border-muted-foreground/40 rounded border px-1 {size}"
+            title="Kept from an earlier play, so it works offline. May be removed to free space."
         >
             {providerName} · offline
         </span>

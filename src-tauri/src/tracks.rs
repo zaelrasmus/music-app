@@ -33,6 +33,29 @@ pub async fn list_tracks(db: State<'_, Db>) -> Result<Vec<Track>, String> {
     .map_err(|e| e.to_string())
 }
 
+/// The tracks played most recently, newest first.
+///
+/// Reads straight from `tracks` rather than keeping a history table: a play
+/// is already an attribute of the track, and a separate log would need pruning
+/// and could disagree with the row it points at.
+///
+/// The limit is a display choice, not a storage one -- nothing is discarded by
+/// asking for fewer.
+#[tauri::command]
+pub async fn recently_played(db: State<'_, Db>, limit: Option<u32>) -> Result<Vec<Track>, String> {
+    let limit = limit.unwrap_or(50).clamp(1, 500);
+
+    sqlx::query_as(
+        "SELECT id, source, title, artist, album, duration_secs, state \
+         FROM tracks WHERE last_played IS NOT NULL \
+         ORDER BY last_played DESC LIMIT ?",
+    )
+    .bind(limit)
+    .fetch_all(&db.pool)
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Rescans every registered folder.
 ///
 /// Returns `None` if a scan is already running, so the caller can say so
