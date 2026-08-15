@@ -11,7 +11,12 @@ use crate::engine::{self, AudioEngine, EngineEvent, SUPERSEDED};
 use crate::audio_cache::AudioCache;
 use crate::playable::{get_playable_source, PlayableSource, PlayableTrack};
 use crate::providers::Provider;
-use crate::queue::{PlayerQueue, RepeatMode};
+use crate::queue::PlayerQueue;
+
+/// Re-exported because it already forms part of this module public surface --
+/// `PlayerCommand::SetRepeat` takes one and `PlayerStatus` returns one -- and
+/// a type you can be handed but cannot name is no use to a caller.
+pub use crate::queue::RepeatMode;
 use crate::stream_urls::StreamUrlCache;
 
 pub const PLAYER_STATE_EVENT: &str = "player-state";
@@ -302,6 +307,12 @@ struct Coordinator<E: PlayerEvents> {
     keep_abandoned: bool,
     /// How far the current track has played, for judging that.
     last_position: Duration,
+    /// Whether the current decode began at the very start of the track.
+    ///
+    /// Only such a decode writes a cache copy, so a track that was seeked in
+    /// reaches its end with nothing kept -- and a natural end is not an
+    /// abandonment, so nothing else would notice.
+    covered_from_zero: bool,
     /// Tracks already being fetched, so leaving the same one twice does not
     /// start two downloads of it.
     fetching: Arc<Mutex<std::collections::HashSet<i64>>>,
@@ -351,6 +362,7 @@ pub fn spawn<E: PlayerEvents>(
             prepares: prepares_tx,
             keep_abandoned: false,
             last_position: Duration::ZERO,
+            covered_from_zero: true,
             fetching: Arc::new(Mutex::new(std::collections::HashSet::new())),
             stalled: false,
             stalled_since: None,
@@ -528,7 +540,11 @@ impl<E: PlayerEvents> Coordinator<E> {
                     match self.engine.seek(position).await {
                         // Echo the new position straight away rather than
                         // leaving the bar stale until the next tick.
-                        Ok(()) => self.emit_progress(position),
+                        Ok(()) => {
+                            self.covered_from_zero = false;
+                            self.last_position = position;
+                            self.emit_progress(position);
+                        }
                         Err(e) => {
                             // Some sources genuinely cannot be restarted --
                             // say so and carry on playing from where we were.
@@ -556,6 +572,13 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // a double advance.
                 if epoch != self.epoch {
                     return;
+                }
+
+                // A track that was seeked in reaches its end having written
+                // nothing: the decode never covered it from the start. That is
+                // not an abandonment, so only this notices.
+                if !self.covered_from_zero {
+                    self.consider_offline_copy();
                 }
 
                 // The engine dropped its player, so nothing is decoded any
@@ -694,6 +717,7 @@ impl<E: PlayerEvents> Coordinator<E> {
         // Consumed here: a resume applies to the track being resumed, and
         // must not leak into whatever plays after it.
         let start_at = self.resume_at.take().unwrap_or(Duration::ZERO);
+        self.covered_from_zero = start_at.is_zero();
 
         // Prepared while the previous track was still playing: the process is
         // running and the buffer is full, so this is a hand-off rather than a

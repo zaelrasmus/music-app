@@ -15,6 +15,7 @@ use music_app_lib::player::{
 
 #[derive(Default)]
 struct Captured {
+    progress: Mutex<Vec<f64>>,
     states: Mutex<Vec<PlayerStatus>>,
     errors: Mutex<Vec<String>>,
     queues: Mutex<Vec<QueueState>>,
@@ -28,7 +29,9 @@ impl PlayerEvents for Recorder {
         self.0.states.lock().unwrap().push(status);
     }
 
-    fn progress(&self, _progress: PlayerProgress) {}
+    fn progress(&self, progress: PlayerProgress) {
+        self.0.progress.lock().unwrap().push(progress.position_secs);
+    }
 
     fn error(&self, message: String) {
         self.0.errors.lock().unwrap().push(message);
@@ -51,6 +54,10 @@ impl Recorder {
             }
         }
         order
+    }
+
+    fn progress(&self) -> Vec<f64> {
+        self.0.progress.lock().unwrap().clone()
     }
 
     fn no_audio_device(&self) -> bool {
@@ -298,6 +305,63 @@ async fn skipping_an_unplayable_track_still_honours_the_queue() {
     assert!(
         played.contains(&ids[3]),
         "the queued track was consumed while skipping a dead one: {played:?}"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Repeat-one re-decodes from the very start of the track.
+///
+/// This is what makes a seeked listen self-heal: only a decode that covers a
+/// track from zero may write a cache copy, so a loop that restarted partway
+/// would leave a looping track permanently uncacheable. It currently holds
+/// because `on_finished` under repeat-one returns the same track and the
+/// coordinator loads it with no resume offset -- both incidental-looking
+/// details that this pins down.
+#[tokio::test]
+async fn a_repeated_track_starts_each_loop_from_the_beginning() {
+    let base = std::env::temp_dir().join("music-app-repeat-from-zero");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let (db, ids) = fixture(&base, 400).await;
+    let track = ids[0];
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+    handle
+        .send(PlayerCommand::SetRepeat(
+            music_app_lib::player::RepeatMode::One,
+        ))
+        .unwrap();
+
+    // Long enough for several loops of a 400ms clip.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    if recorder.no_audio_device() {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    let positions = recorder.progress();
+    eprintln!("positions across loops: {positions:?}");
+
+    // Every loop must be seen starting at zero. If a loop resumed partway,
+    // the run of positions would never return to the beginning.
+    let restarts = positions.iter().filter(|p| **p == 0.0).count();
+    assert!(
+        restarts >= 2,
+        "the track never restarted from zero, so loops are not fresh decodes \
+         (got {positions:?})"
     );
 
     db.pool.close().await;

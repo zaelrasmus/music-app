@@ -31,6 +31,14 @@ use serde::Serialize;
 /// against letting people see the number and change it.
 const DEFAULT_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Distinguishes one decode's temp file from another's.
+///
+/// A reservation is made once per track but can be *used* more than once --
+/// seeking rebuilds the decode, and a seek back to the very start rebuilds it
+/// with caching still enabled. Two decodes sharing a temp path meant the
+/// second opened the file and the first then deleted it on its way out.
+static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
+
 /// Floor, so a mistyped setting cannot quietly make caching useless.
 const MIN_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -67,6 +75,24 @@ pub struct PendingCache {
 }
 
 impl PendingCache {
+    /// A copy of this reservation with a temp file of its own.
+    ///
+    /// Called once per decode, so overlapping decodes of the same track never
+    /// touch the same bytes. They still share a destination, and the rename
+    /// onto it is atomic -- exactly the arrangement the background fetch uses.
+    pub fn for_decode(&self) -> PendingCache {
+        let nonce = NEXT_WRITE.fetch_add(1, Ordering::Relaxed);
+        let mut partial = self.partial.clone().into_os_string();
+        partial.push(format!(".{nonce}"));
+
+        PendingCache {
+            partial: PathBuf::from(partial),
+            complete: self.complete.clone(),
+            dir: self.dir.clone(),
+            max_bytes: Arc::clone(&self.max_bytes),
+        }
+    }
+
     /// Publishes the write, then brings the cache back under its cap.
     pub fn commit(self) {
         if std::fs::rename(&self.partial, &self.complete).is_err() {
@@ -169,7 +195,11 @@ impl AudioCache {
             .dir
             .join(file_name(source, remote_id, &format!("part.{EXTENSION}")));
 
-        let _ = std::fs::remove_file(&partial);
+        // Sweeps every temp file for this track, not just the bare base:
+        // decodes append a nonce, so a crash can leave several behind and they
+        // would otherwise sit in the cache eating its budget forever.
+        sweep_partials(&self.dir, &partial);
+
         Some(PendingCache {
             partial,
             complete,
@@ -262,6 +292,29 @@ fn evict(dir: &std::path::Path, max_bytes: u64) {
             if std::fs::remove_file(&path).is_ok() {
                 total = total.saturating_sub(size);
             }
+        }
+    }
+}
+
+/// Removes `base` and anything that extends it, which is how a decode's
+/// temp file is named.
+fn sweep_partials(dir: &std::path::Path, base: &std::path::Path) {
+    let _ = std::fs::remove_file(base);
+
+    let Some(prefix) = base.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(prefix))
+        {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
@@ -491,6 +544,63 @@ mod tests {
         cache.clear();
         assert_eq!(cache.used_bytes(), 0);
         assert!(cache.lookup("youtube", "a").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bug this guards against was reachable from the Previous button.
+    ///
+    /// Rewinding to the very start rebuilds the decode with caching still
+    /// enabled, so two decodes of one track briefly overlap. Sharing a temp
+    /// file meant the outgoing one deleted the file the incoming one had just
+    /// opened -- and it only appeared to work because Windows refuses to
+    /// delete a file another process holds open.
+    #[test]
+    fn two_decodes_of_one_track_never_share_a_temp_file() {
+        let dir = temp_dir("overlap");
+        let cache = AudioCache::new(dir.clone());
+
+        let reserved = cache.reserve("youtube", "abc").unwrap();
+        let first = reserved.for_decode();
+        let second = reserved.for_decode();
+
+        assert_ne!(
+            first.partial, second.partial,
+            "overlapping decodes wrote to the same file"
+        );
+        // They still land in the same place, so whichever finishes wins.
+        assert_eq!(first.complete, second.complete);
+
+        // And the loser tidying up must not take the winner with it.
+        std::fs::write(&first.partial, b"first").unwrap();
+        std::fs::write(&second.partial, b"second").unwrap();
+        first.discard();
+        assert!(
+            second.partial.is_file(),
+            "discarding one decode deleted the other one work"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash can leave several nonce-suffixed temp files behind; the next
+    /// reservation for that track must clear them, or they sit in the cache
+    /// consuming its budget with nothing able to use them.
+    #[test]
+    fn stale_temp_files_are_swept_on_the_next_reservation() {
+        let dir = temp_dir("sweep");
+        let cache = AudioCache::new(dir.clone());
+
+        let reserved = cache.reserve("youtube", "abc").unwrap();
+        for _ in 0..3 {
+            let orphan = reserved.for_decode();
+            std::fs::write(&orphan.partial, vec![0u8; 32]).unwrap();
+        }
+        assert!(cache.used_bytes() > 0);
+
+        // Reserving again is what a later play does.
+        let _ = cache.reserve("youtube", "abc").unwrap();
+        assert_eq!(cache.used_bytes(), 0, "orphaned temp files were not swept");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

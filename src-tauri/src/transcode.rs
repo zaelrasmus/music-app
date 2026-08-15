@@ -104,6 +104,12 @@ impl FfmpegSource {
         start: Duration,
         cache: Option<PendingCache>,
     ) -> Result<Self, String> {
+        // Its own temp file. The reservation is per *track*, but this is one
+        // decode of it, and a seek can leave two overlapping briefly -- the
+        // outgoing one deleting its temp file on the way out would otherwise
+        // take the incoming one's with it.
+        let cache = cache.map(|pending| pending.for_decode());
+
         let mut command = Command::new(ffmpeg);
         command.arg("-hide_banner").args(["-loglevel", "error"]);
 
