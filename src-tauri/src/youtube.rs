@@ -26,7 +26,7 @@ async fn run_at(yt_dlp: std::path::PathBuf, args: Vec<String>) -> Result<String,
     // a blocking process spawn. Running it inline would park a runtime worker
     // for that whole time, stalling every other command including playback.
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new(&yt_dlp).args(&args).output()
+        crate::sidecar::quiet(Command::new(&yt_dlp).args(&args)).output()
     })
     .await
     .map_err(|e| format!("yt-dlp task failed: {e}"))?

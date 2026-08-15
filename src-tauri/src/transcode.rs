@@ -111,6 +111,7 @@ impl FfmpegSource {
         let cache = cache.map(|pending| pending.for_decode());
 
         let mut command = Command::new(ffmpeg);
+        crate::sidecar::quiet(&mut command);
         command.arg("-hide_banner").args(["-loglevel", "error"]);
 
         if let FfmpegInput::Url(_) = input {

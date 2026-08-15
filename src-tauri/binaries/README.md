@@ -34,19 +34,46 @@ This is the easy mistake. A typical Windows ffmpeg install is a *shared* build:
 single executables and will **not** carry those DLLs, so a shared build fails
 at runtime with a missing-DLL error.
 
-Use a static build, where `ffmpeg.exe` is one self-contained file (~90-170 MB):
+Use a static build, where `ffmpeg.exe` is one self-contained file (~90-170 MB).
+From <https://github.com/BtbN/FFmpeg-Builds/releases>, the rule is the suffix:
 
-- <https://github.com/BtbN/FFmpeg-Builds/releases> — pick a `win64-*-shared`?
-  **no** — pick the non-shared (static) archive.
-- <https://www.gyan.dev/ffmpeg/builds/> — the "essentials" or "full" *release
-  build* (not the shared variant).
+| Asset                          | Use it? |
+| ------------------------------ | ------- |
+| `ffmpeg-…-win64-lgpl.zip`      | yes     |
+| `ffmpeg-…-win64-gpl.zip`       | works, but see licensing below |
+| `…-win64-lgpl-shared.zip`      | no      |
+| `…-win64-gpl-shared.zip`       | no      |
 
-Verify before bundling: the extracted `bin/ffmpeg.exe` should be tens of MB and
-have no sibling `av*.dll` files.
+**No `-shared` suffix means static.** That is the whole rule.
+
+### Verifying, before you trust it
+
+File size is not enough. Copy `ffmpeg.exe` *alone* into an empty directory and
+run it — this reproduces exactly what Tauri does to it at install time, where it
+lands beside the app executable and away from anything it shipped with:
+
+```powershell
+$iso = Join-Path $env:TEMP "ffmpeg-static-test"
+New-Item -ItemType Directory -Force $iso | Out-Null
+Copy-Item "<extracted>\bin\ffmpeg.exe" $iso
+& "$iso\ffmpeg.exe" -version
+```
+
+A static build prints its version banner. A shared build fails immediately with
+a missing-DLL error — the failure a user would otherwise hit on first play,
+surfaced in five seconds instead of in a bug report.
+
+Last verified with `ffmpeg-master-latest-win64-lgpl.zip` (N-126168, 110 MB).
 
 ### Licensing note
 
-Most prebuilt static Windows binaries are GPL builds (`--enable-gpl`). That is
-fine for personal use. If this app is ever distributed, prefer an LGPL build and
-ship the corresponding notices — audio-only decoding does not need the GPL-only
-components.
+Most prebuilt static Windows binaries are GPL builds (`--enable-gpl`), which
+would licence this app's whole distribution under the GPL. Prefer LGPL: nothing
+here needs the GPL-only components, which are video *encoders*. This app only
+decodes to raw PCM (`transcode.rs`), remuxes with `-c copy` for the offline
+cache, and encodes PNG for cover art.
+
+Confirm with the `configuration:` line that `ffmpeg -version` prints — an LGPL
+build shows `--disable-libx264 --disable-libx265 --disable-libfdk-aac`. Check
+also for `--enable-libopus` (Opus playback) and `--enable-schannel` (HTTPS,
+without which no remote stream can be fetched at all).

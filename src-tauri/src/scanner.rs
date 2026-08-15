@@ -431,7 +431,7 @@ fn read_metadata(path: &str, covers: Option<&CoverStore>) -> Option<Metadata> {
 
     Some(Metadata {
         title,
-        cover_key: covers.and_then(|store| extract_cover(tag, store)),
+        cover_key: covers.and_then(|store| extract_cover(tag, tagged.file_type(), path, store)),
         artist: tag.and_then(|t| t.artist()).and_then(non_empty),
         album: tag.and_then(|t| t.album()).and_then(non_empty),
         // lofty reports a zero duration when it cannot determine one; storing
@@ -450,20 +450,70 @@ fn read_metadata(path: &str, covers: Option<&CoverStore>) -> Option<Metadata> {
 /// A file with no picture, or one the decoder rejects, simply has no cover.
 /// Failing a scan over unreadable artwork would be losing a library to a
 /// broken JPEG.
-fn extract_cover(tag: Option<&lofty::tag::Tag>, covers: &CoverStore) -> Option<String> {
+fn extract_cover(
+    tag: Option<&lofty::tag::Tag>,
+    file_type: lofty::file::FileType,
+    path: &str,
+    covers: &CoverStore,
+) -> Option<String> {
+    if let Some(picture) = tag.and_then(preferred_picture) {
+        return store_cover(picture.data(), covers);
+    }
+
+    // MP4 keeps its artwork somewhere the unified tag cannot reach; see
+    // `mp4_cover`. Only reached when the tag yielded nothing, so files that do
+    // expose their picture normally never pay for the second read.
+    if file_type == lofty::file::FileType::Mp4 {
+        if let Some(bytes) = mp4_cover(path) {
+            return store_cover(&bytes, covers);
+        }
+    }
+
+    None
+}
+
+/// The picture to use, out of however many the tag carries.
+///
+/// Prefer the front cover when the file says which is which. Tags routinely
+/// carry a back cover, a disc scan and an artist photo alongside it, and any of
+/// those would be a strange thing to show as the track's artwork.
+fn preferred_picture(tag: &lofty::tag::Tag) -> Option<&lofty::picture::Picture> {
     use lofty::picture::PictureType;
 
-    let pictures = tag?.pictures();
-
-    // Prefer the front cover when the file says which is which. Tags routinely
-    // carry a back cover, a disc scan and an artist photo alongside it, and any
-    // of those would be a strange thing to show as the track's artwork.
-    let picture = pictures
+    let pictures = tag.pictures();
+    pictures
         .iter()
         .find(|p| p.pic_type() == PictureType::CoverFront)
-        .or_else(|| pictures.first())?;
+        .or_else(|| pictures.first())
+}
 
-    match covers.store(picture.data()) {
+/// Reads an MP4's cover art from the concrete tag.
+///
+/// `read_from_path` returns lofty's *unified* tag, and MP4 artwork does not
+/// survive the conversion into it: `Ilst::split_tag` looks up an `ItemKey` for
+/// each atom before it inspects the atom's data, and `covr` has no `ItemKey`,
+/// so the atom is skipped before the picture branch is ever reached. The
+/// picture is still in the file and still parsed -- only the unified view drops
+/// it -- so reading the concrete `Ilst` recovers it.
+///
+/// This costs a second parse of the file. It is confined to MP4s whose unified
+/// tag came back without a picture, and `cover_checked` means any one file pays
+/// it once, ever.
+fn mp4_cover(path: &str) -> Option<Vec<u8>> {
+    use lofty::config::ParseOptions;
+    use lofty::mp4::Mp4File;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mp4 = Mp4File::read_from(&mut file, ParseOptions::new()).ok()?;
+
+    // Every `covr` picture is typed `Other`, so there is no front cover to
+    // prefer here -- the first one is the cover.
+    let picture = mp4.ilst()?.pictures()?.next()?;
+    Some(picture.data().to_vec())
+}
+
+fn store_cover(bytes: &[u8], covers: &CoverStore) -> Option<String> {
+    match covers.store(bytes) {
         Ok(key) => Some(key),
         Err(e) => {
             // Expected in a real library, so never loud.
@@ -626,6 +676,76 @@ mod tests {
         assert_eq!(
             third.unchanged, 1,
             "a file already examined must not be read again, even with no art"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The MP4 regression.
+    ///
+    /// Nearly every file this app downloads is an `.m4a`, and every one of them
+    /// lost its artwork silently: lofty parses the `covr` atom correctly, but
+    /// the picture does not survive the conversion into the unified tag that
+    /// `read_from_path` returns (see `mp4_cover`). Nothing errored -- the
+    /// library simply had no covers, which looks exactly like untagged files.
+    ///
+    /// Built with ffmpeg rather than checked in as a fixture so the atom layout
+    /// is a real encoder's, not one we invented to match our own reader.
+    #[test]
+    fn an_mp4_keeps_its_artwork() {
+        let base = std::env::temp_dir().join(format!("music-app-mp4-cover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let art = base.join("art.jpg");
+        let song = base.join("song.m4a");
+
+        let jpeg = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "color=c=red:s=300x300:d=1"])
+            .args(["-frames:v", "1"])
+            .arg(&art)
+            .status();
+
+        match jpeg {
+            Ok(status) if status.success() => {}
+            _ => {
+                eprintln!("SKIP: ffmpeg is not available to build the fixture");
+                return;
+            }
+        }
+
+        let muxed = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=1"])
+            .arg("-i")
+            .arg(&art)
+            .args(["-map", "0:a", "-map", "1:v"])
+            .args(["-c:a", "aac", "-c:v", "mjpeg"])
+            .args(["-disposition:v", "attached_pic"])
+            .arg(&song)
+            .status();
+
+        assert!(
+            matches!(muxed, Ok(status) if status.success()),
+            "the fixture should mux"
+        );
+
+        let store = CoverStore::new(base.join("covers"));
+        let metadata =
+            read_metadata(song.to_str().unwrap(), Some(&store)).expect("the file should parse");
+
+        assert!(
+            metadata.cover_key.is_some(),
+            "an MP4 with embedded artwork must yield a cover"
+        );
+
+        // The key has to name a file that is really there, or every row would
+        // point at a broken image.
+        let key = metadata.cover_key.unwrap();
+        assert!(
+            base.join("covers").join(&key).is_file(),
+            "the stored cover {key} should exist on disk"
         );
 
         let _ = std::fs::remove_dir_all(&base);

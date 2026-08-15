@@ -1,6 +1,31 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use tauri::{AppHandle, Manager};
+
+/// Stops Windows opening a console window for a child process.
+///
+/// A GUI application has no console of its own, so Windows creates one for
+/// every child it spawns -- a black window that appears over the UI and stays
+/// for as long as the child lives. That is a flicker for a quick yt-dlp resolve
+/// and a window parked on top of the app for the entire length of a track,
+/// since ffmpeg runs for the whole of it.
+///
+/// Invisible in development, because `tauri dev` runs from a terminal the child
+/// can inherit. It only appears in the built app, which is the one place it
+/// matters.
+///
+/// A no-op off Windows, where child processes have no such notion.
+pub fn quiet(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// `CREATE_NO_WINDOW`, from the Windows process-creation flags.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
 
 /// External programs the app shells out to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +97,10 @@ pub fn resolve(app: &AppHandle, tool: Tool) -> Result<Resolved, String> {
 }
 
 /// Locations the bundled copy might live in.
+///
+/// `tool` is read only by the development branch below, which reconstructs the
+/// triple-suffixed name; a release build derives everything from `file_name`.
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
 fn bundled_candidates(tool: Tool, file_name: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 

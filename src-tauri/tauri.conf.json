@@ -36,7 +36,8 @@
     "active": true,
     "targets": "all",
     "externalBin": [
-      "binaries/yt-dlp"
+      "binaries/yt-dlp",
+      "binaries/ffmpeg"
     ],
     "icon": [
       "icons/32x32.png",

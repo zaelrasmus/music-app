@@ -272,7 +272,7 @@ async fn resolve_format(
     let url = page_url.to_string();
 
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new(&yt_dlp)
+        crate::sidecar::quiet(&mut Command::new(&yt_dlp))
             .args(["-f", "bestaudio[ext=m4a]/bestaudio"])
             // Timestamp last on purpose: `--print` writes in flag order, so
             // appending leaves the two positions parsed below exactly where
@@ -320,7 +320,7 @@ async fn copy_stream(ffmpeg: PathBuf, url: &str, destination: &Path) -> Result<(
     let destination = destination.to_path_buf();
 
     let output = tauri::async_runtime::spawn_blocking(move || {
-        Command::new(&ffmpeg)
+        crate::sidecar::quiet(&mut Command::new(&ffmpeg))
             .arg("-hide_banner")
             .args(["-loglevel", "error", "-y"])
             .args(["-reconnect", "1"])

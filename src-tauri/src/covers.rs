@@ -257,7 +257,7 @@ pub async fn fetch_remote_cover(
     covers: CoverStore,
 ) -> Result<String, String> {
     let output = tauri::async_runtime::spawn_blocking(move || {
-        std::process::Command::new(&ffmpeg)
+        crate::sidecar::quiet(&mut std::process::Command::new(&ffmpeg))
             .arg("-hide_banner")
             .args(["-loglevel", "error"])
             .args(["-reconnect", "1"])
