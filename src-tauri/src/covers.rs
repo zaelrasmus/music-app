@@ -262,6 +262,18 @@ pub async fn fetch_remote_cover(
             .args(["-loglevel", "error"])
             .args(["-reconnect", "1"])
             .args(["-reconnect_delay_max", "5"])
+            // Name the input demuxer instead of letting ffmpeg guess from the
+            // URL. Left to itself it reads the extension, and a SoundCloud
+            // thumbnail ends in a literal `.jpg`, which selects `image2` -- the
+            // *file sequence* demuxer. Over HTTP that yields a stream whose
+            // size it cannot determine, so the decode produces no frame and the
+            // cover silently never appears.
+            //
+            // YouTube escaped this only by accident: its thumbnails carry a
+            // query string, so there is no extension to misread and ffmpeg
+            // probes the content instead. Being explicit makes both providers
+            // take the same path rather than leaving one of them to luck.
+            .args(["-f", "image2pipe"])
             .arg("-i")
             .arg(&url)
             // One frame, as PNG, to stdout. `image2pipe` is the muxer that
@@ -292,6 +304,98 @@ pub async fn fetch_remote_cover(
 mod tests {
     use super::*;
     use image::{ImageFormat, RgbImage};
+
+    /// Serves `body` once, at a URL ending in `.jpg`, and returns that URL.
+    ///
+    /// Both halves matter. The bug this guards needed a real HTTP source *and*
+    /// a path ffmpeg would read an extension from: given `.jpg` it selects the
+    /// `image2` file-sequence demuxer, which cannot size a single image over
+    /// HTTP. A local file reproduces nothing, and neither does an HTTP URL
+    /// carrying a query string -- which is exactly why YouTube worked while
+    /// SoundCloud did not.
+    fn serve_one_jpeg(body: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // Read the request line so the client is not writing into a closed
+            // socket; the content is irrelevant, only that it is drained.
+            let mut scratch = [0u8; 1024];
+            let _ = stream.read(&mut scratch);
+
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&body);
+            let _ = stream.flush();
+        });
+
+        format!("http://127.0.0.1:{port}/artwork.jpg")
+    }
+
+    fn jpeg(width: u32, height: u32) -> Vec<u8> {
+        let mut buffer = RgbImage::new(width, height);
+        for (x, y, pixel) in buffer.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x % 256) as u8, (y % 256) as u8, 200]);
+        }
+        let mut out = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(buffer)
+            .write_to(&mut out, ImageFormat::Jpeg)
+            .unwrap();
+        out.into_inner()
+    }
+
+    /// Covers the fetch path end to end: HTTP in, a key on disk out.
+    ///
+    /// NOT a regression test for the SoundCloud bug, though it was written as
+    /// one. Checked by reverting the `-f image2pipe` fix and re-running: this
+    /// still passed, so it does not reproduce the failure. Whatever the real
+    /// difference is, a locally served baseline JPEG does not have it -- the
+    /// SoundCloud image was checked and is baseline too, so that is not it.
+    ///
+    /// The fix rests on measurement against the live URLs instead: SoundCloud
+    /// returned 0 bytes before and 138,248 after, while YouTube returned an
+    /// identical 132,754 both ways. Left here for the coverage it does give,
+    /// and labelled so nobody trusts it for more than that.
+    #[tokio::test]
+    async fn a_thumbnail_url_is_fetched_and_stored() {
+        let Some(ffmpeg) = which_ffmpeg() else {
+            eprintln!("SKIP: ffmpeg is not available");
+            return;
+        };
+
+        let dir = std::env::temp_dir().join(format!("music-app-sc-cover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = CoverStore::new(dir.clone());
+
+        let url = serve_one_jpeg(jpeg(300, 300));
+        let key = fetch_remote_cover(ffmpeg, url, store)
+            .await
+            .expect("a .jpg URL served over HTTP must yield a cover");
+
+        assert!(
+            dir.join(&key).is_file(),
+            "the stored cover {key} should exist on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ffmpeg is optional, so this test reports rather than fails without it.
+    fn which_ffmpeg() -> Option<PathBuf> {
+        let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    }
 
     fn png(width: u32, height: u32) -> Vec<u8> {
         let mut buffer = RgbImage::new(width, height);

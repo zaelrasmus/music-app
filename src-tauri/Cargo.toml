@@ -66,3 +66,26 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Cargo's defaults already give a real release build (`opt-level = 3`, no debug
+# assertions). What follows is only size and speed tuning on top of that.
+#
+# Worth a note on scale: this trims a 19 MB binary, which sits next to a 110 MB
+# ffmpeg sidecar. The win is real but small against the installer as a whole.
+[profile.release]
+# Whole-program optimisation across crate boundaries. The slower link is paid
+# once per release build, never by a user.
+lto = true
+# One codegen unit lets LLVM see the whole crate at once. Costs parallelism
+# during compilation, which matters far less than the shipped binary.
+codegen-units = 1
+# Debug symbols are useless in a build nobody can attach a debugger to, and
+# they are most of what makes an unstripped Rust binary large.
+strip = true
+# Unwinding exists so a panic can be caught and recovered from. Nothing here
+# does that: a panic in the audio thread or a command handler is a bug, not a
+# condition to handle, so the unwind tables are dead weight.
+#
+# Deliberately not applied to `profile.test` -- the test harness needs unwinding
+# to report which test panicked rather than aborting the whole run.
+panic = "abort"
