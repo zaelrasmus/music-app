@@ -34,6 +34,13 @@ async fn run_at(yt_dlp: std::path::PathBuf, args: Vec<String>) -> Result<String,
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // An extraction that broke, rather than a track that is gone: worth
+        // asking whether a newer yt-dlp knows what this one does not.
+        if crate::updater::looks_stale(&stderr) {
+            crate::updater::nudge(crate::updater::Trigger::Suspected);
+        }
+
         return Err(explain(&stderr));
     }
 

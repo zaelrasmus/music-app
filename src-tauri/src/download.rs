@@ -193,7 +193,16 @@ pub async fn fetch_into_cache(
             Err(e) => {
                 let _ = std::fs::remove_file(&pending.partial);
 
-                if !crate::transcode::is_transient(&e) || attempt == FETCH_ATTEMPTS {
+                if !crate::transcode::is_transient(&e) {
+                    return Err(e);
+                }
+
+                if attempt == FETCH_ATTEMPTS {
+                    // Three freshly resolved URLs, all refused. One is
+                    // YouTube being busy; three in a row is the shape of a
+                    // yt-dlp that has aged out -- the failure it cannot
+                    // report itself, because the extraction it did succeeded.
+                    crate::updater::nudge(crate::updater::Trigger::Suspected);
                     return Err(e);
                 }
 
@@ -244,7 +253,16 @@ async fn fetch_with_retries(
                 // A rejected fetch can still leave a stub file behind.
                 let _ = std::fs::remove_file(&partial_path);
 
-                if !crate::transcode::is_transient(&e) || attempt == FETCH_ATTEMPTS {
+                if !crate::transcode::is_transient(&e) {
+                    return Err(e);
+                }
+
+                if attempt == FETCH_ATTEMPTS {
+                    // Three freshly resolved URLs, all refused. One is
+                    // YouTube being busy; three in a row is the shape of a
+                    // yt-dlp that has aged out -- the failure it cannot
+                    // report itself, because the extraction it did succeeded.
+                    crate::updater::nudge(crate::updater::Trigger::Suspected);
                     return Err(e);
                 }
 

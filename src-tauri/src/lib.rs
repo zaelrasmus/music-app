@@ -16,6 +16,7 @@ mod stream_urls;
 mod tags;
 mod transcode;
 mod tracks;
+mod updater;
 mod youtube;
 
 use tauri::Manager;
@@ -58,6 +59,23 @@ pub fn run() {
             app.manage(scanner::ScanLock::new());
             app.manage(download::DownloadLock::new());
 
+            // yt-dlp updates itself by rewriting its own executable, which the
+            // install directory does not permit. Staging a copy in app data is
+            // what makes updating possible at all, and doing it *before* the
+            // resolves below is what makes the path stable: from here on every
+            // caller gets the app-data copy, so a binary replaced underneath is
+            // used by the next spawn rather than after a restart.
+            //
+            // Failure is deliberately ignored: `resolve` still finds the
+            // bundled copy, and a stale yt-dlp beats an app that will not open.
+            //
+            // ffmpeg is not staged. It does not break when YouTube changes, and
+            // it is 110 MB of copying to no purpose.
+            let staged = matches!(
+                sidecar::seed(app.handle(), sidecar::Tool::YtDlp),
+                Ok(sidecar::Seed::Refreshed)
+            );
+
             // Coordinator (queue, repeat, shuffle, volume) plus the dumb audio
             // engine it drives. The engine thread owns the output device for
             // the whole process.
@@ -94,6 +112,17 @@ pub fn run() {
                 yt_dlp,
                 Some(audio_cache),
             ));
+
+            // Keeps yt-dlp current. Managed before it is started so the first
+            // status event has somewhere to land, and started last so that
+            // nothing above it waits on a network call.
+            //
+            // `staged` carries one fact the updater cannot work out for
+            // itself: that the binary underneath it was written moments ago
+            // by an install or an upgrade, which is worth a check of its own
+            // rather than a place in the daily rota.
+            app.manage(updater::Updater::new());
+            updater::spawn(app.handle(), staged);
 
             // The window is created hidden so that the first frame the user
             // sees is already themed and laid out -- an undecorated window
@@ -172,6 +201,8 @@ pub fn run() {
             providers::list_providers,
             youtube::search_provider,
             youtube::save_remote_track,
+            updater::yt_dlp_status,
+            updater::update_yt_dlp,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

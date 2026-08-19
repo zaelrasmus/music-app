@@ -19,12 +19,37 @@ Check yours with `rustc -vV | grep host`.
 
 ## yt-dlp
 
-Single self-contained executable — download the release build and rename it.
-<https://github.com/yt-dlp/yt-dlp/releases>
+Single self-contained executable — download it and rename it. Take it from the
+**nightly** builds, not the stable releases:
+<https://github.com/yt-dlp/yt-dlp-nightly-builds/releases>
 
-The bundled copy is only a **floor**. yt-dlp breaks whenever YouTube changes,
-so the app prefers a newer copy in its app-data directory when one is present
-(see `src/sidecar.rs`); it never needs a recompile to pick up an update.
+Nightly rather than stable because a stable release is a nightly that was
+blessed later: both are cut from master and pass the same CI, and the only
+difference that reaches a user whose player has stopped working is how many
+days old the fix is. The app moves its own copy onto the nightly channel on
+first run regardless (`src/updater.rs`), so bundling stable would only mean
+shipping a floor that is weeks behind and one extra channel switch to perform.
+
+The bundled copy is a **floor**, not the binary that runs. On first launch the
+app copies it into its app-data directory (`sidecar::seed`), and from then on
+yt-dlp updates itself in place — daily, when the app is upgraded, and whenever
+a playback failure suggests it has aged out. The bundle is what a machine with
+no network falls back to.
+
+Refresh it at each release, and smoke-test the one you are about to ship
+against both providers before building the installer:
+
+```bash
+yt-dlp "ytsearch3:daft punk" --flat-playlist -J --no-warnings   # search
+yt-dlp -f "bestaudio[ext=m4a]/bestaudio" -g <video-url>         # resolve
+ffmpeg -i "<the url that printed>" -t 5 -vn -c copy probe.m4a   # play
+```
+
+The third line is the one that matters and the one that is easy to skip. A
+resolve can succeed and still hand back a URL that YouTube refuses to anything
+but the client it was minted for — which is exactly how this bundle went stale
+in August 2026: search and resolve both worked, and every track 403'd the
+moment ffmpeg reached for it.
 
 ## ffmpeg — must be a STATIC build
 

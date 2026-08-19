@@ -12,6 +12,7 @@
     import { libraryView } from "$lib/library-view.svelte";
     import { queueStore } from "$lib/queue.svelte";
     import { covers } from "$lib/covers.svelte";
+    import { ytDlp } from "$lib/ytdlp.svelte";
 
     import LibraryView from "$components/library-view.svelte";
     import ProviderSearch from "$components/provider-search.svelte";
@@ -32,11 +33,13 @@
         cacheStore.restore();
         historyStore.load();
         covers.load();
+        ytDlp.refresh();
         player.restorePreferences().then(() => player.restorePlayback());
 
         const scans = trackStore.listenForScans();
         const playback = player.listenForPlayer();
         const queue = queueStore.listenForQueue();
+        const extractor = ytDlp.listenForUpdates();
 
         // Artwork for a just-saved track arrives after the save returned, so
         // the lists holding that row have to be told. Reloading them is a few
@@ -52,6 +55,7 @@
             scans.then((off) => off());
             playback.then((off) => off());
             queue.then((off) => off());
+            extractor.then((off) => off());
             artwork.then((off) => off());
         };
     });

@@ -192,7 +192,17 @@ impl FfmpegSource {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "ffmpeg produced no audio.".to_string());
 
-            return Err(explain_ffmpeg(&detail));
+            let message = explain_ffmpeg(&detail);
+
+            // The failure yt-dlp is structurally unable to report. It resolved
+            // a URL and exited happy; the refusal happened afterwards, here,
+            // to a different process. Playback is where an aged-out build is
+            // first visible, so it is where the app has to notice.
+            if is_transient(&message) {
+                crate::updater::nudge(crate::updater::Trigger::Suspected);
+            }
+
+            return Err(message);
         }
 
         Ok(source)

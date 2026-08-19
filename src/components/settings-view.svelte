@@ -3,6 +3,7 @@
     import PageShell from "$components/page-shell.svelte";
     import SettingsSection from "$components/settings-section.svelte";
     import CacheSettings from "$components/cache-settings.svelte";
+    import ExtractorSettings from "$components/extractor-settings.svelte";
     import TagManager from "$components/tag-manager.svelte";
     import { library } from "$lib/library.svelte";
     import { trackStore } from "$lib/tracks.svelte";
@@ -185,6 +186,8 @@
         </SettingsSection>
 
         <CacheSettings />
+
+        <ExtractorSettings />
 
         <TagManager />
     </div>
