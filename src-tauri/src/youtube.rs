@@ -183,7 +183,11 @@ impl SearchResponse {
             },
             item_count: self.playlist_count,
             follower_count: self.channel_follower_count,
-            thumbnail_url: pick_thumbnail(&self.thumbnails),
+            // An artist is a face; a playlist is cover art.
+            thumbnail_url: match kind {
+                SearchKind::Artist => pick_avatar(&self.thumbnails),
+                _ => pick_thumbnail(&self.thumbnails),
+            },
         }
     }
 }
@@ -293,6 +297,9 @@ struct Thumbnail {
     url: String,
     #[serde(default)]
     width: Option<u32>,
+    /// Read only to tell an avatar from a banner -- see `pick_avatar`.
+    #[serde(default)]
+    height: Option<u32>,
 }
 
 impl SearchEntry {
@@ -343,7 +350,10 @@ impl SearchEntry {
             // rather than filled with a plausible-looking guess.
             item_count: None,
             follower_count: None,
-            thumbnail_url: pick_thumbnail(&self.thumbnails),
+            thumbnail_url: match kind {
+                SearchKind::Artist => pick_avatar(&self.thumbnails),
+                _ => pick_thumbnail(&self.thumbnails),
+            },
         })
     }
 
@@ -405,6 +415,50 @@ impl SearchEntry {
 /// "within the cap" selected exactly that one, pulling the full-size artwork
 /// for every row. YouTube never exposed this because all of its thumbnails
 /// carry dimensions.
+/// The squarest picture in the set, for a face rather than a banner.
+///
+/// A channel's `thumbnails` lead with six banner crops -- 1060x175 rising to
+/// 2560x424 -- and put the avatar *last*, at 900x900. [`pick_thumbnail`] wants
+/// the widest one under a cap, and against a banner-first list nothing meets
+/// the cap at all, so it falls back to the first: a sliver of the channel
+/// banner in a round frame, which on a dark or plain banner reads as empty.
+///
+/// Squareness is the signal rather than position or size. It is what actually
+/// separates an avatar from a banner, and it keeps working if YouTube reorders
+/// the list or changes the sizes it offers.
+fn pick_avatar(thumbnails: &[Thumbnail]) -> Option<String> {
+    /// How far from square a picture may be and still be a face. Avatars are
+    /// exactly 1:1; the narrowest banner here is 6:1.
+    const TOLERANCE: u32 = 5;
+    /// Above this it is a source image, not something to draw at 144px.
+    const MAX_WIDTH: u32 = 1200;
+
+    let square = |t: &&Thumbnail| match (t.width, t.height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => {
+            let (long, short) = if width >= height {
+                (width, height)
+            } else {
+                (height, width)
+            };
+            long * 4 <= short * TOLERANCE
+        }
+        // No dimensions to judge by. A track thumbnail carries them, and so
+        // does every channel picture seen so far.
+        _ => false,
+    };
+
+    thumbnails
+        .iter()
+        .filter(square)
+        .filter(|t| t.width.is_some_and(|w| w <= MAX_WIDTH))
+        .max_by_key(|t| t.width.unwrap_or(0))
+        // Every square one is enormous: take the smallest of them rather than
+        // no picture at all.
+        .or_else(|| thumbnails.iter().filter(square).min_by_key(|t| t.width.unwrap_or(0)))
+        .map(|t| t.url.clone())
+        .or_else(|| pick_thumbnail(thumbnails))
+}
+
 fn pick_thumbnail(thumbnails: &[Thumbnail]) -> Option<String> {
     const MAX_WIDTH: u32 = 480;
 
@@ -1195,3 +1249,77 @@ pub async fn save_remote_tracks(
     Ok(ids)
 }
 
+#[cfg(test)]
+mod thumbnail_tests {
+    use super::*;
+    /// The reported bug: a YouTube artist's picture was empty once the page
+    /// finished loading.
+    ///
+    /// Shaped from a real channel envelope. The six banners come first and the
+    /// avatar comes last, which is exactly what defeats "widest under a cap,
+    /// else the first one".
+    #[test]
+    fn a_channel_avatar_is_preferred_over_its_banner() {
+        let thumbnails: Vec<Thumbnail> = serde_json::from_str(
+            r#"[
+                {"url": "banner-1060", "width": 1060, "height": 175},
+                {"url": "banner-1138", "width": 1138, "height": 188},
+                {"url": "banner-1707", "width": 1707, "height": 283},
+                {"url": "banner-2120", "width": 2120, "height": 351},
+                {"url": "banner-2276", "width": 2276, "height": 377},
+                {"url": "banner-2560", "width": 2560, "height": 424},
+                {"url": "avatar-900", "width": 900, "height": 900}
+            ]"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            pick_avatar(&thumbnails).as_deref(),
+            Some("avatar-900"),
+            "a round frame filled with a sliver of banner is the bug"
+        );
+
+        // The old rule, kept honest: it takes the first banner, which is how
+        // this happened.
+        assert_eq!(pick_thumbnail(&thumbnails).as_deref(), Some("banner-1060"));
+    }
+
+    #[test]
+    fn a_search_rows_avatar_still_wins() {
+        // Artist *search* results carry only square avatars, at two sizes.
+        let thumbnails: Vec<Thumbnail> = serde_json::from_str(
+            r#"[
+                {"url": "s88", "width": 88, "height": 88},
+                {"url": "s176", "width": 176, "height": 176}
+            ]"#,
+        )
+        .unwrap();
+
+        assert_eq!(pick_avatar(&thumbnails).as_deref(), Some("s176"));
+    }
+
+    #[test]
+    fn a_channel_with_only_banners_still_shows_something() {
+        let thumbnails: Vec<Thumbnail> = serde_json::from_str(
+            r#"[{"url": "banner", "width": 1060, "height": 175}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            pick_avatar(&thumbnails).as_deref(),
+            Some("banner"),
+            "a wrong picture beats a blank circle"
+        );
+    }
+
+    #[test]
+    fn an_enormous_avatar_is_still_used_when_it_is_the_only_square_one() {
+        let thumbnails: Vec<Thumbnail> = serde_json::from_str(
+            r#"[{"url": "huge", "width": 4000, "height": 4000}]"#,
+        )
+        .unwrap();
+
+        assert_eq!(pick_avatar(&thumbnails).as_deref(), Some("huge"));
+    }
+
+}

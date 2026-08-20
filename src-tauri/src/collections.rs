@@ -535,4 +535,38 @@ pub(crate) mod network_tests {
         assert!(!tracks.is_empty(), "a set that expanded to nothing");
         eprintln!("{} SoundCloud tracks", tracks.len());
     }
+
+    /// Against the real channel, because the shape that caused this -- banners
+    /// first, avatar last -- is YouTube's choice and can change again.
+    #[tokio::test]
+    async fn a_real_channel_page_yields_a_square_avatar() {
+        let response = crate::youtube::flat_playlist_at(
+            crate::collections::network_tests::yt_dlp(),
+            "https://www.youtube.com/channel/UCdI8MAC5HoPJSJ4zrgDDI-Q",
+            Some(1),
+        )
+        .await
+        .expect("the channel should open");
+
+        let collection = response.collection(
+            Provider::YouTube,
+            SearchKind::Artist,
+            "https://www.youtube.com/channel/UCdI8MAC5HoPJSJ4zrgDDI-Q",
+        );
+
+        let picture = collection
+            .thumbnail_url
+            .as_deref()
+            .expect("an artist page needs a picture");
+
+        eprintln!("{} -> {picture}", collection.title);
+
+        // A banner crop carries `fcrop64`; an avatar is served square with an
+        // `=sNNN` size. Asserted on the URL because the alternative is
+        // downloading it to measure.
+        assert!(
+            !picture.contains("fcrop64"),
+            "that is the channel banner, not the artist: {picture}"
+        );
+    }
 }
