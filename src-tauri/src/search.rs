@@ -198,7 +198,17 @@ pub async fn query_library(
         }
     }
 
-    query.push(" LIMIT 500");
+    // No limit, deliberately.
+    //
+    // There was one, of five hundred rows, and it was a lie the UI repeated:
+    // the library said "500 songs" however many were actually in it, and
+    // adding more changed nothing. It existed because five hundred rows was
+    // already more DOM than a list should carry, and the honest fix was never
+    // to fetch less -- it was to stop rendering what nobody is looking at.
+    //
+    // The list is virtualised now, so the count is the truth and the rows off
+    // screen cost nothing. What this does cost is the query itself, and that
+    // is one indexed scan returning a few hundred bytes per track.
 
     query
         .build_query_as::<Track>()

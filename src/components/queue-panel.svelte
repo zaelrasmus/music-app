@@ -1,10 +1,7 @@
 <script lang="ts">
     import { queueStore, type QueueEntry } from "$lib/queue.svelte";
-    import SourceBadge from "$components/source-badge.svelte";
-    import CoverArt from "$components/cover-art.svelte";
-    import PlayingBars from "$components/playing-bars.svelte";
-    import { coverSeed } from "$lib/cover";
-    import { cacheStore } from "$lib/cache.svelte";
+    import QueueRow from "$components/queue-row.svelte";
+    import VirtualList from "$components/virtual-list.svelte";
     import { player } from "$lib/player.svelte";
     import XIcon from "@lucide/svelte/icons/x";
     import GripVerticalIcon from "@lucide/svelte/icons/grip-vertical";
@@ -30,18 +27,127 @@
         await queueStore.reorder(entryId, toIndex);
     }
 
-    function formatDuration(secs: number | null) {
-        if (secs === null) return "";
-        const m = Math.floor(secs / 60);
-        const s = secs % 60;
-        return `${m}:${String(s).padStart(2, "0")}`;
-    }
-
     const contextHeading = $derived(
         queueStore.contextName
             ? `Next from ${queueStore.contextName}`
             : "Next up",
     );
+
+    /**
+     * One flat list, because there is one scroller.
+     *
+     * The panel reads as three sections, but virtualising three lists inside a
+     * single scrolling element means telling each one how far down the content
+     * it begins — an offset that has to be re-measured every time anything
+     * above it changes height, and that is silently wrong when it is not.
+     *
+     * Flattening the sections into one sequence of typed rows removes the
+     * question entirely: one virtualizer, one coordinate space, and the
+     * headings scroll with the rows they head because they *are* rows.
+     */
+    type PanelRow =
+        | { kind: "heading"; key: string; text: string; clearable?: boolean }
+        | { kind: "note"; key: string; text: string }
+        | { kind: "entry"; key: string; entry: QueueEntry; current: true }
+        | {
+              kind: "entry";
+              key: string;
+              entry: QueueEntry;
+              current?: false;
+              /** Where the click goes, and which list the row belongs to. */
+              play: () => void;
+              /** Manual rows only — the queue is the reorderable tier. */
+              index?: number;
+          };
+
+    const rows = $derived.by(() => {
+        const built: PanelRow[] = [];
+
+        if (queueStore.current) {
+            built.push({ kind: "heading", key: "h-now", text: "Now playing" });
+            built.push({
+                kind: "entry",
+                key: "now",
+                entry: queueStore.current,
+                current: true,
+            });
+        }
+
+        built.push({
+            kind: "heading",
+            key: "h-queue",
+            text: "Queue",
+            clearable: queueStore.manual.length > 0,
+        });
+
+        if (queueStore.manual.length === 0) {
+            built.push({
+                kind: "note",
+                key: "queue-empty",
+                text: "Nothing queued. Use “Play next” or “Add to queue” on any track and it jumps ahead of whatever is playing next.",
+            });
+        } else {
+            queueStore.manual.forEach((entry, index) => {
+                built.push({
+                    kind: "entry",
+                    key: `m-${entry.entryId}`,
+                    entry,
+                    index,
+                    play: () =>
+                        entry.entryId !== null &&
+                        queueStore.playEntry(entry.entryId),
+                });
+            });
+        }
+
+        built.push({ kind: "heading", key: "h-next", text: contextHeading });
+
+        if (queueStore.upNext.length === 0) {
+            built.push({
+                kind: "note",
+                key: "next-empty",
+                text: "Nothing follows — the list ends here.",
+            });
+        } else {
+            queueStore.upNext.forEach((entry, index) => {
+                built.push({
+                    kind: "entry",
+                    key: `u-${entry.trackId}-${index}`,
+                    entry,
+                    play: () => queueStore.playUpcoming(index),
+                });
+            });
+
+            if (queueStore.contextRemaining > 0) {
+                built.push({
+                    kind: "note",
+                    key: "more",
+                    text: `and ${queueStore.contextRemaining} more`,
+                });
+            }
+        }
+
+        if (player.shuffle) {
+            built.push({
+                kind: "note",
+                key: "shuffled",
+                text: "Shuffled — this is the order it will actually play.",
+            });
+        }
+
+        return built;
+    });
+
+    /** Rough, and corrected by measurement the moment a row is drawn. */
+    function estimate(index: number) {
+        const row = rows[index];
+        if (row?.kind === "heading") return 28;
+        if (row?.kind === "note") return 34;
+        return 48;
+    }
+
+    /** The panel's own scroller, since it is not inside a `PageShell`. */
+    let scroller = $state<HTMLElement>();
 </script>
 
 {#snippet heading(text: string)}
@@ -50,18 +156,6 @@
     >
         {text}
     </h3>
-{/snippet}
-
-<!-- Unavailable tracks stay listed, marked. Hiding them would make the panel
-     disagree with what actually plays. -->
-{#snippet badge(entry: QueueEntry)}
-    <SourceBadge
-        source={entry.source}
-        state={entry.state}
-        durationSecs={entry.durationSecs}
-        cached={cacheStore.isCached(entry.trackId)}
-        compact
-    />
 {/snippet}
 
 <!--
@@ -95,179 +189,97 @@
             </button>
         </header>
 
-        <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-2 pb-4">
-            {#if queueStore.current}
-                <section class="flex flex-col gap-1.5">
-                    {@render heading("Now playing")}
-                    <div
-                        class="bg-accent/60 flex items-center gap-2.5 rounded-lg px-2 py-2"
-                    >
-                        <CoverArt
-                            seed={coverSeed(queueStore.current)}
-                            coverKey={queueStore.current.coverKey}
-                            src={queueStore.current.remoteThumbnailUrl}
-                            class="size-9"
-                            glyph={false}
-                        />
-                        <div class="flex min-w-0 flex-1 flex-col gap-0.5">
-                            <span class="truncate text-[13px] leading-tight font-medium">
-                                {queueStore.current.title}
-                            </span>
-                            <span
-                                class="text-muted-foreground flex items-center gap-1.5 text-[11px] leading-tight"
-                            >
-                                <span class="truncate">
-                                    {queueStore.current.artist ?? "Unknown artist"}
-                                </span>
-                                {@render badge(queueStore.current)}
-                            </span>
-                        </div>
-                        <span class="text-primary shrink-0">
-                            <PlayingBars animate={player.state === "playing"} />
-                        </span>
-                    </div>
-                </section>
-            {/if}
-
-            <!-- The manual queue: what the user explicitly asked for. -->
-            <section class="flex flex-col gap-1.5">
-                <div class="flex items-center justify-between gap-2">
-                    {@render heading("Queue")}
-                    {#if queueStore.manual.length > 0}
-                        <button
-                            type="button"
-                            class="text-muted-foreground hover:text-foreground px-1 text-[11px] underline underline-offset-2 transition-colors"
-                            onclick={() => queueStore.clear()}
+        <div
+            bind:this={scroller}
+            class="min-h-0 flex-1 overflow-y-auto px-2 pb-4"
+        >
+            <VirtualList
+                {rows}
+                estimateSize={estimate}
+                scrollElement={scroller}
+                key={(item) => item.key}
+            >
+                {#snippet row(item)}
+                    {#if item.kind === "heading"}
+                        <div
+                            class="flex items-center justify-between gap-2 pt-3 pb-1"
                         >
-                            Clear
-                        </button>
-                    {/if}
-                </div>
-
-                {#if queueStore.manual.length === 0}
-                    <p class="text-muted-foreground px-1 text-xs leading-relaxed">
-                        Nothing queued. Use “Play next” or “Add to queue” on any
-                        track and it jumps ahead of whatever is playing next.
-                    </p>
-                {:else}
-                    <ul class="flex flex-col gap-px">
-                        {#each queueStore.manual as entry, index (entry.entryId)}
-                            <li
-                                class="group/entry hover:bg-accent/60 flex items-center gap-1.5 rounded-md px-1.5 py-1.5 transition-colors
-                                       {dragOver === index
-                                    ? 'bg-accent ring-primary/40 ring-1'
-                                    : ''}"
-                                class:opacity-50={entry.state === "missing"}
-                                draggable="true"
-                                ondragstart={() => (dragFrom = index)}
-                                ondragover={(e) => {
-                                    e.preventDefault();
-                                    dragOver = index;
-                                }}
-                                ondragleave={() => {
-                                    if (dragOver === index) dragOver = null;
-                                }}
-                                ondrop={(e) => {
-                                    e.preventDefault();
-                                    drop(index);
-                                }}
-                                ondragend={() => {
-                                    dragFrom = null;
-                                    dragOver = null;
-                                }}
-                            >
-                                <GripVerticalIcon
-                                    class="text-muted-foreground size-3.5 shrink-0 cursor-grab opacity-40 transition-opacity group-hover/entry:opacity-80"
-                                />
-
-                                <div class="flex min-w-0 flex-1 flex-col">
-                                    <span class="truncate text-xs leading-tight">
-                                        {entry.title}
-                                    </span>
-                                    <span
-                                        class="text-muted-foreground flex items-center gap-1.5 text-[11px] leading-tight"
-                                    >
-                                        <span class="truncate">
-                                            {entry.artist ?? "Unknown artist"}
-                                        </span>
-                                        {@render badge(entry)}
-                                    </span>
-                                </div>
-
-                                <span
-                                    class="text-muted-foreground shrink-0 text-[11px] tabular-nums group-hover/entry:hidden"
-                                >
-                                    {formatDuration(entry.durationSecs)}
-                                </span>
-
+                            {@render heading(item.text)}
+                            {#if item.clearable}
                                 <button
                                     type="button"
-                                    class="text-muted-foreground hover:bg-background hover:text-foreground hidden size-6 shrink-0 place-items-center rounded-md transition-colors group-hover/entry:grid"
-                                    aria-label="Remove {entry.title} from the queue"
-                                    onclick={() =>
-                                        entry.entryId !== null &&
-                                        queueStore.remove(entry.entryId)}
+                                    class="text-muted-foreground hover:text-foreground px-1 text-[11px] underline underline-offset-2 transition-colors"
+                                    onclick={() => queueStore.clear()}
                                 >
-                                    <XIcon class="size-3.5" />
+                                    Clear
                                 </button>
-                            </li>
-                        {/each}
-                    </ul>
-                {/if}
-            </section>
-
-            <!-- The context continuation. Read-only: a displayed row maps to a
-                 shuffled permutation index, so removing one here is a larger
-                 change than it looks. -->
-            <section class="flex flex-col gap-1.5">
-                {@render heading(contextHeading)}
-
-                {#if queueStore.upNext.length === 0}
-                    <p class="text-muted-foreground px-1 text-xs">
-                        Nothing follows — the list ends here.
-                    </p>
-                {:else}
-                    <ul class="flex flex-col gap-px">
-                        {#each queueStore.upNext as entry, index (`${entry.trackId}-${index}`)}
-                            <li
-                                class="flex items-center gap-1.5 rounded-md px-1.5 py-1"
-                                class:opacity-50={entry.state === "missing"}
-                            >
-                                <div class="flex min-w-0 flex-1 flex-col">
-                                    <span class="truncate text-xs leading-tight">
-                                        {entry.title}
-                                    </span>
-                                    <span
-                                        class="text-muted-foreground flex items-center gap-1.5 text-[11px] leading-tight"
-                                    >
-                                        <span class="truncate">
-                                            {entry.artist ?? "Unknown artist"}
-                                        </span>
-                                        {@render badge(entry)}
-                                    </span>
-                                </div>
-                                <span
-                                    class="text-muted-foreground shrink-0 text-[11px] tabular-nums"
-                                >
-                                    {formatDuration(entry.durationSecs)}
-                                </span>
-                            </li>
-                        {/each}
-                    </ul>
-
-                    {#if queueStore.contextRemaining > 0}
-                        <p class="text-muted-foreground px-1 text-[11px]">
-                            and {queueStore.contextRemaining} more
+                            {/if}
+                        </div>
+                    {:else if item.kind === "note"}
+                        <p class="text-muted-foreground px-1 pb-1 text-[11px] leading-relaxed">
+                            {item.text}
                         </p>
-                    {/if}
-                {/if}
+                    {:else if item.current}
+                        <QueueRow entry={item.entry} current />
+                    {:else if item.index !== undefined}
+                        <!--
+                          A queued row: reorderable, removable, and the only
+                          tier where dragging means anything. Drag handlers sit
+                          on the wrapper rather than inside `QueueRow`, because
+                          being draggable is a fact about this list, not about
+                          what a queued track looks like.
+                        -->
+                        <div
+                            class="rounded-md {dragOver === item.index
+                                ? 'bg-accent ring-primary/40 ring-1'
+                                : ''}"
+                            draggable="true"
+                            ondragstart={() => (dragFrom = item.index ?? null)}
+                            ondragover={(e) => {
+                                e.preventDefault();
+                                dragOver = item.index ?? null;
+                            }}
+                            ondragleave={() => {
+                                if (dragOver === item.index) dragOver = null;
+                            }}
+                            ondrop={(e) => {
+                                e.preventDefault();
+                                if (item.index !== undefined) drop(item.index);
+                            }}
+                            ondragend={() => {
+                                dragFrom = null;
+                                dragOver = null;
+                            }}
+                        >
+                            <QueueRow entry={item.entry} onplay={item.play}>
+                                {#snippet leading()}
+                                    <GripVerticalIcon
+                                        class="text-muted-foreground size-3.5 cursor-grab opacity-40 transition-opacity group-hover/queue-row:opacity-80"
+                                    />
+                                {/snippet}
 
-                {#if player.shuffle}
-                    <p class="text-muted-foreground px-1 text-[11px]">
-                        Shuffled — this is the order it will actually play.
-                    </p>
-                {/if}
-            </section>
+                                {#snippet trailing()}
+                                    <button
+                                        type="button"
+                                        class="text-muted-foreground hover:bg-background hover:text-foreground hidden size-6 place-items-center rounded-md transition-colors group-hover/queue-row:grid"
+                                        aria-label="Remove {item.entry
+                                            .title} from the queue"
+                                        onclick={() =>
+                                            item.entry.entryId !== null &&
+                                            queueStore.remove(
+                                                item.entry.entryId,
+                                            )}
+                                    >
+                                        <XIcon class="size-3.5" />
+                                    </button>
+                                {/snippet}
+                            </QueueRow>
+                        </div>
+                    {:else}
+                        <QueueRow entry={item.entry} onplay={item.play} />
+                    {/if}
+                {/snippet}
+            </VirtualList>
         </div>
     </div>
 </aside>

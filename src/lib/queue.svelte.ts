@@ -85,6 +85,21 @@ class QueueStore {
     this.open = !this.open;
   }
 
+  /**
+   * Plays a queued track, dropping whatever was queued ahead of it.
+   *
+   * What clicking the fourth item in a queue means: the three above it were
+   * going to play first, and choosing the fourth is choosing not to hear them.
+   */
+  async playEntry(entryId: number) {
+    await invoke("play_queued_entry", { entryId });
+  }
+
+  /** Plays the nth row of "up next", counting from zero. */
+  async playUpcoming(offset: number) {
+    await invoke("play_upcoming", { offset });
+  }
+
   async remove(entryId: number) {
     await this.run("remove_from_queue", { entryId });
   }

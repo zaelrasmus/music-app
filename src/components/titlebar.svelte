@@ -1,6 +1,7 @@
 <script lang="ts">
     import WindowControls from "$components/window-controls.svelte";
     import ThemeToggle from "$components/theme-toggle.svelte";
+    import ActivityButton from "$components/activity-button.svelte";
     import { sidebar } from "$lib/sidebar.svelte";
     import PanelLeftIcon from "@lucide/svelte/icons/panel-left";
     import PanelLeftCloseIcon from "@lucide/svelte/icons/panel-left-close";
@@ -60,6 +61,8 @@
     <div data-tauri-drag-region class="h-full flex-1"></div>
 
     <div class="flex shrink-0 items-center gap-0.5 pr-1">
+        <!-- Only present while there is something to report. -->
+        <ActivityButton />
         <ThemeToggle chrome />
     </div>
 

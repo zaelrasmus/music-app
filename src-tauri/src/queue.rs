@@ -474,6 +474,53 @@ impl PlayerQueue {
         Some(track_id)
     }
 
+    /// What to play when the user clicks a track in the manual queue.
+    ///
+    /// Everything queued ahead of it is dropped. That is what clicking the
+    /// fourth item in a queue means: the three above it were going to play
+    /// first, and choosing the fourth is choosing not to hear them. Leaving
+    /// them in place would put them *after* the track just picked, which is
+    /// the one arrangement nobody asked for.
+    ///
+    /// They are dropped rather than pushed to history: they never played.
+    pub fn jump_to_manual(&mut self, entry_id: u64) -> Option<i64> {
+        let index = self
+            .manual
+            .iter()
+            .position(|entry| entry.entry_id == entry_id)?;
+
+        self.push_history();
+        self.manual.drain(..index);
+        self.take_from_manual()
+    }
+
+    /// What to play when the user clicks a track in "up next".
+    ///
+    /// `offset` counts from the first row shown, so zero is the same track
+    /// pressing Next would reach.
+    ///
+    /// Stepping the cursor rather than indexing it: with shuffle on, the row
+    /// at position three of the display is at some other index of the context,
+    /// and only the cursor knows which. Taking the same step Next takes,
+    /// repeatedly, cannot disagree with it.
+    pub fn jump_to_upcoming(&mut self, offset: usize) -> Option<i64> {
+        self.push_history();
+
+        let mut reached = None;
+        for _ in 0..=offset {
+            match self.context.next() {
+                Some(track_id) => reached = Some(track_id),
+                // Ran out early. The cursor stays where it got to, exactly as
+                // it would after pressing Next that many times.
+                None => break,
+            }
+        }
+
+        let track_id = reached?;
+        self.set_context_current(track_id);
+        Some(track_id)
+    }
+
     /// What to play when the user presses Previous.
     ///
     /// Driven by history rather than by stepping the cursor backwards. With
@@ -956,5 +1003,100 @@ mod tests {
         for expected in preview {
             assert_eq!(q.on_next(), Some(expected), "preview matched playback");
         }
+    }
+
+    // --- clicking a row in the queue panel ------------------------------
+
+    #[test]
+    fn clicking_a_queued_track_drops_what_was_ahead_of_it() {
+        let mut q = queue_of(3);
+        q.enqueue_last(90);
+        let chosen = q.enqueue_last(91);
+        q.enqueue_last(92);
+
+        assert_eq!(q.jump_to_manual(chosen), Some(91));
+        assert_eq!(
+            q.manual().map(|e| e.track_id).collect::<Vec<_>>(),
+            vec![92],
+            "the track queued before it was skipped, not moved behind it"
+        );
+    }
+
+    #[test]
+    fn clicking_the_first_queued_track_is_just_next() {
+        let mut q = queue_of(3);
+        let first = q.enqueue_last(90);
+        q.enqueue_last(91);
+
+        assert_eq!(q.jump_to_manual(first), Some(90));
+        assert_eq!(q.manual().map(|e| e.track_id).collect::<Vec<_>>(), vec![91]);
+    }
+
+    #[test]
+    fn clicking_a_queued_track_that_is_gone_does_nothing() {
+        let mut q = queue_of(3);
+        q.enqueue_last(90);
+
+        assert_eq!(q.jump_to_manual(9999), None);
+        assert_eq!(
+            q.manual().count(),
+            1,
+            "an unknown entry must not drain the queue"
+        );
+    }
+
+    #[test]
+    fn clicking_up_next_plays_that_row() {
+        let mut q = queue_of(5);
+        // Showing 2,3,4,5 -- so row 2 is track 4.
+        assert_eq!(q.jump_to_upcoming(2), Some(4));
+        assert_eq!(q.current(), Some(4));
+        assert_eq!(q.on_next(), Some(5), "the context continues from there");
+    }
+
+    #[test]
+    fn clicking_the_first_up_next_row_agrees_with_next() {
+        let mut clicked = queue_of(4);
+        let mut pressed = queue_of(4);
+
+        assert_eq!(clicked.jump_to_upcoming(0), pressed.on_next());
+        assert_eq!(clicked.current(), pressed.current());
+    }
+
+    /// The rows shown are the permuted order, so the click has to follow the
+    /// same cursor Next follows rather than indexing the underlying list.
+    #[test]
+    fn clicking_up_next_with_shuffle_on_plays_the_row_that_was_shown() {
+        let mut q = queue_of(12);
+        q.set_shuffle(true);
+
+        let shown: Vec<i64> = q.context_upcoming(5);
+        let target = shown[3];
+
+        assert_eq!(
+            q.jump_to_upcoming(3),
+            Some(target),
+            "displayed order and cursor order must not disagree"
+        );
+    }
+
+    #[test]
+    fn clicking_past_the_end_stops_rather_than_wrapping() {
+        let mut q = queue_of(3);
+        assert_eq!(q.jump_to_upcoming(50), Some(3), "clamps to the last track");
+        assert_eq!(q.on_next(), None);
+    }
+
+    /// Going back has to reach the track that was actually playing, not the
+    /// one the cursor would have stepped to.
+    #[test]
+    fn previous_returns_to_what_was_playing_before_a_jump() {
+        let mut q = queue_of(6);
+        assert_eq!(q.current(), Some(1));
+
+        q.jump_to_upcoming(3);
+        assert_eq!(q.current(), Some(5));
+
+        assert_eq!(q.on_previous(), Some(1));
     }
 }

@@ -77,19 +77,22 @@ pub fn downloads_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// The audio is **stream-copied**, never re-encoded: yt-dlp resolves the best
 /// audio-only format and ffmpeg muxes those exact packets into a file. What
 /// lands on disk is bit-identical to what YouTube served.
-#[tauri::command]
-pub async fn download_track(
-    app: AppHandle,
-    db: State<'_, Db>,
-    covers: State<'_, crate::covers::CoverStore>,
-    downloads: State<'_, DownloadLock>,
+pub(crate) async fn fetch_track(
+    app: &AppHandle,
+    pool: &sqlx::SqlitePool,
+    covers: &crate::covers::CoverStore,
     track_id: i64,
 ) -> Result<(), String> {
-    let _guard = downloads.try_claim(track_id)?;
+    // Still claimed, even though the queue runs one job at a time: the queue
+    // is not the only way in -- the player's own background caching writes to
+    // this directory too -- and this is the guard that makes two writes to one
+    // file impossible rather than merely unlikely.
+    let lock = app.state::<DownloadLock>();
+    let _guard = lock.try_claim(track_id)?;
 
     let row = sqlx::query("SELECT source, state, remote_id, remote_url FROM tracks WHERE id = ?")
         .bind(track_id)
-        .fetch_optional(&db.pool)
+        .fetch_optional(pool)
         .await
         .map_err(|e| e.to_string())?
         .ok_or("That track no longer exists.")?;
@@ -114,9 +117,9 @@ pub async fn download_track(
         ));
     }
 
-    let yt_dlp = sidecar::resolve(&app, Tool::YtDlp)?.path;
-    let ffmpeg = sidecar::resolve(&app, Tool::Ffmpeg)?.path;
-    let dir = downloads_dir(&app)?;
+    let yt_dlp = sidecar::resolve(app, Tool::YtDlp)?.path;
+    let ffmpeg = sidecar::resolve(app, Tool::Ffmpeg)?.path;
+    let dir = downloads_dir(app)?;
 
     // Names are keyed by provider *and* id: SoundCloud ids are plain integers,
     // so an id alone could collide with another provider's in one directory.
@@ -149,17 +152,17 @@ pub async fn download_track(
              uploaded_at = COALESCE(uploaded_at, ?) \
          WHERE id = ?",
     )
-        .bind(stored)
-        .bind(uploaded_at)
-        .bind(track_id)
-        .execute(&db.pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    .bind(stored)
+    .bind(uploaded_at)
+    .bind(track_id)
+    .execute(pool)
+    .await
+    .map_err(|e| e.to_string())?;
 
     // A downloaded track is meant to work with the network off, and a
     // thumbnail URL does not. This is the other half of what filing it in the
     // library just did.
-    crate::covers::ensure_for_track_detached(&app, &db.pool, &covers, track_id);
+    crate::covers::ensure_for_track_detached(app, pool, covers, track_id);
 
     Ok(())
 }

@@ -153,7 +153,16 @@
     }
 </script>
 
-<li
+<!--
+  A plain element, not an `<li>`.
+
+  The list belongs to whatever is listing: a virtualised list has to own the
+  positioned wrapper itself, and an `<li>` inside an `<li>` is not valid HTML.
+  Every caller supplies the list element and its item, which is where that
+  decision belongs anyway — this component knows what a track looks like, not
+  what it is one of.
+-->
+<div
     class="group/row has-[:focus-visible]:ring-ring relative rounded-lg transition-colors has-[:focus-visible]:ring-2
            {reorder?.over ? 'bg-accent ring-foreground/25 ring-1' : ''}
            {isCurrent ? 'bg-foreground/[0.055]' : 'hover:bg-foreground/[0.04]'}"
@@ -346,4 +355,4 @@
             {/each}
         </div>
     {/if}
-</li>
+</div>

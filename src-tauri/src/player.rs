@@ -183,6 +183,10 @@ pub enum PlayerCommand {
     /// Queue to the back.
     AddToQueue(i64),
     RemoveFromQueue(u64),
+    /// Play a queued track now, dropping whatever was queued ahead of it.
+    PlayManualEntry(u64),
+    /// Play the nth row of "up next", counting from zero.
+    PlayUpcoming(usize),
     ReorderQueue {
         entry_id: u64,
         to_index: usize,
@@ -228,11 +232,17 @@ impl PlayerCommand {
 /// tested without a window -- which matters because the progress and
 /// end-of-track paths are driven by the engine, never by a command, and so
 /// cannot be exercised through the command API at all.
-pub trait PlayerEvents: Send + Sync + 'static {
+pub trait PlayerEvents: Send + Sync + Clone + 'static {
     fn state(&self, status: PlayerStatus);
     fn progress(&self, progress: PlayerProgress);
     fn error(&self, message: String);
     fn queue(&self, queue: QueueState);
+    /// A background cache fill started or finished.
+    ///
+    /// Routed through this trait rather than an `AppHandle` because the
+    /// coordinator deliberately has none -- and because a test that wants to
+    /// know whether caching was announced should be able to see it.
+    fn caching(&self, track_id: i64, title: Option<String>);
 }
 
 impl<R: Runtime> PlayerEvents for AppHandle<R> {
@@ -250,6 +260,13 @@ impl<R: Runtime> PlayerEvents for AppHandle<R> {
 
     fn queue(&self, queue: QueueState) {
         let _ = self.emit(PLAYER_QUEUE_EVENT, queue);
+    }
+
+    fn caching(&self, track_id: i64, title: Option<String>) {
+        match title {
+            Some(title) => crate::downloads::caching_started(self, track_id, title),
+            None => crate::downloads::caching_finished(self, track_id),
+        }
     }
 }
 
@@ -452,6 +469,25 @@ impl<E: PlayerEvents> Coordinator<E> {
 
             PlayerCommand::RemoveFromQueue(entry_id) => {
                 self.queue.remove_manual(entry_id);
+            }
+
+            // Both of these are Next with a destination: the same start and
+            // the same halt, so a clicked row and a pressed button cannot
+            // end up in different states.
+            PlayerCommand::PlayManualEntry(entry_id) => {
+                self.consider_offline_copy();
+                match self.queue.jump_to_manual(entry_id) {
+                    Some(track_id) => self.start(Some(track_id)),
+                    None => self.halt(),
+                }
+            }
+
+            PlayerCommand::PlayUpcoming(offset) => {
+                self.consider_offline_copy();
+                match self.queue.jump_to_upcoming(offset) {
+                    Some(track_id) => self.start(Some(track_id)),
+                    None => self.halt(),
+                }
             }
 
             PlayerCommand::ReorderQueue { entry_id, to_index } => {
@@ -1026,6 +1062,9 @@ impl<E: PlayerEvents> Coordinator<E> {
 
         let pool = self.pool.clone();
         let fetching = Arc::clone(&self.fetching);
+        // Cloned in because the fill runs on its own task: it reports when it
+        // starts and when it stops, minutes apart.
+        let events = self.events.clone();
 
         tauri::async_runtime::spawn(async move {
             let Ok(Some(row)) = sqlx::query(
@@ -1080,9 +1119,16 @@ impl<E: PlayerEvents> Coordinator<E> {
                 }
             }
 
+            // Shown in the activity panel while it runs -- quietly, and
+            // below the downloads. The user did not ask for this; they only
+            // allowed it, and it should read that way.
+            events.caching(track_id, Some(row.get("title")));
+
             // Silent either way: the user did not ask for this and must not be
             // told off for it failing.
             let _ = crate::download::fetch_into_cache(&yt_dlp, &ffmpeg, &remote_url, pending).await;
+
+            events.caching(track_id, None);
 
             if let Ok(mut active) = fetching.lock() {
                 active.remove(&track_id);
@@ -1522,6 +1568,19 @@ pub async fn add_to_queue(track_id: i64, player: State<'_, PlayerHandle>) -> Res
 #[tauri::command]
 pub async fn remove_from_queue(entry_id: u64, player: State<'_, PlayerHandle>) -> Result<(), String> {
     player.send(PlayerCommand::RemoveFromQueue(entry_id))
+}
+
+#[tauri::command]
+pub async fn play_queued_entry(
+    entry_id: u64,
+    player: State<'_, PlayerHandle>,
+) -> Result<(), String> {
+    player.send(PlayerCommand::PlayManualEntry(entry_id))
+}
+
+#[tauri::command]
+pub async fn play_upcoming(offset: usize, player: State<'_, PlayerHandle>) -> Result<(), String> {
+    player.send(PlayerCommand::PlayUpcoming(offset))
 }
 
 #[tauri::command]

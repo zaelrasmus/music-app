@@ -1,5 +1,6 @@
 <script lang="ts">
     import type { Snippet } from "svelte";
+    import { provideScrollContainer } from "$lib/scroll-container.svelte";
 
     /**
      * The frame every view sits in.
@@ -39,6 +40,14 @@
         toolbar,
         children,
     }: Props = $props();
+
+    /**
+     * The element every view scrolls in, offered to anything inside that
+     * needs to know what is on screen — which in practice means a virtualised
+     * list. Nothing else reads it.
+     */
+    let scroller = $state<HTMLElement>();
+    provideScrollContainer(() => scroller);
 </script>
 
 <div class="flex h-full min-h-0 flex-col">
@@ -89,7 +98,7 @@
     <!-- Rows are indented one step less than the header, so a row's hover
          background bleeds slightly wider than the heading above it and the
          list reads as a surface rather than as a stack of paragraphs. -->
-    <div class="min-h-0 flex-1 overflow-y-auto px-5 pb-8">
+    <div bind:this={scroller} class="min-h-0 flex-1 overflow-y-auto px-5 pb-8">
         {@render children()}
     </div>
 </div>

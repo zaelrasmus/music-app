@@ -3,6 +3,8 @@
     import ListHeader from "$components/list-header.svelte";
     import EmptyState from "$components/empty-state.svelte";
     import TrackRow from "$components/track-row.svelte";
+    import VirtualList from "$components/virtual-list.svelte";
+    import { ROW_HEIGHT } from "$lib/virtual.svelte";
     import { historyStore } from "$lib/history.svelte";
     import { cacheStore } from "$lib/cache.svelte";
     import { player } from "$lib/player.svelte";
@@ -78,15 +80,15 @@
             hint="Play something for half a minute, or to the end, and it will show up."
         />
     {:else}
-        <ul class="flex flex-col">
-            {#each historyStore.tracks as track, index (track.id)}
+        <VirtualList rows={historyStore.tracks} estimateSize={ROW_HEIGHT}>
+            {#snippet row(track, index)}
                 <TrackRow
                     {track}
                     {queueIds}
                     {index}
                     contextName="recently played"
                 />
-            {/each}
-        </ul>
+            {/snippet}
+        </VirtualList>
     {/if}
 </PageShell>

@@ -1,5 +1,6 @@
 <script lang="ts">
     import { onMount } from "svelte";
+    import { SEARCH_ROW_HEIGHT } from "$lib/virtual.svelte";
     import { invoke } from "@tauri-apps/api/core";
     import PageShell from "$components/page-shell.svelte";
     import EmptyState from "$components/empty-state.svelte";
@@ -8,6 +9,7 @@
     import TrackMenu from "$components/track-menu.svelte";
     import CollectionRow from "$components/collection-row.svelte";
     import ArtistHeader from "$components/artist-header.svelte";
+    import VirtualList from "$components/virtual-list.svelte";
     import { Button } from "$components/ui/button";
     import {
         providerSearch,
@@ -291,11 +293,11 @@
                     {/if}
                 </div>
 
-                <ul class="flex flex-col gap-1">
-                    {#each opened.tracks as result (result.remoteUrl)}
+                <VirtualList rows={opened.tracks} estimateSize={SEARCH_ROW_HEIGHT}>
+                    {#snippet row(result)}
                         {@render resultRow(result)}
-                    {/each}
-                </ul>
+                    {/snippet}
+                </VirtualList>
             </section>
         {/if}
     {:else if opened}
@@ -382,11 +384,11 @@
                 Opening… this takes a few seconds for a long playlist.
             </p>
         {:else}
-            <ul class="flex flex-col gap-1">
-                {#each opened.tracks as result (result.remoteUrl)}
+            <VirtualList rows={opened.tracks} estimateSize={SEARCH_ROW_HEIGHT}>
+                {#snippet row(result)}
                     {@render resultRow(result)}
-                {/each}
-            </ul>
+                {/snippet}
+            </VirtualList>
         {/if}
     {:else if providerSearch.kind !== "track"}
         {#if providerSearch.searching && providerSearch.collections.length === 0}
@@ -432,14 +434,16 @@
             hint="Anything you play from here is saved to your library and streams; download it later if you want to keep it."
         />
     {:else}
-        <ul
-            class="flex flex-col gap-1"
-            class:opacity-60={providerSearch.searching}
-        >
-            {#each providerSearch.results as result (result.remoteId)}
-                {@render resultRow(result)}
-            {/each}
-        </ul>
+        <div class:opacity-60={providerSearch.searching}>
+            <VirtualList
+                rows={providerSearch.results}
+                estimateSize={SEARCH_ROW_HEIGHT}
+            >
+                {#snippet row(result)}
+                    {@render resultRow(result)}
+                {/snippet}
+            </VirtualList>
+        </div>
     {/if}
 </PageShell>
 
@@ -454,7 +458,7 @@
     {@const busy = providerSearch.saving === result.remoteId}
     {@const preview = looksLikePreview(result)}
     {@const inLibrary = providerSearch.added.has(result.remoteId)}
-                <li
+                <div
                     class="group/result hover:bg-accent/50 flex items-start gap-3 rounded-lg px-2 py-2 transition-colors"
                 >
                     <div class="relative shrink-0 {artClass}">
@@ -583,5 +587,5 @@
                         label="More actions for {result.title}"
                         trigger="opacity-0 transition-opacity group-hover/result:opacity-100 focus-visible:opacity-100 data-open:opacity-100"
                     />
-                </li>
+                </div>
 {/snippet}

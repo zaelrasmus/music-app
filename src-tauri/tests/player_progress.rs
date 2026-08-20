@@ -46,6 +46,8 @@ impl PlayerEvents for Recorder {
         self.0.errors.lock().unwrap().push(message);
     }
 
+    fn caching(&self, _track_id: i64, _title: Option<String>) {}
+
     fn queue(&self, queue: QueueState) {
         self.0.queues.lock().unwrap().push(queue);
     }

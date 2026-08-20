@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "svelte-sonner";
+import { downloads } from "$lib/downloads.svelte";
 import { libraryView } from "$lib/library-view.svelte";
 
 export type Track = {
@@ -93,26 +94,32 @@ class TrackStore {
 
   // --- offline downloads and metadata ---------------------------------
 
-  /** Track ids with a download in flight, so each row can show progress. */
-  downloading = $state<number[]>([]);
-
+  /**
+   * Whether this track is queued or downloading.
+   *
+   * Read from the download queue rather than tracked here. There used to be a
+   * local list of ids, which was only ever a guess at what the backend was
+   * doing and knew nothing about tracks queued by a playlist download.
+   */
   isDownloading(trackId: number) {
-    return this.downloading.includes(trackId);
+    return downloads.jobs.some(
+      (job) =>
+        job.trackId === trackId &&
+        (job.state === "queued" || job.state === "running"),
+    );
   }
 
-  /** Fetches a saved YouTube track for offline play. */
+  /**
+   * Queues a saved track for offline play.
+   *
+   * Returns as soon as it is queued, not when it is on disk. The command used
+   * to run the whole download and only then come back, which meant a row that
+   * sat spinning for a minute with no way to see why or what else was waiting.
+   * The activity panel in the titlebar is where that lives now, so a click
+   * here is a request rather than a wait.
+   */
   async download(trackId: number) {
-    if (this.isDownloading(trackId)) return;
-    this.downloading.push(trackId);
-
-    try {
-      await invoke("download_track", { trackId });
-      await this.load();
-    } catch (e) {
-      toast.error(String(e));
-    } finally {
-      this.downloading = this.downloading.filter((id) => id !== trackId);
-    }
+    await downloads.queueTrack(trackId);
   }
 
   /** Removes the downloaded file, returning the track to `saved`. */

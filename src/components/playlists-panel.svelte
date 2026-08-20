@@ -7,8 +7,11 @@
     import SearchField from "$components/search-field.svelte";
     import TagFilter from "$components/tag-filter.svelte";
     import TrackRow from "$components/track-row.svelte";
+    import VirtualList from "$components/virtual-list.svelte";
+    import { ROW_HEIGHT } from "$lib/virtual.svelte";
     import CoverArt from "$components/cover-art.svelte";
     import { playlistStore } from "$lib/playlists.svelte";
+    import { downloads } from "$lib/downloads.svelte";
     import { player } from "$lib/player.svelte";
     import { nav } from "$lib/nav.svelte";
     import { promptFor } from "$lib/prompt.svelte";
@@ -24,6 +27,7 @@
     import MoreHorizontalIcon from "@lucide/svelte/icons/more-horizontal";
     import ImageIcon from "@lucide/svelte/icons/image";
     import ImageOffIcon from "@lucide/svelte/icons/image-off";
+    import DownloadIcon from "@lucide/svelte/icons/download";
 
     /** Index currently being dragged, and the index it is hovering over. */
     let dragFrom = $state<number | null>(null);
@@ -265,6 +269,20 @@
                                 </DropdownMenu.Item>
                             {/if}
                             <DropdownMenu.Separator />
+                            <!--
+                              Queues the whole playlist for offline play.
+                              Tracks already on this device are skipped rather
+                              than refused: "have all of it offline" is still
+                              the request when half of it already is.
+                            -->
+                            <DropdownMenu.Item
+                                onSelect={() =>
+                                    downloads.queuePlaylist(detail.playlist.id)}
+                            >
+                                <DownloadIcon />
+                                Download for offline
+                            </DropdownMenu.Item>
+                            <DropdownMenu.Separator />
                             <DropdownMenu.Item
                                 onSelect={async () => {
                                     await playlistStore.remove(detail.playlist.id);
@@ -333,8 +351,8 @@
                 {/if}
             </EmptyState>
         {:else}
-            <ul class="flex flex-col">
-                {#each detail.tracks as track, index (track.id)}
+            <VirtualList rows={detail.tracks} estimateSize={ROW_HEIGHT}>
+                {#snippet row(track, index)}
                     <TrackRow
                         {track}
                         {index}
@@ -367,8 +385,8 @@
                             </DropdownMenu.Item>
                         {/snippet}
                     </TrackRow>
-                {/each}
-            </ul>
+                {/snippet}
+            </VirtualList>
         {/if}
     </PageShell>
 {/if}

@@ -3,6 +3,7 @@ mod collections;
 mod covers;
 pub mod db;
 mod download;
+mod downloads;
 mod engine;
 mod library;
 mod playable;
@@ -61,6 +62,12 @@ pub fn run() {
             app.manage(scanner::ScanLock::new());
             app.manage(download::DownloadLock::new());
 
+            // The download queue and the one worker that drains it. Managed
+            // before the worker starts, because the worker reads the queue
+            // back out of managed state rather than keeping its own copy.
+            let (queue, doorbell) = downloads::Downloads::new();
+            app.manage(queue);
+
             // yt-dlp updates itself by rewriting its own executable, which the
             // install directory does not permit. Staging a copy in app data is
             // what makes updating possible at all, and doing it *before* the
@@ -107,6 +114,16 @@ pub fn run() {
             // them behind the app is a visible loss rather than a free one.
             let cover_store = covers::CoverStore::new(data_dir.join("covers"));
             app.manage(cover_store.clone());
+
+            // Drains the download queue, one track at a time, for as long as
+            // the app runs. Started here because it needs the pool and the
+            // cover store, and both are about to be moved elsewhere.
+            downloads::spawn_worker(
+                app.handle().clone(),
+                pool.clone(),
+                cover_store.clone(),
+                doorbell,
+            );
 
             // Reclaim covers nothing points at any more, once, in the
             // background.
@@ -197,12 +214,18 @@ pub fn run() {
             tags::delete_tag,
             search::query_library,
             search::group_tracks_by_artist,
-            download::download_track,
+            downloads::download_track,
+            downloads::download_playlist,
+            downloads::download_activity,
+            downloads::cancel_download,
+            downloads::clear_finished_downloads,
             download::delete_download,
             player::play_queue,
             player::play_next,
             player::add_to_queue,
             player::remove_from_queue,
+            player::play_queued_entry,
+            player::play_upcoming,
             player::reorder_queue,
             player::clear_queue,
             player::request_queue_state,

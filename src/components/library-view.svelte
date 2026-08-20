@@ -6,6 +6,8 @@
     import SearchField from "$components/search-field.svelte";
     import SortControl from "$components/sort-control.svelte";
     import TrackRow from "$components/track-row.svelte";
+    import VirtualList from "$components/virtual-list.svelte";
+    import { ROW_HEIGHT } from "$lib/virtual.svelte";
     import TagFilter from "$components/tag-filter.svelte";
     import { libraryView } from "$lib/library-view.svelte";
     import { library } from "$lib/library.svelte";
@@ -173,11 +175,14 @@
                         </h2>
                         <ul class="flex flex-col">
                             {#each group.tracks as track, trackIndex (track.id)}
-                                <TrackRow
-                                    {track}
-                                    queueIds={groupedIds}
-                                    index={groupOffsets[groupIndex] + trackIndex}
-                                />
+                                <li>
+                                    <TrackRow
+                                        {track}
+                                        queueIds={groupedIds}
+                                        index={groupOffsets[groupIndex] +
+                                            trackIndex}
+                                    />
+                                </li>
                             {/each}
                         </ul>
                     </section>
@@ -240,10 +245,16 @@
             </EmptyState>
         {/if}
     {:else}
-        <ul class="flex flex-col" class:opacity-60={libraryView.loading}>
-            {#each libraryView.results as track, index (track.id)}
-                <TrackRow {track} queueIds={flatIds} {index} />
-            {/each}
-        </ul>
+        <!--
+          Virtualised: this is the list that holds an entire library, and it
+          is why the query behind it no longer stops at five hundred rows.
+        -->
+        <div class:opacity-60={libraryView.loading}>
+            <VirtualList rows={libraryView.results} estimateSize={ROW_HEIGHT}>
+                {#snippet row(track, index)}
+                    <TrackRow {track} queueIds={flatIds} {index} />
+                {/snippet}
+            </VirtualList>
+        </div>
     {/if}
 </PageShell>
