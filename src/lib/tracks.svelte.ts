@@ -13,6 +13,14 @@ export type Track = {
   /** Names a file in the cover store; null means generated artwork. */
   coverKey?: string | null;
   /**
+   * The provider's own thumbnail, for a track whose cover was never stored.
+   *
+   * Artwork is only kept on disk once a track is kept — added to the library
+   * or downloaded. Everything else shows this URL directly, which costs
+   * nothing and looks identical while there is a network.
+   */
+  remoteThumbnailUrl?: string | null;
+  /**
    * Whether the user keeps this in their library.
    *
    * Always true for local files. False for a streamed track that has been

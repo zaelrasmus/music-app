@@ -3,14 +3,44 @@ import { toast } from "svelte-sonner";
 import { player } from "$lib/player.svelte";
 import { trackStore } from "$lib/tracks.svelte";
 import { libraryView } from "$lib/library-view.svelte";
+import { playlistStore } from "$lib/playlists.svelte";
 import { SvelteSet } from "svelte/reactivity";
 
 export type Provider = "youtube" | "soundcloud";
+
+/** What a search is looking for. */
+export type SearchKind = "track" | "playlist" | "artist";
 
 /** One entry in the provider picker, as the backend lists them. */
 export type ProviderInfo = {
   id: Provider;
   name: string;
+  /**
+   * What this provider can be searched for.
+   *
+   * Sent by the backend rather than decided here, so the tabs on screen and
+   * the searches that can actually run cannot drift apart.
+   */
+  kinds: SearchKind[];
+};
+
+/** A playlist or an artist, as a row in a result list. */
+export type Collection = {
+  provider: Provider;
+  kind: SearchKind;
+  url: string;
+  title: string;
+  uploader: string | null;
+  itemCount: number | null;
+  /** Followers or subscribers, for an artist. Never shown as zero. */
+  followerCount: number | null;
+  thumbnailUrl: string | null;
+};
+
+/** A collection the user is looking inside, with what it holds. */
+export type OpenedCollection = {
+  collection: Collection;
+  tracks: SearchResult[];
 };
 
 export type SearchResult = {
@@ -26,6 +56,13 @@ export type SearchResult = {
   durationSecs: number | null;
   viewCount: number | null;
   thumbnailUrl: string | null;
+  /**
+   * The uploader's own page, when the provider gives one.
+   *
+   * What makes "go to the artist" work from any track on both providers —
+   * including SoundCloud, where artists cannot be searched for at all.
+   */
+  channelUrl: string | null;
   isLive: boolean;
 };
 
@@ -96,8 +133,14 @@ class ProviderSearchStore {
 
     this.provider = provider;
     this.results = [];
+    this.collections = [];
+    this.opened = null;
     this.searched = false;
     this.error = null;
+
+    // A provider that cannot be searched the current way falls back to
+    // tracks, rather than leaving a tab selected that it does not offer.
+    if (!this.kinds.includes(this.kind)) this.kind = "track";
 
     if (this.query.trim() !== "") {
       clearTimeout(this.#debounce);
@@ -115,6 +158,7 @@ class ProviderSearchStore {
       // the user has just cleared.
       this.#latestRequest += 1;
       this.results = [];
+      this.collections = [];
       this.searching = false;
       this.searched = false;
       this.error = null;
@@ -144,6 +188,36 @@ class ProviderSearchStore {
    * the existing track rather than duplicating it — which also means play
    * counts and any edited title survive.
    */
+  /**
+   * Plays a track, and everything around it when there is a surrounding.
+   *
+   * Pressing play on the fourth song of a playlist means "play this playlist,
+   * from here" — not "play this one song and then stop". The context is what
+   * makes the rest follow, and what gives shuffle and repeat something to act
+   * on; without it the queue ends after one track and the other forty-nine
+   * might as well not have been opened.
+   *
+   * Nothing about this needs the playlist to be in the library. The tracks
+   * become ordinary rows on the way to the queue, exactly as a single
+   * audition does, and stay out of the library just the same.
+   */
+  async playFromHere(result: SearchResult) {
+    const opened = this.opened;
+    if (!opened) return this.playResult(result);
+
+    const index = opened.tracks.findIndex(
+      (track) => track.remoteUrl === result.remoteUrl,
+    );
+    if (index < 0) return this.playResult(result);
+
+    this.saving = result.remoteId;
+    try {
+      await this.playAll(index);
+    } finally {
+      this.saving = null;
+    }
+  }
+
   async playResult(result: SearchResult) {
     this.saving = result.remoteId;
 
@@ -221,23 +295,239 @@ class ProviderSearchStore {
     this.error = null;
 
     try {
-      const results = await invoke<SearchResult[]>("search_provider", {
-        provider: this.provider,
-        query,
-        limit: 15,
-      });
+      if (this.kind === "track") {
+        const results = await invoke<SearchResult[]>("search_provider", {
+          provider: this.provider,
+          query,
+          limit: 15,
+        });
 
-      if (request !== this.#latestRequest) return;
-      this.results = results;
+        if (request !== this.#latestRequest) return;
+        this.results = results;
+      } else {
+        const collections = await invoke<Collection[]>("search_collections", {
+          provider: this.provider,
+          kind: this.kind,
+          query,
+        });
+
+        if (request !== this.#latestRequest) return;
+        this.collections = collections;
+      }
+
       this.searched = true;
     } catch (e) {
       if (request !== this.#latestRequest) return;
       this.error = String(e);
       this.results = [];
+      this.collections = [];
     } finally {
       // Only the newest request owns the spinner, or a superseded one would
       // switch it off while a newer search is still running.
       if (request === this.#latestRequest) this.searching = false;
+    }
+  }
+
+  // --- playlists and artists ------------------------------------------
+
+  /**
+   * What the search is looking for.
+   *
+   * Not every provider can answer every question, and which ones it can comes
+   * from the backend rather than from a list kept here — see
+   * `Provider::searchable_kinds`. SoundCloud has no playlist or artist search
+   * at all, so those tabs simply do not appear for it.
+   */
+  kind = $state<SearchKind>("track");
+  collections = $state<Collection[]>([]);
+
+  /** The playlist or artist being looked inside, if any. */
+  opened = $state<OpenedCollection | null>(null);
+  expanding = $state(false);
+  importing = $state(false);
+
+  get kinds(): SearchKind[] {
+    return (
+      this.providers.find((p) => p.id === this.provider)?.kinds ?? ["track"]
+    );
+  }
+
+  async setKind(kind: SearchKind) {
+    if (kind === this.kind) return;
+
+    this.kind = kind;
+    // Results of the old kind are meaningless under the new tab, and a
+    // search takes seconds — leaving them up would be a lie for that whole
+    // time.
+    this.results = [];
+    this.collections = [];
+    this.searched = false;
+    this.error = null;
+    this.opened = null;
+
+    if (this.query.trim() !== "") {
+      clearTimeout(this.#debounce);
+      await this.search(this.query);
+    }
+  }
+
+  /**
+   * Looks inside a playlist or artist.
+   *
+   * The search results behind it are kept exactly as they are: going back has
+   * to be instant, and re-running the search to rebuild a list the user was
+   * just looking at would cost seconds to arrive at the same thing.
+   */
+  async openCollection(collection: Collection) {
+    this.expanding = true;
+    this.error = null;
+    this.opened = { collection, tracks: [] };
+
+    try {
+      const expansion = await invoke<OpenedCollection>("expand_collection", {
+        provider: collection.provider,
+        kind: collection.kind,
+        url: collection.url,
+      });
+
+      // Still the one being opened? A second click while the first was in
+      // flight would otherwise fill this one with the other's tracks.
+      if (this.opened?.collection.url !== collection.url) return;
+
+      // The page's own description of itself replaces the row that led here.
+      // That row is whatever a search happened to say — and for an artist
+      // reached from a track it is a bare name with no picture at all.
+      //
+      // Field by field rather than wholesale: a provider that omits something
+      // should leave what the search already knew, not blank it. A search
+      // result carrying artwork the page does not is common, and losing it
+      // would be a visible regression from the row the user just clicked.
+      this.opened = {
+        collection: {
+          ...expansion.collection,
+          title: expansion.collection.title || collection.title,
+          uploader: expansion.collection.uploader ?? collection.uploader,
+          itemCount: expansion.collection.itemCount ?? collection.itemCount,
+          followerCount:
+            expansion.collection.followerCount ?? collection.followerCount,
+          thumbnailUrl:
+            expansion.collection.thumbnailUrl ?? collection.thumbnailUrl,
+        },
+        tracks: expansion.tracks,
+      };
+    } catch (e) {
+      if (this.opened?.collection.url !== collection.url) return;
+      this.error = String(e);
+      this.opened = null;
+    } finally {
+      this.expanding = false;
+    }
+  }
+
+  /** Opens the artist behind a track, without needing artist search. */
+  async openArtistOf(result: SearchResult) {
+    if (!result.channelUrl) return;
+
+    await this.openCollection({
+      provider: result.provider,
+      kind: "artist",
+      url: result.channelUrl,
+      title: result.channel ?? "Artist",
+      uploader: null,
+      itemCount: null,
+      followerCount: null,
+      // All unknown from a track row — the artist page fills them in from
+      // the page itself the moment it opens.
+      thumbnailUrl: null,
+    });
+  }
+
+  back() {
+    this.opened = null;
+    this.error = null;
+  }
+
+  /**
+   * Plays everything in the open collection, in order.
+   *
+   * One bulk save, then one queue — the tracks become ordinary rows first, and
+   * from that point the player cannot tell this from a local playlist. Shuffle
+   * and repeat therefore work on it without knowing it is remote, because they
+   * act on the context and the context is just track ids.
+   */
+  async playAll(startIndex = 0) {
+    const opened = this.opened;
+    if (!opened || opened.tracks.length === 0) return;
+
+    this.importing = true;
+    try {
+      const ids = await invoke<number[]>("save_remote_tracks", {
+        results: opened.tracks,
+      });
+      await player.playQueue(ids, startIndex, opened.collection.title);
+    } catch (e) {
+      toast.error(String(e));
+    } finally {
+      this.importing = false;
+    }
+  }
+
+  /**
+   * Plays the collection shuffled.
+   *
+   * Shuffle is turned on *before* the queue exists, because the coordinator
+   * re-derives the permutation over whatever a new context contains and keeps
+   * the starting track at the front. Doing it afterwards would leave the first
+   * track being the list's head, which is not what the button says.
+   *
+   * The start is picked at random for the same reason: "shuffle" that always
+   * opens with track one is not shuffled in the only place the user can see.
+   */
+  async shuffleAll() {
+    const opened = this.opened;
+    if (!opened || opened.tracks.length === 0) return;
+
+    if (!player.shuffle) await player.toggleShuffle();
+    await this.playAll(Math.floor(Math.random() * opened.tracks.length));
+  }
+
+  /**
+   * Copies the open collection into a playlist of the user's own.
+   *
+   * The tracks are saved but deliberately not filed in the library: importing
+   * a fifty-track album says "keep this list", not "put fifty tracks in my
+   * library". Each one can still be added individually from inside it.
+   */
+  async importCollection(): Promise<number | null> {
+    const opened = this.opened;
+    if (!opened || opened.tracks.length === 0) return null;
+
+    this.importing = true;
+    try {
+      const trackIds = await invoke<number[]>("save_remote_tracks", {
+        results: opened.tracks,
+      });
+
+      const playlist = await invoke<{ id: number; name: string }>(
+        "import_playlist",
+        {
+          name: opened.collection.title,
+          source: opened.collection.provider,
+          sourceUrl: opened.collection.url,
+          trackIds,
+        },
+      );
+
+      await playlistStore.load();
+      toast.success(
+        `Saved “${playlist.name}” — ${trackIds.length} tracks, in your playlists.`,
+      );
+      return playlist.id;
+    } catch (e) {
+      toast.error(String(e));
+      return null;
+    } finally {
+      this.importing = false;
     }
   }
 }

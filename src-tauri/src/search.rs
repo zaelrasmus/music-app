@@ -93,7 +93,7 @@ pub struct ArtistGroup {
 
 const TRACK_COLUMNS: &str =
     "SELECT t.id, t.source, t.title, t.artist, t.album, t.duration_secs, t.state, t.cover_key, \
-     t.in_library FROM tracks t";
+     t.in_library, t.remote_thumbnail_url FROM tracks t";
 
 /// Turns what the user typed into an FTS5 expression.
 ///
@@ -216,7 +216,7 @@ pub async fn query_library(
 pub async fn group_tracks_by_artist(db: State<'_, Db>) -> Result<Vec<ArtistGroup>, String> {
     let tracks: Vec<Track> = sqlx::query_as(
         "SELECT t.id, t.source, t.title, t.artist, t.album, t.duration_secs, t.state, t.cover_key,
-                t.in_library
+                t.in_library, t.remote_thumbnail_url
          FROM tracks t
          WHERE t.in_library = 1
          ORDER BY LOWER(COALESCE(NULLIF(TRIM(t.artist), ''), 'Unknown Artist')),

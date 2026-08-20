@@ -1,4 +1,5 @@
 pub mod audio_cache;
+mod collections;
 mod covers;
 pub mod db;
 mod download;
@@ -12,6 +13,7 @@ mod queue;
 mod scanner;
 mod search;
 mod sidecar;
+mod soundcloud;
 mod stream_urls;
 mod tags;
 mod transcode;
@@ -103,7 +105,28 @@ pub fn run() {
             // Cover art. Not under `cache/`: entries here are cheap to
             // rebuild but are referenced by id from the database, so clearing
             // them behind the app is a visible loss rather than a free one.
-            app.manage(covers::CoverStore::new(data_dir.join("covers")));
+            let cover_store = covers::CoverStore::new(data_dir.join("covers"));
+            app.manage(cover_store.clone());
+
+            // Reclaim covers nothing points at any more, once, in the
+            // background.
+            //
+            // The sweep already runs after every scan, but a library of
+            // streamed tracks may go months without one -- and the migration
+            // that stopped auditions from keeping artwork has just released a
+            // batch of files that no row references. Waiting for a rescan to
+            // collect them would mean the fix does nothing for the people who
+            // already have the problem.
+            //
+            // Safe to run here specifically because nothing fetches a cover at
+            // startup: the only writers are keeping a track and finishing a
+            // download, both of which need a user.
+            {
+                let pool = pool.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = scanner::sweep_covers(&pool, &cover_store).await;
+                });
+            }
 
             app.manage(player::spawn(
                 app.handle().clone(),
@@ -201,6 +224,11 @@ pub fn run() {
             providers::list_providers,
             youtube::search_provider,
             youtube::save_remote_track,
+            youtube::save_remote_tracks,
+            collections::search_collections,
+            collections::expand_collection,
+            collections::max_expanded_tracks,
+            playlists::import_playlist,
             updater::yt_dlp_status,
             updater::update_yt_dlp,
         ])

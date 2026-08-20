@@ -148,7 +148,10 @@ pub async fn scan_all(
 ///
 /// Failure is not worth surfacing: an orphaned JPEG costs a few kilobytes and
 /// the next scan tries again.
-async fn sweep_covers(pool: &SqlitePool, covers: &CoverStore) -> Result<usize, String> {
+pub(crate) async fn sweep_covers(
+    pool: &SqlitePool,
+    covers: &CoverStore,
+) -> Result<usize, String> {
     let keys: Vec<String> = sqlx::query_scalar(
         "SELECT cover_key FROM tracks WHERE cover_key IS NOT NULL
          UNION

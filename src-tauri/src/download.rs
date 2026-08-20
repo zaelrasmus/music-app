@@ -81,6 +81,7 @@ pub fn downloads_dir(app: &AppHandle) -> Result<PathBuf, String> {
 pub async fn download_track(
     app: AppHandle,
     db: State<'_, Db>,
+    covers: State<'_, crate::covers::CoverStore>,
     downloads: State<'_, DownloadLock>,
     track_id: i64,
 ) -> Result<(), String> {
@@ -154,6 +155,11 @@ pub async fn download_track(
         .execute(&db.pool)
         .await
         .map_err(|e| e.to_string())?;
+
+    // A downloaded track is meant to work with the network off, and a
+    // thumbnail URL does not. This is the other half of what filing it in the
+    // library just did.
+    crate::covers::ensure_for_track_detached(&app, &db.pool, &covers, track_id);
 
     Ok(())
 }

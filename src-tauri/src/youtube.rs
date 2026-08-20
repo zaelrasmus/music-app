@@ -1,9 +1,10 @@
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
-use crate::providers::Provider;
+use crate::collections::Collection;
+use crate::providers::{Provider, SearchKind};
 use crate::sidecar::{self, Tool};
 
 /// Runs yt-dlp with `args` and returns stdout.
@@ -12,15 +13,10 @@ use crate::sidecar::{self, Tool};
 /// that API delivers output as line-oriented events, which is fine for JSON but
 /// unusable for the raw PCM byte stream ffmpeg will produce. Keeping one
 /// spawning mechanism for both tools avoids two ways of doing the same thing.
-async fn run(app: &AppHandle, args: Vec<String>) -> Result<String, String> {
-    let tool = sidecar::resolve(app, Tool::YtDlp)?;
-    run_at(tool.path, args).await
-}
-
-/// Same, but for callers that already know where yt-dlp lives.
 ///
-/// Playback resolution runs on the coordinator, which deliberately has no
-/// `AppHandle`, so it is handed the path at startup instead.
+/// Takes the path rather than an `AppHandle`: playback resolution runs on the
+/// coordinator, which deliberately has none, and a test needs to be able to
+/// point this at a real binary without a running app.
 async fn run_at(yt_dlp: std::path::PathBuf, args: Vec<String>) -> Result<String, String> {
     // yt-dlp takes seconds -- ~4 for a search, ~7 to resolve a stream -- and is
     // a blocking process spawn. Running it inline would park a runtime worker
@@ -116,6 +112,13 @@ pub struct SearchResult {
     pub duration_secs: Option<f64>,
     pub view_count: Option<u64>,
     pub thumbnail_url: Option<String>,
+    /// The uploader's own page, when the provider gives one.
+    ///
+    /// This is what makes "go to the artist" work from any track, on both
+    /// providers -- including SoundCloud, where artists cannot be *searched*
+    /// for at all. Every search result already carries it, so the route that
+    /// needs no search is the one that always works.
+    pub channel_url: Option<String>,
     /// Live streams have no duration, so the UI shows this instead of a blank.
     pub is_live: bool,
     /// Publication time in unix seconds, or `None` when the provider does not
@@ -124,28 +127,146 @@ pub struct SearchResult {
 }
 
 /// `--flat-playlist` returns a playlist envelope around the entries.
+///
+/// The envelope is ignored by a search -- where it only repeats the query --
+/// and is the whole point when opening a collection, because it is the page
+/// describing itself.
 #[derive(Debug, Deserialize)]
-struct SearchResponse {
+pub(crate) struct SearchResponse {
     #[serde(default)]
-    entries: Vec<Option<SearchEntry>>,
+    pub(crate) entries: Vec<Option<SearchEntry>>,
+    /// The playlist's name, or a channel tab's ("Daft Punk - Videos").
+    #[serde(default)]
+    title: Option<String>,
+    /// The channel's own name, without the tab suffix.
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    uploader: Option<String>,
+    #[serde(default)]
+    playlist_count: Option<u64>,
+    #[serde(default)]
+    channel_follower_count: Option<u64>,
+    #[serde(default)]
+    thumbnails: Vec<Thumbnail>,
+}
+
+impl SearchResponse {
+    /// What the page says about itself.
+    ///
+    /// `url` is passed back rather than read from the envelope: it is the one
+    /// already validated for this provider, and everything downstream --
+    /// playing, importing, opening again -- goes through it.
+    pub(crate) fn collection(
+        &self,
+        provider: Provider,
+        kind: SearchKind,
+        url: &str,
+    ) -> crate::collections::Collection {
+        // An artist is the channel, not the tab. Opening a channel lands on
+        // its videos, and the envelope titles that "Daft Punk - Videos" --
+        // which is the tab's name, not the artist's.
+        let title = match kind {
+            SearchKind::Artist => self.channel.clone().or_else(|| self.title.clone()),
+            _ => self.title.clone(),
+        }
+        .unwrap_or_else(|| "(untitled)".to_string());
+
+        crate::collections::Collection {
+            provider,
+            kind,
+            url: url.to_string(),
+            title,
+            uploader: match kind {
+                SearchKind::Artist => None,
+                _ => self.channel.clone().or_else(|| self.uploader.clone()),
+            },
+            item_count: self.playlist_count,
+            follower_count: self.channel_follower_count,
+            thumbnail_url: pick_thumbnail(&self.thumbnails),
+        }
+    }
+}
+
+/// Runs one `--flat-playlist` extraction and parses the envelope.
+///
+/// The single place that shape is produced, because four callers now want it:
+/// a track search, a playlist search, an artist search, and expanding any of
+/// the last two. They differ only in the argument yt-dlp is pointed at --
+/// a search prefix, a results URL, a playlist URL, a channel URL -- which is
+/// exactly the difference this takes as a parameter.
+///
+/// `limit` caps the entries. Left off, a channel with two thousand uploads is
+/// two thousand entries of JSON before anything can be shown.
+pub(crate) async fn flat_playlist(
+    app: &AppHandle,
+    target: &str,
+    limit: Option<u32>,
+) -> Result<SearchResponse, String> {
+    let tool = sidecar::resolve(app, Tool::YtDlp)?;
+    flat_playlist_at(tool.path, target, limit).await
+}
+
+/// Same, for callers that already know where yt-dlp lives.
+///
+/// Split for the same reason `run_at` is: it makes the extraction reachable
+/// without an `AppHandle`, which is what lets a test point it at a real
+/// service and check what actually comes back.
+pub(crate) async fn flat_playlist_at(
+    yt_dlp: std::path::PathBuf,
+    target: &str,
+    limit: Option<u32>,
+) -> Result<SearchResponse, String> {
+    let mut args = vec![
+        target.to_string(),
+        "--flat-playlist".to_string(),
+        "-J".to_string(),
+        "--no-warnings".to_string(),
+    ];
+
+    if let Some(limit) = limit {
+        args.push("--playlist-end".to_string());
+        args.push(limit.to_string());
+    }
+
+    let json = run_at(yt_dlp, args).await?;
+
+    serde_json::from_str(&json).map_err(|e| format!("Could not read what came back: {e}"))
 }
 
 /// Only `id` is guaranteed. Entries can even be `null` when a video became
 /// unavailable between indexing and the query, hence `Vec<Option<_>>` above.
 #[derive(Debug, Deserialize)]
-struct SearchEntry {
+pub(crate) struct SearchEntry {
     id: String,
     /// The canonical page. yt-dlp also sends `url`, but for SoundCloud that is
     /// an `api.soundcloud.com` form with percent-encoded ids; `webpage_url` is
     /// the stable public one, and both providers always send it.
     #[serde(default)]
     webpage_url: Option<String>,
+    /// The other URL yt-dlp sends, and the only one a *collection* entry has:
+    /// a playlist or channel row carries `url` and no `webpage_url` at all.
+    #[serde(default)]
+    url: Option<String>,
+    /// Which extractor would handle this entry.
+    ///
+    /// `YoutubeTab` for a playlist or a channel, `Youtube` for a video. This
+    /// is what proves a filtered search really was filtered, rather than
+    /// having quietly returned videos.
+    #[serde(default)]
+    ie_key: Option<String>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     channel: Option<String>,
     #[serde(default)]
     uploader: Option<String>,
+    /// The uploader's page. `channel_url` on YouTube, `uploader_url` on
+    /// SoundCloud -- both providers send one, under their own name.
+    #[serde(default)]
+    channel_url: Option<String>,
+    #[serde(default)]
+    uploader_url: Option<String>,
     #[serde(default)]
     duration: Option<f64>,
     #[serde(default)]
@@ -181,17 +302,77 @@ impl SearchEntry {
     /// not recognise, or no usable page URL. Dropping one dead row is right --
     /// the alternative is a result that saves fine and then fails at play time
     /// with nothing to point at.
-    fn normalize(self, provider: Provider) -> Option<SearchResult> {
+    /// Turns a raw entry into a playlist or artist row, or drops it.
+    ///
+    /// The `ie_key` check is the load-bearing part. YouTube's result filters
+    /// are undocumented parameters it may stop honouring, and an unrecognised
+    /// one is *ignored* rather than refused -- so the same request that used
+    /// to return playlists starts returning videos, with no error anywhere.
+    /// Only a `YoutubeTab` entry is a collection; a video says `Youtube` and
+    /// is dropped here, which is what turns a silent wrong answer into a
+    /// visibly empty one the caller can complain about.
+    pub(crate) fn into_collection(
+        self,
+        provider: Provider,
+        kind: SearchKind,
+    ) -> Option<Collection> {
+        if self.ie_key.as_deref() != Some("YoutubeTab") {
+            return None;
+        }
+
+        // A collection entry carries `url`; only a video carries
+        // `webpage_url`. Both are checked so neither shape can slip through
+        // unvalidated into a subprocess argument.
+        let url = self
+            .url
+            .or(self.webpage_url)
+            .filter(|url| provider.accepts_url(url))?;
+
+        Some(Collection {
+            provider,
+            kind,
+            url,
+            title: self.title.unwrap_or_else(|| "(untitled)".to_string()),
+            // An artist row's uploader is its own name, which would read as
+            // "Daft Punk, by Daft Punk".
+            uploader: match kind {
+                SearchKind::Artist => None,
+                _ => self.channel.or(self.uploader),
+            },
+            // YouTube does not report a length on a search result. Left empty
+            // rather than filled with a plausible-looking guess.
+            item_count: None,
+            follower_count: None,
+            thumbnail_url: pick_thumbnail(&self.thumbnails),
+        })
+    }
+
+    pub(crate) fn normalize(self, provider: Provider) -> Option<SearchResult> {
         if !provider.accepts_id(&self.id) {
             return None;
         }
 
-        // Derivable for YouTube, never for SoundCloud -- which is exactly why
-        // the URL is stored rather than reconstructed.
-        let remote_url = self
-            .webpage_url
-            .or_else(|| provider.page_url(&self.id))
-            .filter(|url| provider.accepts_url(url))?;
+        // Three candidates, first acceptable one wins -- and the order is the
+        // whole point.
+        //
+        // `webpage_url` is the stable public page and is what a *search*
+        // result carries. Expanding a collection does not: a SoundCloud set
+        // lists entries with `url` alone, so preferring `webpage_url` and
+        // stopping there dropped every track in every set.
+        //
+        // `url` cannot simply be trusted in its place, which is why this
+        // filters rather than picks: on a SoundCloud search it is an
+        // `api.soundcloud.com` form with percent-encoded ids, and that host is
+        // not one this provider accepts -- so it is skipped there and used
+        // here, without either case needing to know about the other.
+        //
+        // The derived page URL is last and exists only for YouTube; SoundCloud
+        // URLs embed the uploader's handle and cannot be rebuilt from an id.
+        let remote_url = [self.webpage_url, self.url]
+            .into_iter()
+            .flatten()
+            .chain(provider.page_url(&self.id))
+            .find(|url| provider.accepts_url(url))?;
 
         Some(SearchResult {
             provider,
@@ -204,6 +385,10 @@ impl SearchEntry {
             duration_secs: self.duration,
             view_count: self.view_count,
             thumbnail_url: pick_thumbnail(&self.thumbnails),
+            channel_url: self
+                .channel_url
+                .or(self.uploader_url)
+                .filter(|url| provider.accepts_url(url)),
             uploaded_at: self.timestamp.or(self.release_timestamp),
             is_live: self.live_status.as_deref() == Some("is_live"),
         })
@@ -255,19 +440,7 @@ pub async fn search_provider(
 
     // The query is one argv entry embedded after `<prefix>N:`, and no shell is
     // involved, so it cannot become a flag or a second argument.
-    let json = run(
-        &app,
-        vec![
-            format!("{prefix}{limit}:{query}"),
-            "--flat-playlist".to_string(),
-            "-J".to_string(),
-            "--no-warnings".to_string(),
-        ],
-    )
-    .await?;
-
-    let response: SearchResponse =
-        serde_json::from_str(&json).map_err(|e| format!("Could not parse search results: {e}"))?;
+    let response = flat_playlist(&app, &format!("{prefix}{limit}:{query}"), None).await?;
 
     Ok(response
         .entries
@@ -596,6 +769,7 @@ mod tests {
             duration_secs: Some(322.606),
             view_count: Some(5),
             thumbnail_url: None,
+            channel_url: Some("https://soundcloud.com/daftpunk".to_string()),
             uploaded_at: None,
             is_live: false,
         };
@@ -604,6 +778,7 @@ mod tests {
         assert!(json.contains("\"remoteId\""), "got {json}");
         assert!(json.contains("\"remoteUrl\""), "got {json}");
         assert!(json.contains("\"viewCount\""), "got {json}");
+        assert!(json.contains("\"channelUrl\""), "got {json}");
         assert!(json.contains("\"soundcloud\""), "got {json}");
 
         let back: SearchResult = serde_json::from_str(&json).expect("should parse back");
@@ -885,7 +1060,7 @@ mod search_tests {
 /// encodes are easy to break silently and impossible to notice by hand: the
 /// conflict branch must leave `in_library` alone, and must not overwrite a
 /// known upload date with a NULL from a provider that did not report one.
-const SAVE_REMOTE_TRACK: &str = "INSERT INTO tracks (
+pub(crate) const SAVE_REMOTE_TRACK: &str = "INSERT INTO tracks (
          source, title, artist, duration_secs, state,
          remote_id, remote_url, remote_uploader, remote_title,
          remote_thumbnail_url, uploaded_at, in_library
@@ -914,9 +1089,7 @@ const SAVE_REMOTE_TRACK: &str = "INSERT INTO tracks (
 /// overwrite `title` or `artist`, which the user may have edited.
 #[tauri::command]
 pub async fn save_remote_track(
-    app: AppHandle,
     db: tauri::State<'_, crate::db::Db>,
-    covers: tauri::State<'_, crate::covers::CoverStore>,
     result: SearchResult,
 ) -> Result<i64, String> {
     // The result round-trips through the frontend, so neither field is trusted
@@ -954,70 +1127,71 @@ pub async fn save_remote_track(
     .await
     .map_err(|e| e.to_string())?;
 
-    // Detached, because saving is on the path to *playing*: a result queued or
-    // played from search must not wait on a picture. The row is already usable
-    // without artwork -- the UI draws generated art until this lands and emits.
-    if let Some(url) = result.thumbnail_url.clone() {
-        let pool = db.pool.clone();
-        let store = (*covers).clone();
-        tauri::async_runtime::spawn(async move {
-            store_remote_cover(app, pool, store, id, url).await;
-        });
-    }
-
+    // No artwork is fetched here, deliberately.
+    //
+    // Saving is what auditioning does, and nine auditions out of ten are
+    // rejected -- so fetching a cover at this point spends disk on a decision
+    // the user has not made yet, and the row keeps referencing it forever.
+    // `remote_thumbnail_url` is on the row, the webview may load it directly,
+    // and the picture looks identical either way.
+    //
+    // The stored copy is bought where it is needed: `tracks::set_in_library`
+    // and `download::download_track`, the two places that mean "keep this".
     Ok(id)
 }
 
-/// Event fired once a track's artwork has arrived, carrying the new key so the
-/// frontend can patch one row instead of reloading a list.
-pub const COVER_READY_EVENT: &str = "cover-ready";
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CoverReady {
-    track_id: i64,
-    cover_key: String,
-}
-
-/// Best-effort, and silent when it fails.
+/// Saves many results at once, returning their ids in the order given.
 ///
-/// A missing thumbnail costs nothing the user can see -- generated artwork is
-/// already there -- so none of this is worth an error toast. The URL stays in
-/// `remote_thumbnail_url`, which is what makes a later retry possible.
-async fn store_remote_cover(
-    app: AppHandle,
-    pool: sqlx::SqlitePool,
-    covers: crate::covers::CoverStore,
-    track_id: i64,
-    url: String,
-) {
-    let Ok(ffmpeg) = crate::sidecar::resolve(&app, crate::sidecar::Tool::Ffmpeg) else {
-        return;
-    };
+/// Exists because a playlist is not fifty separate decisions. Calling the
+/// single-track command fifty times would be fifty IPC round trips and fifty
+/// transactions to record one gesture, and a failure halfway would leave the
+/// playlist half saved with nothing to say which half.
+///
+/// One transaction, so the set either lands or does not. Order is preserved
+/// because the caller is about to use it as a queue or a playlist, where the
+/// order *is* the content.
+#[tauri::command]
+pub async fn save_remote_tracks(
+    db: tauri::State<'_, crate::db::Db>,
+    results: Vec<SearchResult>,
+) -> Result<Vec<i64>, String> {
+    let mut tx = db.pool.begin().await.map_err(|e| e.to_string())?;
+    let mut ids = Vec::with_capacity(results.len());
 
-    let key = match crate::covers::fetch_remote_cover(ffmpeg.path, url, covers).await {
-        Ok(key) => key,
-        Err(e) => {
-            eprintln!("cover art skipped for track {track_id}: {e}");
-            return;
+    for result in results {
+        // Same checks as the single-track path, for the same reason: these
+        // round-trip through the frontend before coming back here.
+        if !result.provider.accepts_id(&result.remote_id)
+            || !result.provider.accepts_url(&result.remote_url)
+        {
+            return Err(format!(
+                "One of those is not a valid {} track.",
+                result.provider.display_name()
+            ));
         }
-    };
 
-    if sqlx::query("UPDATE tracks SET cover_key = ? WHERE id = ?")
-        .bind(&key)
-        .bind(track_id)
-        .execute(&pool)
-        .await
-        .is_err()
-    {
-        return;
+        let duration_secs = result.duration_secs.map(|d| d.round() as i64);
+
+        let id: i64 = sqlx::query_scalar(SAVE_REMOTE_TRACK)
+            .bind(result.provider.as_str())
+            .bind(&result.title)
+            .bind(&result.channel)
+            .bind(duration_secs)
+            .bind(&result.remote_id)
+            .bind(&result.remote_url)
+            .bind(&result.channel)
+            .bind(&result.title)
+            .bind(&result.thumbnail_url)
+            .bind(result.uploaded_at)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        ids.push(id);
     }
 
-    let _ = app.emit(
-        COVER_READY_EVENT,
-        CoverReady {
-            track_id,
-            cover_key: key,
-        },
-    );
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    Ok(ids)
 }
+

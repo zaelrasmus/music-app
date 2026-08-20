@@ -22,6 +22,13 @@ pub struct Track {
     pub state: String,
     /// Names a file in the cover store. `None` means generated artwork.
     pub cover_key: Option<String>,
+    /// The provider's own thumbnail, for tracks with no stored copy.
+    ///
+    /// Carried so a row that was only ever auditioned still shows real
+    /// artwork: the webview loads this URL directly, at no cost on disk. A
+    /// track that is kept gets a stored copy and `cover_key` takes over --
+    /// which is the one that still works with the network off.
+    pub remote_thumbnail_url: Option<String>,
     /// Whether the user keeps this in their library.
     ///
     /// Always true for local files. False for a streamed track that has been
@@ -33,7 +40,8 @@ pub struct Track {
 #[tauri::command]
 pub async fn list_tracks(db: State<'_, Db>) -> Result<Vec<Track>, String> {
     sqlx::query_as(
-        "SELECT id, source, title, artist, album, duration_secs, state, cover_key, in_library \
+        "SELECT id, source, title, artist, album, duration_secs, state, cover_key, in_library, \
+         remote_thumbnail_url \
          FROM tracks WHERE in_library = 1 ORDER BY artist, album, title",
     )
     .fetch_all(&db.pool)
@@ -58,7 +66,8 @@ pub async fn recently_played(db: State<'_, Db>, limit: Option<u32>) -> Result<Ve
     let limit = limit.unwrap_or(50).clamp(1, 500);
 
     sqlx::query_as(
-        "SELECT id, source, title, artist, album, duration_secs, state, cover_key, in_library \
+        "SELECT id, source, title, artist, album, duration_secs, state, cover_key, in_library, \
+         remote_thumbnail_url \
          FROM tracks WHERE last_played IS NOT NULL \
          ORDER BY last_played DESC LIMIT ?",
     )
@@ -74,9 +83,15 @@ pub async fn recently_played(db: State<'_, Db>, limit: Option<u32>) -> Result<Ve
 /// and its playlist memberships all survive. It only stops being listed in the
 /// library, which is the difference between "I do not want this filed here"
 /// and "destroy it".
+///
+/// This is also where a streamed track earns its stored artwork. Filing one is
+/// the gesture that says it should still be there with the network off, and
+/// until then the provider's thumbnail URL is doing the job for free.
 #[tauri::command]
 pub async fn set_in_library(
+    app: AppHandle,
     db: State<'_, Db>,
+    covers: State<'_, crate::covers::CoverStore>,
     track_id: i64,
     in_library: bool,
 ) -> Result<(), String> {
@@ -89,6 +104,13 @@ pub async fn set_in_library(
 
     if outcome.rows_affected() == 0 {
         return Err("That track no longer exists.".to_string());
+    }
+
+    // Only on the way in. Taking a track out of the library deliberately does
+    // not throw its cover away: the row survives, history still shows it, and
+    // re-filing it would only have to fetch the same bytes again.
+    if in_library {
+        crate::covers::ensure_for_track_detached(&app, &db.pool, &covers, track_id);
     }
 
     Ok(())

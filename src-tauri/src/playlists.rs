@@ -17,6 +17,13 @@ pub struct Playlist {
     pub created_at: i64,
     /// Shown in the list so a playlist's size is visible without opening it.
     pub track_count: i64,
+    /// The provider an imported playlist came from, if it was imported.
+    ///
+    /// Null for every playlist made by hand, which is what tells the two
+    /// apart without a flag that could disagree with the URL beside it.
+    pub source: Option<String>,
+    /// The provider page it was built from.
+    pub source_url: Option<String>,
 }
 
 /// A playlist together with its tracks, in order.
@@ -62,6 +69,71 @@ pub async fn create_playlist(db: State<'_, Db>, name: String) -> Result<Playlist
     load_playlist(&db.pool, id).await
 }
 
+/// Creates a playlist from a provider's, remembering where it came from.
+///
+/// The tracks are already saved rows by the time this is called; what happens
+/// here is only the playlist and its membership.
+///
+/// Deliberately **not** filed in the library. Importing says "I want this list
+/// to be here", not "I want fifty tracks in my library" -- and the difference
+/// matters most for the big imports, where the second reading would bury a
+/// carefully kept library under an album someone half remembered. Each track
+/// can still be added individually, from the playlist, by the same gesture
+/// that adds any other.
+///
+/// A name is taken rather than derived, so the provider's own title can be
+/// edited before it lands.
+#[tauri::command]
+pub async fn import_playlist(
+    db: State<'_, Db>,
+    name: String,
+    source: crate::providers::Provider,
+    source_url: String,
+    track_ids: Vec<i64>,
+) -> Result<Playlist, String> {
+    let name = clean_name(&name)?;
+
+    if !source.accepts_url(&source_url) {
+        return Err(format!(
+            "That does not look like a {} link.",
+            source.display_name()
+        ));
+    }
+
+    let mut tx = db.pool.begin().await.map_err(|e| e.to_string())?;
+
+    let playlist_id: i64 = sqlx::query_scalar(
+        "INSERT INTO playlists (name, source, source_url) VALUES (?, ?, ?) RETURNING id",
+    )
+    .bind(&name)
+    .bind(source.as_str())
+    .bind(&source_url)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Positions are assigned from the given order rather than read back,
+    // because the playlist is new: nothing else can be inserting into it, and
+    // the order the provider listed is the order the user is looking at.
+    for (position, track_id) in track_ids.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position)
+             VALUES (?, ?, ?)
+             ON CONFLICT (playlist_id, track_id) DO NOTHING",
+        )
+        .bind(playlist_id)
+        .bind(track_id)
+        .bind(position as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| describe_track_error(&e, *track_id))?;
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+
+    load_playlist(&db.pool, playlist_id).await
+}
+
 #[tauri::command]
 pub async fn rename_playlist(
     db: State<'_, Db>,
@@ -101,7 +173,7 @@ pub async fn delete_playlist(db: State<'_, Db>, playlist_id: i64) -> Result<(), 
 #[tauri::command]
 pub async fn list_playlists(db: State<'_, Db>) -> Result<Vec<Playlist>, String> {
     sqlx::query_as(
-        "SELECT p.id, p.name, p.cover_key, p.created_at,
+        "SELECT p.id, p.name, p.cover_key, p.created_at, p.source, p.source_url,
                 COUNT(pt.track_id) AS track_count
          FROM playlists p
          LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
@@ -142,7 +214,7 @@ pub async fn get_playlist(
     }
 
     let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(
-        "SELECT t.id, t.source, t.title, t.artist, t.album, t.duration_secs, t.state, t.cover_key, t.in_library
+        "SELECT t.id, t.source, t.title, t.artist, t.album, t.duration_secs, t.state, t.cover_key, t.in_library, t.remote_thumbnail_url
          FROM playlist_tracks pt
          JOIN tracks t ON t.id = pt.track_id",
     );
@@ -333,7 +405,7 @@ pub async fn reorder_playlist_track(
 
 async fn load_playlist(pool: &sqlx::SqlitePool, playlist_id: i64) -> Result<Playlist, String> {
     sqlx::query_as(
-        "SELECT p.id, p.name, p.cover_key, p.created_at,
+        "SELECT p.id, p.name, p.cover_key, p.created_at, p.source, p.source_url,
                 COUNT(pt.track_id) AS track_count
          FROM playlists p
          LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
@@ -385,5 +457,195 @@ fn describe_track_error(error: &sqlx::Error, track_id: i64) -> String {
         format!("Track {track_id} no longer exists.")
     } else {
         text
+    }
+}
+
+/// Importing a provider playlist, against a real database.
+///
+/// The interesting parts are not the SQL but the promises made around it: that
+/// the order survives, that the tracks stay out of the library, and that the
+/// playlist remembers where it came from.
+#[cfg(test)]
+mod import_tests {
+    use crate::providers::Provider;
+    use sqlx::{Row, SqlitePool};
+
+    async fn pool(name: &str) -> SqlitePool {
+        let dir = std::env::temp_dir().join(format!("music-app-import-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::db::init(&dir).await.unwrap().pool
+    }
+
+    /// The statements `save_remote_tracks` runs, in one transaction.
+    async fn save_many(pool: &SqlitePool, ids: &[&str]) -> Vec<i64> {
+        let mut tx = pool.begin().await.unwrap();
+        let mut saved = Vec::new();
+
+        for (n, remote_id) in ids.iter().enumerate() {
+            let id: i64 = sqlx::query_scalar(crate::youtube::SAVE_REMOTE_TRACK)
+                .bind("youtube")
+                .bind(format!("Track {n}"))
+                .bind(Some("An Uploader"))
+                .bind(Some(180i64))
+                .bind(remote_id)
+                .bind(format!("https://www.youtube.com/watch?v={remote_id}"))
+                .bind(Some("An Uploader"))
+                .bind(format!("Track {n}"))
+                .bind(Some("https://i.ytimg.com/vi/x/hq.jpg"))
+                .bind(None::<i64>)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+            saved.push(id);
+        }
+
+        tx.commit().await.unwrap();
+        saved
+    }
+
+    /// The statements `import_playlist` runs.
+    async fn import(pool: &SqlitePool, name: &str, url: &str, track_ids: &[i64]) -> i64 {
+        let playlist_id: i64 = sqlx::query_scalar(
+            "INSERT INTO playlists (name, source, source_url) VALUES (?, ?, ?) RETURNING id",
+        )
+        .bind(name)
+        .bind(Provider::YouTube.as_str())
+        .bind(url)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        for (position, track_id) in track_ids.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO playlist_tracks (playlist_id, track_id, position)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT (playlist_id, track_id) DO NOTHING",
+            )
+            .bind(playlist_id)
+            .bind(track_id)
+            .bind(position as i64)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        playlist_id
+    }
+
+    #[tokio::test]
+    async fn an_imported_playlist_keeps_the_providers_order() {
+        let pool = pool("order").await;
+        // Deliberately not alphabetical, and not the order the ids sort in:
+        // the only thing that should decide this is the order given.
+        let ids = save_many(&pool, &["ccccccccccc", "aaaaaaaaaaa", "bbbbbbbbbbb"]).await;
+        let playlist = import(&pool, "Discovery", "https://www.youtube.com/playlist?list=X", &ids).await;
+
+        let ordered: Vec<i64> = sqlx::query_scalar(
+            "SELECT track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position",
+        )
+        .bind(playlist)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(ordered, ids, "a playlist's order is its content");
+    }
+
+    /// The user's decision, made explicit: keep the list, not fifty tracks.
+    #[tokio::test]
+    async fn imported_tracks_stay_out_of_the_library() {
+        let pool = pool("library").await;
+        let ids = save_many(&pool, &["ddddddddddd", "eeeeeeeeeee"]).await;
+        import(&pool, "An Album", "https://www.youtube.com/playlist?list=Y", &ids).await;
+
+        let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tracks WHERE in_library = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(kept, 0, "importing a list must not file every track in it");
+    }
+
+    #[tokio::test]
+    async fn an_imported_playlist_remembers_where_it_came_from() {
+        let pool = pool("provenance").await;
+        let ids = save_many(&pool, &["fffffffffff"]).await;
+        let url = "https://www.youtube.com/playlist?list=Z";
+        let playlist = import(&pool, "Imported", url, &ids).await;
+
+        let row = sqlx::query("SELECT source, source_url FROM playlists WHERE id = ?")
+            .bind(playlist)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(row.get::<Option<String>, _>("source").as_deref(), Some("youtube"));
+        assert_eq!(row.get::<Option<String>, _>("source_url").as_deref(), Some(url));
+    }
+
+    /// A playlist made by hand is told apart by having no origin at all,
+    /// rather than by a flag that could disagree with the URL beside it.
+    #[tokio::test]
+    async fn a_handmade_playlist_has_no_origin() {
+        let pool = pool("handmade").await;
+
+        let id: i64 = sqlx::query_scalar("INSERT INTO playlists (name) VALUES (?) RETURNING id")
+            .bind("Mine")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let row = sqlx::query("SELECT source, source_url FROM playlists WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert!(row.get::<Option<String>, _>("source").is_none());
+        assert!(row.get::<Option<String>, _>("source_url").is_none());
+    }
+
+    /// Re-importing the same playlist must not multiply its rows.
+    #[tokio::test]
+    async fn importing_the_same_tracks_twice_reuses_them() {
+        let pool = pool("twice").await;
+        let first = save_many(&pool, &["ggggggggggg", "hhhhhhhhhhh"]).await;
+        let second = save_many(&pool, &["ggggggggggg", "hhhhhhhhhhh"]).await;
+
+        assert_eq!(first, second, "the same remote track is the same row");
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tracks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
+    }
+    /// A migration that failed to apply looks exactly like one that did,
+    /// right up until a query mentions a column that is not there.
+    #[tokio::test]
+    async fn every_column_this_feature_added_exists() {
+        let dir = std::env::temp_dir().join("music-app-migration-shape");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let pool = crate::db::init(&dir).await.unwrap().pool;
+
+        for (table, column) in [
+            ("tracks", "remote_thumbnail_url"),
+            ("playlists", "source"),
+            ("playlists", "source_url"),
+        ] {
+            let found: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+            assert_eq!(found, 1, "{table}.{column} is missing");
+        }
     }
 }

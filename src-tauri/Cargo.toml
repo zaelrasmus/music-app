@@ -63,6 +63,28 @@ image = { version = "0.25", default-features = false, features = [
 # rules out DefaultHasher -- it is explicitly not guaranteed across releases,
 # and these hashes are filenames on disk.
 sha2 = "0.10"
+# One provider, one endpoint: SoundCloud's own search API.
+#
+# Every other network call this app makes goes through yt-dlp or ffmpeg, and
+# that was worth trying first -- ffmpeg already fetches cover art over HTTPS.
+# It cannot carry this: asked for a JSON body it reports "Output file does not
+# contain any stream", because it is a media demuxer and this is not media.
+# The webview cannot either -- api-v2 sends no `Access-Control-Allow-Origin`
+# for any origin but its own, so `fetch` is blocked before it starts. Both
+# measured rather than assumed.
+#
+# `native-tls` rather than `rustls-tls`: on Windows it is schannel, already
+# present, with nothing to compile -- while rustls pulls aws-lc-rs, which
+# wants NASM and cmake on this platform. The cost is that a Linux build needs
+# OpenSSL headers, which is the right way round for an app whose installer is
+# Windows-only today.
+#
+# default-features = false drops the charset, cookie and gzip machinery that
+# one JSON GET has no use for.
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "native-tls",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

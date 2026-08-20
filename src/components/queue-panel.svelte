@@ -105,6 +105,7 @@
                         <CoverArt
                             seed={coverSeed(queueStore.current)}
                             coverKey={queueStore.current.coverKey}
+                            src={queueStore.current.remoteThumbnailUrl}
                             class="size-9"
                             glyph={false}
                         />

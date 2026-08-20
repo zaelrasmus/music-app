@@ -21,6 +21,8 @@ export type QueueEntry = {
   state: string;
   source: string;
   coverKey: string | null;
+  /** The provider thumbnail, for a row with no stored cover. */
+  remoteThumbnailUrl: string | null;
 };
 
 export type QueueState = {

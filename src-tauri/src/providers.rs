@@ -58,6 +58,47 @@ impl Provider {
         }
     }
 
+    /// Which kinds of thing this provider can be searched for.
+    ///
+    /// Both providers answer all three, but by two entirely different routes,
+    /// which is why [`Provider::search_target`] returns `None` for half of
+    /// them: yt-dlp has no playlist or user search for SoundCloud at all
+    /// (`soundcloud.com/search/sets?q=` is routed to the user extractor and
+    /// 404s), so those go through SoundCloud's own API instead.
+    ///
+    /// Kept as a table anyway rather than assumed. It is what the UI builds
+    /// its tabs from, and a provider that loses a capability should lose the
+    /// tab with it rather than keeping one that always fails.
+    pub fn searchable_kinds(self) -> &'static [SearchKind] {
+        match self {
+            Provider::YouTube | Provider::SoundCloud => {
+                &[SearchKind::Track, SearchKind::Playlist, SearchKind::Artist]
+            }
+        }
+    }
+
+    /// The argument yt-dlp is given to search for `kind`.
+    ///
+    /// `None` when yt-dlp is not the route: SoundCloud playlists and artists
+    /// go through `crate::soundcloud` instead, and the caller dispatches on
+    /// exactly this being absent.
+    ///
+    /// Tracks use yt-dlp's own search prefix on both providers. YouTube's
+    /// other two go through its results page with a filter, because that is
+    /// the only route yt-dlp offers to them -- see [`youtube_filter`] for what
+    /// that costs.
+    pub fn search_target(self, kind: SearchKind, query: &str, limit: u32) -> Option<String> {
+        match (self, kind) {
+            (_, SearchKind::Track) => Some(format!("{}{limit}:{query}", self.search_prefix())),
+            (Provider::YouTube, _) => Some(format!(
+                "https://www.youtube.com/results?search_query={}&sp={}",
+                percent_encode(query),
+                youtube_filter(kind)?
+            )),
+            (Provider::SoundCloud, _) => None,
+        }
+    }
+
     /// Builds a page URL from an id, where that is possible at all.
     ///
     /// Only a fallback for when yt-dlp omits `webpage_url`. SoundCloud returns
@@ -134,12 +175,85 @@ impl Provider {
     }
 }
 
+/// What a search is looking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchKind {
+    Track,
+    Playlist,
+    /// A channel on YouTube, a user on SoundCloud. "Artist" is what a listener
+    /// calls it, and neither provider's own word survives contact with the
+    /// question the user is actually asking.
+    Artist,
+}
+
+impl SearchKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchKind::Track => "track",
+            SearchKind::Playlist => "playlist",
+            SearchKind::Artist => "artist",
+        }
+    }
+}
+
+/// YouTube's `sp` search filter for a kind of result.
+///
+/// These are base64url-encoded protobufs -- `EgIQAw==` is "type = playlist",
+/// `EgIQAg==` is "type = channel" -- and they are entirely undocumented.
+///
+/// Worth being clear-eyed about: this is the one piece of provider knowledge
+/// in the app that yt-dlp does **not** own. Everything else that breaks when a
+/// service changes is fixed by a yt-dlp update, which the app now installs by
+/// itself. If YouTube retires these values, no update fixes it, and the
+/// failure mode is quiet -- a filter it does not recognise is ignored, and the
+/// page returns ordinary video results.
+///
+/// So the caller checks that what came back really is a collection rather than
+/// trusting the filter to have been applied. A loud failure is recoverable; a
+/// playlist tab silently full of single videos is not.
+fn youtube_filter(kind: SearchKind) -> Option<&'static str> {
+    match kind {
+        SearchKind::Playlist => Some("EgIQAw%3D%3D"),
+        SearchKind::Artist => Some("EgIQAg%3D%3D"),
+        SearchKind::Track => None,
+    }
+}
+
+/// Percent-encodes a search query for a URL query string.
+///
+/// Hand-rolled rather than pulled in: this is the only place in the app that
+/// builds a URL, and the rule is small enough to state completely. Everything
+/// outside the unreserved set of RFC 3986 is escaped, so nothing the user
+/// types can add a parameter, change the filter, or leave the results page.
+pub(crate) fn percent_encode(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+
+    for byte in query.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            b' ' => out.push('+'),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+
+    out
+}
+
 /// One entry in the provider picker.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderInfo {
     pub id: Provider,
     pub name: &'static str,
+    /// What this provider can be searched for.
+    ///
+    /// Sent rather than hardcoded in the UI, so the tabs on screen and the
+    /// searches that can actually run cannot drift apart. SoundCloud offers
+    /// only tracks -- see `Provider::searchable_kinds`.
+    pub kinds: &'static [SearchKind],
 }
 
 /// The providers the app can search.
@@ -154,6 +268,7 @@ pub async fn list_providers() -> Result<Vec<ProviderInfo>, String> {
         .map(|id| ProviderInfo {
             id,
             name: id.display_name(),
+            kinds: id.searchable_kinds(),
         })
         .collect())
 }

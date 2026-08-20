@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 
 use image::codecs::jpeg::JpegEncoder;
 use sha2::{Digest, Sha256};
+use sqlx::Row;
+use tauri::{AppHandle, Emitter};
 
 /// The longest edge of a stored cover, in pixels.
 ///
@@ -300,6 +302,122 @@ pub async fn fetch_remote_cover(
         .map_err(|e| e.to_string())?
 }
 
+/// The event announcing that a track's artwork has landed.
+///
+/// Lives here rather than with the provider search that used to own it: the
+/// fetch is no longer part of finding a track, it is part of keeping one, and
+/// keeping happens in places that know nothing about searching.
+pub const COVER_READY_EVENT: &str = "cover-ready";
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverReady {
+    pub track_id: i64,
+    pub cover_key: String,
+}
+
+/// Stores a remote track's artwork, if it has none yet.
+///
+/// Called when a track is **kept** -- filed in the library, or downloaded --
+/// and deliberately not when one is merely auditioned. A preview already shows
+/// the provider's thumbnail straight from its URL, which the webview is
+/// allowed to load and which costs nothing to hold; a *stored* copy only earns
+/// its disk once the track has to survive being offline.
+///
+/// Every failure here is silent by design. It runs detached from the gesture
+/// that triggered it, that gesture has already succeeded, and a missing
+/// picture is not worth a toast over a track that is otherwise fine.
+/// The URL worth fetching for a row, if any.
+///
+/// Split out because both answers are easy to get wrong in a way nothing would
+/// notice: fetching again for a row that already has a key costs a process and
+/// a download to arrive at the identical content-addressed name, and fetching
+/// for a row with no thumbnail URL spawns ffmpeg to fail.
+fn fetch_wanted(cover_key: Option<&str>, thumbnail_url: Option<&str>) -> Option<String> {
+    if cover_key.is_some() {
+        return None;
+    }
+
+    // A URL that is present but empty is the same as absent. SQLite is happy
+    // to hold `''`, and ffmpeg would be asked to open nothing.
+    thumbnail_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+}
+
+pub async fn ensure_for_track(
+    app: AppHandle,
+    pool: sqlx::SqlitePool,
+    covers: CoverStore,
+    track_id: i64,
+) {
+    let row = sqlx::query("SELECT cover_key, remote_thumbnail_url FROM tracks WHERE id = ?")
+        .bind(track_id)
+        .fetch_optional(&pool)
+        .await;
+
+    let Ok(Some(row)) = row else {
+        return;
+    };
+
+    let Some(url) = fetch_wanted(
+        row.get::<Option<String>, _>("cover_key").as_deref(),
+        row.get::<Option<String>, _>("remote_thumbnail_url").as_deref(),
+    ) else {
+        return;
+    };
+
+    let Ok(ffmpeg) = crate::sidecar::resolve(&app, crate::sidecar::Tool::Ffmpeg) else {
+        return;
+    };
+
+    let key = match fetch_remote_cover(ffmpeg.path, url, covers).await {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("cover art skipped for track {track_id}: {e}");
+            return;
+        }
+    };
+
+    if sqlx::query("UPDATE tracks SET cover_key = ? WHERE id = ?")
+        .bind(&key)
+        .bind(track_id)
+        .execute(&pool)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let _ = app.emit(
+        COVER_READY_EVENT,
+        CoverReady {
+            track_id,
+            cover_key: key,
+        },
+    );
+}
+
+/// Spawns [`ensure_for_track`], so keeping a track never waits on a picture.
+///
+/// The row is complete and usable the moment the caller returns; the artwork
+/// arrives later and announces itself.
+pub fn ensure_for_track_detached(
+    app: &AppHandle,
+    pool: &sqlx::SqlitePool,
+    covers: &CoverStore,
+    track_id: i64,
+) {
+    let app = app.clone();
+    let pool = pool.clone();
+    let covers = covers.clone();
+
+    tauri::async_runtime::spawn(async move {
+        ensure_for_track(app, pool, covers, track_id).await;
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,4 +636,30 @@ mod tests {
         let keep: HashSet<String> = std::iter::once(kept).collect();
         assert_eq!(store.sweep(&keep), 1);
     }
-}
+
+    #[test]
+    fn a_track_that_already_has_artwork_is_left_alone() {
+        // The store is content-addressed, so a second fetch would spend a
+        // process and a download to write the identical file back.
+        assert_eq!(
+            fetch_wanted(Some("abc123"), Some("https://i.ytimg.com/vi/x/hq.jpg")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_track_with_no_thumbnail_is_left_alone() {
+        assert_eq!(fetch_wanted(None, None), None);
+        // SQLite will hold an empty string quite happily, and ffmpeg would be
+        // spawned to open nothing at all.
+        assert_eq!(fetch_wanted(None, Some("")), None);
+        assert_eq!(fetch_wanted(None, Some("   ")), None);
+    }
+
+    #[test]
+    fn a_kept_track_with_only_a_thumbnail_url_is_fetched() {
+        assert_eq!(
+            fetch_wanted(None, Some("https://i.ytimg.com/vi/x/hq.jpg")),
+            Some("https://i.ytimg.com/vi/x/hq.jpg".to_string())
+        );
+    }}

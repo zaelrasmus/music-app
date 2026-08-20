@@ -230,6 +230,7 @@
                     <CoverArt
                         seed={coverSeed(track)}
                         coverKey={track.coverKey}
+                        src={track.remoteThumbnailUrl}
                         class="size-10"
                         glyph={false}
                     />

@@ -46,6 +46,12 @@
         (nowPlaying as { coverKey?: string | null } | null)?.coverKey ?? null,
     );
 
+    /** Same shape question as the cover key: both list types carry it. */
+    const remoteThumbnail = $derived(
+        (nowPlaying as { remoteThumbnailUrl?: string | null } | null)
+            ?.remoteThumbnailUrl ?? null,
+    );
+
     const totalSecs = $derived(nowPlaying?.durationSecs ?? 0);
     const loading = $derived(player.state === "loading");
     /**
@@ -108,6 +114,7 @@
             <CoverArt
                 seed={coverSeed(nowPlaying)}
                 coverKey={coverKey}
+                src={remoteThumbnail}
                 class="size-[52px] rounded-lg"
             />
             <div class="flex min-w-0 flex-col gap-0.5">

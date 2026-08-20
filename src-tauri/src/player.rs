@@ -152,6 +152,8 @@ pub struct QueueEntry {
     pub source: String,
     /// Names a file in the cover store; `None` means generated artwork.
     pub cover_key: Option<String>,
+    /// The provider thumbnail, for a row whose cover was never stored.
+    pub remote_thumbnail_url: Option<String>,
 }
 
 /// The whole "Up Next" panel in one payload.
@@ -1236,8 +1238,8 @@ impl<E: PlayerEvents> Coordinator<E> {
         }
 
         let mut builder = QueryBuilder::new(
-            "SELECT id, source, title, artist, duration_secs, state, cover_key \
-         FROM tracks WHERE id IN (",
+            "SELECT id, source, title, artist, duration_secs, state, cover_key, \
+          remote_thumbnail_url FROM tracks WHERE id IN (",
         );
         let mut separated = builder.separated(", ");
         for id in ids {
@@ -1264,6 +1266,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                         duration_secs: row.get("duration_secs"),
                         state: row.get("state"),
                         cover_key: row.get("cover_key"),
+                        remote_thumbnail_url: row.get("remote_thumbnail_url"),
                     },
                 )
             })
@@ -1451,6 +1454,7 @@ struct TrackDetail {
     duration_secs: Option<i64>,
     state: String,
     cover_key: Option<String>,
+    remote_thumbnail_url: Option<String>,
 }
 
 /// Turns an id into a row, keeping deleted tracks visible.
@@ -1469,6 +1473,7 @@ fn entry_for(details: &HashMap<i64, TrackDetail>, entry_id: Option<u64>, track_i
             state: detail.state.clone(),
             source: detail.source.clone(),
             cover_key: detail.cover_key.clone(),
+            remote_thumbnail_url: detail.remote_thumbnail_url.clone(),
         },
         None => QueueEntry {
             entry_id,
@@ -1479,6 +1484,7 @@ fn entry_for(details: &HashMap<i64, TrackDetail>, entry_id: Option<u64>, track_i
             state: "missing".to_string(),
             source: "local".to_string(),
             cover_key: None,
+            remote_thumbnail_url: None,
         },
     }
 }
