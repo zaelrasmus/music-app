@@ -135,14 +135,15 @@ const MEMBER_COUNT: &str = "
          THEN (SELECT COUNT(*) FROM tracks t
                LEFT JOIN playlist_tracks pt
                       ON pt.track_id = t.id AND pt.playlist_id = p.id
-               WHERE (pt.track_id IS NOT NULL
+               WHERE ((pt.track_id IS NOT NULL AND pt.by_rule = 0)
                       OR (t.in_library = 1
                           AND lower(trim(COALESCE(NULLIF(trim(t.remote_uploader), ''), t.artist)))
                               IN (SELECT artist_key FROM playlist_artist_rules
                                   WHERE playlist_id = p.id)))
                  AND t.id NOT IN (SELECT track_id FROM playlist_excluded_tracks
                                   WHERE playlist_id = p.id))
-         ELSE (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id)
+         ELSE (SELECT COUNT(*) FROM playlist_tracks pt
+               WHERE pt.playlist_id = p.id AND pt.by_rule = 0)
     END AS track_count";
 
 /// How a track's artist is identified for matching, as SQL.
@@ -397,8 +398,12 @@ pub async fn playlist_tracks(
     // Without this the picker and the rule disagree -- it offers an artist with
     // two tracks and the rule admits thirty-nine, which is the kind of surprise
     // that stops anyone trusting a list they did not enumerate.
+    // `pt.by_rule = 0` on the first branch: a row written to remember where
+    // a rule match sits is *ordering*, not membership. Without that test the
+    // rule would stop deciding anything the moment an order was recorded, and
+    // removing it would leave every track it ever matched behind.
     query
-        .push(" WHERE (pt.track_id IS NOT NULL OR (t.in_library = 1 AND ")
+        .push(" WHERE ((pt.track_id IS NOT NULL AND pt.by_rule = 0) OR (t.in_library = 1 AND ")
         .push(ARTIST_KEY)
         .push(" IN (SELECT artist_key FROM playlist_artist_rules WHERE playlist_id = ")
         .push_bind(playlist_id)
@@ -469,7 +474,21 @@ pub async fn add_tracks_to_playlist(
     playlist_id: i64,
     track_ids: Vec<i64>,
 ) -> Result<AddOutcome, String> {
-    let mut tx = db.pool.begin().await.map_err(|e| e.to_string())?;
+    add_tracks(&db.pool, playlist_id, track_ids).await
+}
+
+/// Appends tracks, ignoring any already present.
+///
+/// A free function taking a pool, for the same reason `playlist_tracks` is one:
+/// this is where "added by hand" is distinguished from "the rule put it there",
+/// and a test that had to reach it through Tauri would re-type the statement
+/// instead of running it.
+pub async fn add_tracks(
+    pool: &sqlx::SqlitePool,
+    playlist_id: i64,
+    track_ids: Vec<i64>,
+) -> Result<AddOutcome, String> {
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
     ensure_playlist_exists(&mut tx, playlist_id).await?;
 
@@ -500,10 +519,14 @@ pub async fn add_tracks_to_playlist(
             .await
             .map_err(|e| e.to_string())?;
 
+        // An existing *ordering* row is promoted rather than skipped:
+        // adding a track by hand says it belongs whatever the rules do
+        // later, and that is a different claim from where it sits.
         let inserted = sqlx::query(
-            "INSERT INTO playlist_tracks (playlist_id, track_id, position)
-             VALUES (?, ?, ?)
-             ON CONFLICT (playlist_id, track_id) DO NOTHING",
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position, by_rule)
+             VALUES (?, ?, ?, 0)
+             ON CONFLICT (playlist_id, track_id) DO UPDATE SET by_rule = 0
+             WHERE playlist_tracks.by_rule = 1",
         )
         .bind(playlist_id)
         .bind(track_id)
@@ -729,9 +752,13 @@ async fn materialise_order(pool: &sqlx::SqlitePool, playlist_id: i64) -> Result<
     // Renumbered from the shown order, so positions stay dense and a UI
     // ordinal keeps matching a stored one.
     for (position, track) in shown.iter().enumerate() {
+        // `by_rule = 1` on insert only. A track that already has a row keeps
+        // whichever kind it was: hand-added rows are written by
+        // `add_tracks_to_playlist`, and nothing here may quietly demote one
+        // to an ordering row.
         sqlx::query(
-            "INSERT INTO playlist_tracks (playlist_id, track_id, position)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position, by_rule)
+             VALUES (?1, ?2, ?3, 1)
              ON CONFLICT (playlist_id, track_id) DO UPDATE SET position = ?3",
         )
         .bind(playlist_id)
@@ -1048,6 +1075,14 @@ pub async fn add_playlist_artist_rule(
     // and a rule is a decision about a name. Neither overrules the other, and
     // silently discarding the more specific one is the wrong way round.
 
+    // The order is written down now rather than on the first drag.
+    //
+    // Rows for the tracks a rule matches are *ordering* rows, so recording
+    // them costs the rule nothing -- it still decides membership -- and it
+    // means the playlist can be rearranged from the moment it exists, with
+    // no invisible change of behaviour partway through.
+    materialise_order(&db.pool, playlist_id).await?;
+
     // Spawned, not awaited: finding the picture is a provider round trip of
     // several seconds, and naming an artist should take effect immediately.
     // The playlist keeps its generated art until this lands.
@@ -1143,6 +1178,29 @@ pub async fn remove_playlist_artist_rule(
     sqlx::query("DELETE FROM playlist_artist_rules WHERE playlist_id = ? AND artist_key = ?")
         .bind(playlist_id)
         .bind(artist_key_of(&artist_key))
+        .execute(&db.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // The ordering rows for tracks no rule matches any more are now saying
+    // where something that is not here should sit. Harmless, but they would
+    // accumulate for as long as rules were added and dropped, so they go with
+    // the rule that justified them. Hand-added rows are untouched: those are a
+    // decision, not bookkeeping.
+    let mut orphans: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
+        "DELETE FROM playlist_tracks
+         WHERE by_rule = 1
+           AND track_id NOT IN (
+             SELECT t.id FROM tracks t
+             WHERE {ARTIST_KEY} IN (
+                 SELECT artist_key FROM playlist_artist_rules WHERE playlist_id = "
+    ));
+    orphans.push_bind(playlist_id);
+    orphans.push(")) AND playlist_id = ");
+    orphans.push_bind(playlist_id);
+
+    orphans
+        .build()
         .execute(&db.pool)
         .await
         .map_err(|e| e.to_string())?;

@@ -39,6 +39,13 @@ export type ScanSummary = {
   unchanged: number;
   markedMissing: number;
   errors: number;
+  /**
+   * Files the scan gave up on rather than wait for.
+   *
+   * Named, not just counted: this is the one outcome that could be wrong, and
+   * a legitimate file wrongly abandoned would otherwise be silently absent.
+   */
+  skippedFiles: string[];
   skippedFolders: string[];
 };
 
@@ -51,14 +58,37 @@ export type ScanSummary = {
 class TrackStore {
   tracks = $state<Track[]>([]);
   scanning = $state(false);
+  /**
+   * How far the running scan has got.
+   *
+   * A thousand files takes long enough that a spinner alone is
+   * indistinguishable from a hang. Null when nothing is scanning.
+   */
+  progress = $state<{ folder: string; file: string | null; done: number; total: number } | null>(
+    null,
+  );
   lastSummary = $state<ScanSummary | null>(null);
   error = $state<string | null>(null);
 
   /** Refetches whenever the backend reports a finished scan. */
   listenForScans() {
-    return listen("scan-finished", () => {
+    const finished = listen("scan-finished", () => {
       this.load();
     });
+
+    const progress = listen<{ folder: string; file: string | null; done: number; total: number }>(
+      "scan-progress",
+      ({ payload }) => {
+        this.progress = payload;
+      },
+    );
+
+    return Promise.all([finished, progress]).then(
+      ([offFinished, offProgress]) => () => {
+        offFinished();
+        offProgress();
+      },
+    );
   }
 
   async load() {
@@ -75,20 +105,29 @@ class TrackStore {
 
   async rescan() {
     this.scanning = true;
+    this.progress = null;
     try {
       // null means a scan was already running -- the backend refuses to start
       // a second one rather than interleaving two passes.
       const summary = await invoke<ScanSummary | null>("rescan_library");
       if (summary === null) {
         this.error = "A scan is already running.";
+        toast.info("A scan is already running.");
         return;
       }
       this.lastSummary = summary;
       this.error = null;
+
+      // Said out loud, where the user is. The summary was only ever shown in
+      // Settings, so a rescan started from the library finished in silence --
+      // indistinguishable from one that never finished at all.
+      toast.success(describeScan(summary));
     } catch (e) {
       this.error = String(e);
+      toast.error(String(e));
     } finally {
       this.scanning = false;
+      this.progress = null;
     }
   }
 
@@ -163,6 +202,33 @@ export async function setInLibrary(trackId: number, inLibrary: boolean) {
     toast.error(String(e));
     return false;
   }
+}
+
+/**
+ * What a finished scan actually did, in one sentence.
+ *
+ * Only the parts that changed. "1019 scanned, 0 added, 0 updated, 1019
+ * unchanged" is four numbers to read before learning that nothing happened.
+ */
+function describeScan(summary: ScanSummary) {
+  const parts: string[] = [];
+  if (summary.added > 0) parts.push(`${summary.added} added`);
+  if (summary.updated > 0) parts.push(`${summary.updated} updated`);
+  if (summary.markedMissing > 0) parts.push(`${summary.markedMissing} missing`);
+  if (summary.errors > 0) parts.push(`${summary.errors} could not be read`);
+  if (summary.skippedFiles.length > 0) {
+    parts.push(
+      `${summary.skippedFiles.length} skipped as too slow — see Settings`,
+    );
+  }
+
+  const scanned = `Scanned ${summary.scanned} ${
+    summary.scanned === 1 ? "file" : "files"
+  }`;
+
+  return parts.length > 0
+    ? `${scanned} — ${parts.join(", ")}.`
+    : `${scanned} — nothing changed.`;
 }
 
 export const trackStore = new TrackStore();

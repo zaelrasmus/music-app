@@ -306,11 +306,38 @@ impl PlayerQueue {
 
     /// Turns recycling on or off.
     ///
-    /// Takes effect from the next track: whatever is playing keeps playing,
-    /// because the alternative is a button that interrupts the music to prove
-    /// it was pressed.
+    /// Whatever is playing keeps playing -- a button that interrupts the music
+    /// to prove it was pressed is a bad button -- but it *joins the loop*.
+    ///
+    /// "Loop these" said while a song is audible plainly includes that song:
+    /// it is the one you are listening to. Leaving it out means the loop skips
+    /// it forever after, and the only way back in is to queue it again by hand,
+    /// which is a chore invented by an implementation detail -- that it came
+    /// from a playlist rather than from the queue.
+    ///
+    /// It joins at the *end*, so the tracks already waiting keep their turn and
+    /// the current one comes round again where it belongs. And it joins as an
+    /// ordinary entry, visible in the panel and removable there, so a user who
+    /// meant only the next four is one click from saying so.
     pub fn set_loop_manual(&mut self, on: bool) {
         self.loop_manual = on;
+
+        if !on {
+            return;
+        }
+
+        let Some(playing) = self.current else {
+            return;
+        };
+
+        // Already round again: it came from the queue and the loop kept it, or
+        // the user queued it twice. Either way, adding another would make it
+        // play twice a lap.
+        if self.manual.iter().any(|e| e.track_id == playing.track_id) {
+            return;
+        }
+
+        self.enqueue_last(playing.track_id);
     }
 
     pub fn context_upcoming(&self, limit: usize) -> Vec<i64> {
@@ -712,9 +739,10 @@ mod tests {
         assert_eq!(q.on_next(), Some(104));
     }
 
-    /// Turning it on mid-listen does not disturb what is playing.
+    /// Turning it on mid-listen does not disturb what is playing -- and does
+    /// not leave it out of the loop either.
     #[test]
-    fn a_track_already_playing_is_left_alone() {
+    fn the_playing_track_joins_the_loop_without_being_interrupted() {
         let mut q = PlayerQueue::default();
         q.enqueue_last(101);
         q.enqueue_last(102);
@@ -724,7 +752,47 @@ mod tests {
 
         assert_eq!(q.current(), Some(101), "the button must not skip a track");
         assert_eq!(q.on_next(), Some(102));
-        assert_eq!(q.on_next(), Some(102), "and 101 is gone, having played");
+        assert_eq!(
+            q.on_next(),
+            Some(101),
+            "the song that was playing has to come round again",
+        );
+    }
+
+    /// The reported case: something from a playlist is playing, four tracks are
+    /// queued behind it, and "loop the queue" is expected to mean all five.
+    #[test]
+    fn a_context_track_joins_the_loop_it_was_playing_over() {
+        let mut q = PlayerQueue::default();
+        q.set_context(vec![1, 2, 3], 0, None);
+        assert_eq!(q.current(), Some(1));
+
+        for id in [101, 102, 103, 104] {
+            q.enqueue_last(id);
+        }
+        q.set_loop_manual(true);
+
+        let heard: Vec<Option<i64>> = (0..6).map(|_| q.on_next()).collect();
+        assert_eq!(
+            heard,
+            vec![Some(101), Some(102), Some(103), Some(104), Some(1), Some(101)],
+            "the queued four then the one that was playing, round again",
+        );
+    }
+
+    /// It joins once, not once per press.
+    #[test]
+    fn toggling_the_loop_does_not_stack_copies_of_the_playing_track() {
+        let mut q = PlayerQueue::default();
+        q.set_context(vec![1], 0, None);
+        q.enqueue_last(101);
+
+        q.set_loop_manual(true);
+        q.set_loop_manual(false);
+        q.set_loop_manual(true);
+
+        let queued: Vec<i64> = q.manual().map(|e| e.track_id).collect();
+        assert_eq!(queued, vec![101, 1], "got {queued:?}");
     }
 
     #[test]

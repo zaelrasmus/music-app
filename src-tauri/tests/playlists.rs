@@ -44,28 +44,12 @@ async fn new_playlist(pool: &SqlitePool) -> i64 {
         .unwrap()
 }
 
+/// The real add path, not a copy of its statement -- which is what makes this
+/// able to catch a change in what "added by hand" means.
 async fn add(pool: &SqlitePool, playlist: i64, tracks: &[i64]) {
-    let mut next: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(position), -1) + 1 FROM playlist_tracks WHERE playlist_id = ?",
-    )
-    .bind(playlist)
-    .fetch_one(pool)
-    .await
-    .unwrap();
-
-    for track in tracks {
-        sqlx::query(
-            "INSERT INTO playlist_tracks (playlist_id, track_id, position)
-             VALUES (?, ?, ?) ON CONFLICT (playlist_id, track_id) DO NOTHING",
-        )
-        .bind(playlist)
-        .bind(track)
-        .bind(next)
-        .execute(pool)
+    music_app_lib::playlists::add_tracks(pool, playlist, tracks.to_vec())
         .await
         .unwrap();
-        next += 1;
-    }
 }
 
 /// The move, exactly as `reorder_playlist_track` issues it.
@@ -503,6 +487,23 @@ async fn rule(pool: &SqlitePool, playlist: i64, label: &str) {
     .unwrap();
 }
 
+/// Ordering rows, as `materialise_order` writes them when a rule is added.
+async fn record_order(pool: &SqlitePool, playlist: i64, tracks: &[i64]) {
+    for (position, track) in tracks.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position, by_rule)
+             VALUES (?1, ?2, ?3, 1)
+             ON CONFLICT (playlist_id, track_id) DO UPDATE SET position = ?3",
+        )
+        .bind(playlist)
+        .bind(track)
+        .bind(position as i64)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
 async fn members(pool: &SqlitePool, playlist: i64) -> Vec<i64> {
     music_app_lib::playlists::playlist_tracks(pool, playlist, None, None, None, None, None)
         .await
@@ -819,6 +820,99 @@ async fn the_first_reorder_of_an_artist_playlist_writes_its_order_down() {
     let latecomer = seed_remote(&db.pool, "ivycomb", &["Vancouver"]).await;
     let after = members(&db.pool, playlist).await;
     assert_eq!(after.last(), Some(&latecomer[0]), "got {after:?}");
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// An ordering row says *where*, never *whether*.
+///
+/// The whole point of the split: a playlist that fills itself from an artist
+/// can have a stored order from the moment the rule is made -- so dragging
+/// works immediately, with no invisible change of behaviour partway through --
+/// and removing the rule still removes its tracks, because those rows never
+/// conferred membership.
+#[tokio::test]
+async fn recording_an_order_does_not_make_rule_matches_permanent() {
+    let (db, base) = fixture("by-rule-order").await;
+    let ids = seed_remote(&db.pool, "ivycomb", &["Y2K", "Strays", "Free"]).await;
+
+    let playlist = new_playlist(&db.pool).await;
+    rule(&db.pool, playlist, "ivycomb").await;
+
+    // As adding the rule does: the visible order, written down.
+    record_order(&db.pool, playlist, &ids).await;
+    assert_eq!(members(&db.pool, playlist).await, ids, "order recorded");
+
+    // And it is a real order -- rows exist to drag between.
+    assert_eq!(positions(&db.pool, playlist).await, vec![0, 1, 2]);
+
+    // Now drop the rule. The rows are still there; the tracks are not.
+    sqlx::query("DELETE FROM playlist_artist_rules WHERE playlist_id = ?")
+        .bind(playlist)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    assert!(
+        members(&db.pool, playlist).await.is_empty(),
+        "recording an order must not turn rule matches into members",
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Adding a track by hand is a different claim from where it sits, and it
+/// outlasts the rule that first brought the track in.
+#[tokio::test]
+async fn adding_by_hand_promotes_an_ordering_row_to_a_real_member() {
+    let (db, base) = fixture("by-rule-promote").await;
+    let ids = seed_remote(&db.pool, "ivycomb", &["Y2K", "Strays"]).await;
+
+    let playlist = new_playlist(&db.pool).await;
+    rule(&db.pool, playlist, "ivycomb").await;
+    record_order(&db.pool, playlist, &ids).await;
+
+    // The user keeps one of them explicitly.
+    add(&db.pool, playlist, &[ids[1]]).await;
+
+    sqlx::query("DELETE FROM playlist_artist_rules WHERE playlist_id = ?")
+        .bind(playlist)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        members(&db.pool, playlist).await,
+        vec![ids[1]],
+        "the hand-added one stays, the other goes with the rule",
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A track the rule finds later joins at the end, leaving an arranged order
+/// alone.
+#[tokio::test]
+async fn a_later_match_appends_rather_than_disturbing_the_order() {
+    let (db, base) = fixture("by-rule-append").await;
+    let ids = seed_remote(&db.pool, "ivycomb", &["Y2K", "Strays"]).await;
+
+    let playlist = new_playlist(&db.pool).await;
+    rule(&db.pool, playlist, "ivycomb").await;
+
+    // Arranged deliberately backwards, to prove the order is respected.
+    record_order(&db.pool, playlist, &[ids[1], ids[0]]).await;
+    assert_eq!(members(&db.pool, playlist).await, vec![ids[1], ids[0]]);
+
+    let later = seed_remote(&db.pool, "ivycomb", &["Vancouver"]).await;
+    assert_eq!(
+        members(&db.pool, playlist).await,
+        vec![ids[1], ids[0], later[0]],
+        "a new match belongs at the end, not woven into the arrangement",
+    );
 
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);

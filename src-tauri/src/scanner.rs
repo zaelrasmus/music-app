@@ -20,6 +20,37 @@ const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "ogg", "opus", "wav"];
 /// resumes cheaply because unchanged files are skipped by mtime.
 const BATCH_SIZE: usize = 500;
 
+/// Longest a single file may take to read before the scan gives up on it.
+///
+/// Measured on a real library: a 245 MB file with an `.mp3` extension that is
+/// not an MP3 took **341 seconds** for lofty to reject. It has no recognisable
+/// header, so the parser searches the entire file and then fails anyway. Four
+/// such files turned a scan of a thousand tracks into twenty minutes of what
+/// looked, fairly, like a hang.
+///
+/// The budget is on *time* rather than size, because size is a poor proxy: a
+/// genuine two-hour set is hundreds of megabytes and parses instantly, its
+/// header being where a header belongs. Only files that make the parser search
+/// are slow, and those are exactly the ones worth abandoning.
+///
+/// Thirty rather than ten, because the failure modes are not symmetrical. A
+/// pathological file costs thirty seconds once; a *legitimate* file wrongly
+/// abandoned is silently missing from the library, and -- never having been
+/// recorded -- is retried and abandoned again on every scan afterwards. So
+/// the budget is set where a false positive is implausible rather than where
+/// a true positive is cheapest, and every file it gives up on is named in the
+/// summary so a wrong call is visible instead of silent.
+///
+/// An honest parse reads a header and stops. Even a large file over a slow
+/// share is far inside this.
+const READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many abandoned paths the summary carries.
+///
+/// Enough to act on, not so many that a misconfigured folder ships its whole
+/// contents through an event payload.
+const MAX_REPORTED_SKIPS: usize = 20;
+
 /// Guards against overlapping scans. Two concurrent scans would interleave
 /// writes and each other's generation numbers, and one could mark the other's
 /// in-flight rows as missing.
@@ -60,6 +91,12 @@ pub struct ScanSummary {
     pub marked_missing: u64,
     /// Files that could not be read or parsed. They are skipped, not fatal.
     pub errors: u64,
+    /// Files the scan gave up on -- see `READ_BUDGET` -- by name.
+    ///
+    /// Named rather than merely counted, because this is the one outcome
+    /// that could be wrong: a legitimate file abandoned for being slow is
+    /// missing from the library and nothing would otherwise say so.
+    pub skipped_files: Vec<String>,
     /// Folders whose root was unreachable. Their tracks were left untouched.
     pub skipped_folders: Vec<String>,
     /// Cover files deleted because nothing points at them any more.
@@ -99,6 +136,39 @@ struct Metadata {
     cover_key: Option<String>,
 }
 
+/// How far a scan has got.
+///
+/// A thousand files takes long enough that a spinner alone is indistinguishable
+/// from a hang -- the honest complaint was "it is eternally loading". This is
+/// what turns that into a number that moves.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanProgress {
+    /// The folder being walked, for when several are registered.
+    pub folder: String,
+    /// The file being read right now.
+    ///
+    /// Carried so that a scan which stops moving says *which file* it
+    /// stopped on. Without it, "it froze at 743" is a number and not a
+    /// lead.
+    pub file: Option<String>,
+    pub done: u64,
+    /// Files found in this folder. Known before any are read, because the
+    /// walk completes first.
+    pub total: u64,
+}
+
+/// Where progress is reported.
+///
+/// A callback rather than an `AppHandle`, so the scanner stays testable
+/// without a window -- the same seam, and the same reason, as `PlayerEvents`.
+///
+/// Shared rather than borrowed, because the slow half of a scan happens on
+/// a blocking thread and that is exactly where the reporting has to come
+/// from: tag-parsing five hundred files is minutes of work, and a progress
+/// count that only moves between batches is indistinguishable from a hang.
+pub type ProgressSink = Option<std::sync::Arc<dyn Fn(ScanProgress) + Send + Sync>>;
+
 /// Scans every registered folder and reconciles the `tracks` table.
 ///
 /// Returns `None` if a scan is already in progress.
@@ -106,6 +176,7 @@ pub async fn scan_all(
     pool: &SqlitePool,
     lock: &ScanLock,
     covers: Option<&CoverStore>,
+    progress: &ProgressSink,
 ) -> Result<Option<ScanSummary>, String> {
     let Some(_guard) = lock.try_acquire() else {
         return Ok(None);
@@ -132,7 +203,7 @@ pub async fn scan_all(
     let mut summary = ScanSummary::default();
 
     for folder in &folders {
-        scan_folder(pool, folder, generation, &mut summary, covers).await?;
+        scan_folder(pool, folder, generation, &mut summary, covers, progress).await?;
     }
 
     // Now, rather than on a timer: the set of live keys is a query away at
@@ -170,6 +241,7 @@ async fn scan_folder(
     generation: i64,
     summary: &mut ScanSummary,
     covers: Option<&CoverStore>,
+    progress: &ProgressSink,
 ) -> Result<(), String> {
     // An unreachable root -- unplugged drive, disconnected share -- yields zero
     // entries from WalkDir, which would otherwise look exactly like "every file
@@ -215,7 +287,11 @@ async fn scan_folder(
         .await
         .map_err(|e| e.to_string())?;
 
-    summary.scanned += entries.len() as u64;
+    // The walk is finished, so the total is known. Taken here, before the
+    // vector is consumed below.
+    let total = entries.len() as u64;
+
+    summary.scanned += total;
     summary.errors += walk_errors;
 
     // Split by what the filesystem says, before touching the database.
@@ -237,6 +313,21 @@ async fn scan_folder(
         }
     }
 
+    // Said before any file is read: the walk itself is the slowest silent
+    // part on a big library, and "0 of 1019" is the first proof it is alive.
+    let mut done = 0u64;
+    let report = |done: u64, file: Option<String>| {
+        if let Some(sink) = progress {
+            sink(ScanProgress {
+                folder: folder.path.clone(),
+                file,
+                done,
+                total,
+            });
+        }
+    };
+    report(0, None);
+
     summary.unchanged += unchanged.len() as u64;
 
     // Unchanged files still need their generation stamped, or the reconcile
@@ -257,6 +348,9 @@ async fn scan_folder(
             .map_err(|e| e.to_string())?;
         }
         tx.commit().await.map_err(|e| e.to_string())?;
+
+        done += batch.len() as u64;
+        report(done, None);
     }
 
     for batch in needs_parse.chunks(BATCH_SIZE) {
@@ -267,20 +361,50 @@ async fn scan_folder(
         // Cloned in because the closure outlives this frame. `CoverStore` is
         // one path, so the clone is free.
         let store = covers.cloned();
+
+        // Reported from *inside* the blocking work, file by file. Each of
+        // these reads a whole tag and may decode and re-encode embedded
+        // artwork, so a batch of five hundred is minutes -- and a count that
+        // only moved between batches was reported, fairly, as the app being
+        // frozen.
+        let sink = progress.clone();
+        let folder_path = folder.path.clone();
+        let start = done;
         let parsed = tauri::async_runtime::spawn_blocking(move || {
             paths
                 .into_iter()
-                .map(|p| read_metadata(&p, store.as_ref()))
+                .enumerate()
+                .map(|(index, p)| {
+                    if let Some(sink) = &sink {
+                        sink(ScanProgress {
+                            folder: folder_path.clone(),
+                            file: Some(p.clone()),
+                            done: start + index as u64,
+                            total,
+                        });
+                    }
+                    read_metadata_bounded(&p, store.as_ref())
+                })
                 .collect::<Vec<_>>()
         })
         .await
         .map_err(|e| e.to_string())?;
 
         let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-        for (entry, metadata) in batch.iter().zip(parsed) {
-            let Some(metadata) = metadata else {
-                summary.errors += 1;
-                continue;
+        for (entry, outcome) in batch.iter().zip(parsed) {
+            let metadata = match outcome {
+                Read::Parsed(metadata) => metadata,
+                Read::Unreadable => {
+                    summary.errors += 1;
+                    continue;
+                }
+                Read::Abandoned => {
+                    summary.errors += 1;
+                    if summary.skipped_files.len() < MAX_REPORTED_SKIPS {
+                        summary.skipped_files.push(entry.path.clone());
+                    }
+                    continue;
+                }
             };
 
             let is_new = !known.contains_key(&entry.path);
@@ -341,6 +465,12 @@ async fn scan_folder(
             }
         }
         tx.commit().await.map_err(|e| e.to_string())?;
+
+        // The slow half: these are the files whose tags had to be read, so
+        // this is where a long scan actually spends its time and where the
+        // number needs to keep moving.
+        done += batch.len() as u64;
+        report(done, None);
     }
 
     // Anything under this folder we did not touch this run is gone from disk.
@@ -419,6 +549,47 @@ fn is_audio(path: &Path) -> bool {
 ///
 /// Dirty and absent tags are the norm in a real library, so a missing or
 /// blank title falls back to the file name rather than failing.
+/// Reads a file's tags, giving up if it takes too long. See [`READ_BUDGET`].
+///
+/// The worker is not cancellable -- lofty offers no way to interrupt a parse --
+/// so an abandoned one is left to finish by itself. It costs a thread and some
+/// background reading, and it ends without help. That is the price of the scan
+/// staying answerable, and it is much smaller than the alternative.
+fn read_metadata_bounded(path: &str, covers: Option<&CoverStore>) -> Read {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let owned = path.to_string();
+    let store = covers.cloned();
+
+    // Detached on purpose: nothing joins it, and it must not hold the scan up
+    // once the budget has passed.
+    std::thread::Builder::new()
+        .name("scan-read".to_string())
+        .spawn(move || {
+            let _ = tx.send(read_metadata(&owned, store.as_ref()));
+        })
+        .map_err(|_| ())
+        .ok();
+
+    match rx.recv_timeout(READ_BUDGET) {
+        Ok(Some(metadata)) => Read::Parsed(metadata),
+        Ok(None) => Read::Unreadable,
+        Err(_) => {
+            eprintln!("scan: gave up reading {path} after {READ_BUDGET:?}");
+            Read::Abandoned
+        }
+    }
+}
+
+/// What one attempt at reading a file produced.
+enum Read {
+    Parsed(Metadata),
+    /// Read to the end and made no sense of it.
+    Unreadable,
+    /// Gave up on it. Distinct from unreadable because this is the verdict
+    /// that could be wrong, and the only one worth naming to the user.
+    Abandoned,
+}
+
 fn read_metadata(path: &str, covers: Option<&CoverStore>) -> Option<Metadata> {
     let tagged = lofty::read_from_path(path).ok()?;
 
@@ -651,7 +822,7 @@ mod tests {
         write_wav(&music.join("Old Song.wav"));
 
         // A library from before covers existed.
-        let first = scan_all(&db.pool, &ScanLock::new(), None)
+        let first = scan_all(&db.pool, &ScanLock::new(), None, &None)
             .await
             .unwrap()
             .unwrap();
@@ -661,7 +832,7 @@ mod tests {
 
         // The upgrade. Nothing on disk changed, but the file has never been
         // looked at for artwork, so it must be read again.
-        let second = scan_all(&db.pool, &ScanLock::new(), Some(&store))
+        let second = scan_all(&db.pool, &ScanLock::new(), Some(&store), &None)
             .await
             .unwrap()
             .unwrap();
@@ -672,7 +843,7 @@ mod tests {
 
         // And exactly once. Re-reading every coverless file on every scan
         // would tax precisely the worst-tagged libraries hardest.
-        let third = scan_all(&db.pool, &ScanLock::new(), Some(&store))
+        let third = scan_all(&db.pool, &ScanLock::new(), Some(&store), &None)
             .await
             .unwrap()
             .unwrap();
@@ -761,7 +932,7 @@ mod tests {
         write_wav(&music.join("Another Song.wav"));
         std::fs::write(music.join("cover.jpg"), b"not audio").unwrap();
 
-        let summary = scan_all(&db.pool, &ScanLock::new(), None)
+        let summary = scan_all(&db.pool, &ScanLock::new(), None, &None)
             .await
             .expect("scan should succeed")
             .expect("no scan should be in progress");
@@ -786,8 +957,8 @@ mod tests {
         let (db, music, base) = fixture("rescan").await;
         write_wav(&music.join("Track.wav"));
 
-        scan_all(&db.pool, &ScanLock::new(), None).await.unwrap().unwrap();
-        let second = scan_all(&db.pool, &ScanLock::new(), None)
+        scan_all(&db.pool, &ScanLock::new(), None, &None).await.unwrap().unwrap();
+        let second = scan_all(&db.pool, &ScanLock::new(), None, &None)
             .await
             .unwrap()
             .unwrap();
@@ -808,10 +979,10 @@ mod tests {
         write_wav(&doomed);
         write_wav(&music.join("Kept.wav"));
 
-        scan_all(&db.pool, &ScanLock::new(), None).await.unwrap().unwrap();
+        scan_all(&db.pool, &ScanLock::new(), None, &None).await.unwrap().unwrap();
         std::fs::remove_file(&doomed).unwrap();
 
-        let summary = scan_all(&db.pool, &ScanLock::new(), None)
+        let summary = scan_all(&db.pool, &ScanLock::new(), None, &None)
             .await
             .unwrap()
             .unwrap();
@@ -836,7 +1007,7 @@ mod tests {
         let file = music.join("Played.wav");
         write_wav(&file);
 
-        scan_all(&db.pool, &ScanLock::new(), None).await.unwrap().unwrap();
+        scan_all(&db.pool, &ScanLock::new(), None, &None).await.unwrap().unwrap();
         sqlx::query("UPDATE tracks SET play_count = 42, last_played = 1000")
             .execute(&db.pool)
             .await
@@ -847,7 +1018,7 @@ mod tests {
         std::fs::write(&file, std::fs::read(&file).unwrap()).unwrap();
         filetime_bump(&file);
 
-        let summary = scan_all(&db.pool, &ScanLock::new(), None)
+        let summary = scan_all(&db.pool, &ScanLock::new(), None, &None)
             .await
             .unwrap()
             .unwrap();
@@ -878,12 +1049,12 @@ mod tests {
         let (db, music, base) = fixture("unreachable").await;
         write_wav(&music.join("OnTheDrive.wav"));
 
-        scan_all(&db.pool, &ScanLock::new(), None).await.unwrap().unwrap();
+        scan_all(&db.pool, &ScanLock::new(), None, &None).await.unwrap().unwrap();
 
         // Simulate the drive being unplugged: the root itself disappears.
         std::fs::remove_dir_all(&music).unwrap();
 
-        let summary = scan_all(&db.pool, &ScanLock::new(), None)
+        let summary = scan_all(&db.pool, &ScanLock::new(), None, &None)
             .await
             .unwrap()
             .unwrap();
@@ -902,5 +1073,108 @@ mod tests {
 
         db.pool.close().await;
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    /// The real file that caused this, if it is still on this machine.
+    #[test]
+    #[ignore]
+    fn the_reported_file_no_longer_stalls_the_scan() {
+        let path = r"D:\kiza2\Music\Chill - Nostalgic\Getaway Spa 1.mp3";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("SKIP: not on this machine");
+            return;
+        }
+
+        let started = std::time::Instant::now();
+        let got = read_metadata_bounded(path, None);
+        eprintln!(
+            "245MB file: {:?} -> {}",
+            started.elapsed(),
+            matches!(got, Read::Parsed(_))
+        );
+
+        assert!(
+            started.elapsed() < READ_BUDGET * 2,
+            "it took {:?}, which was 341s before the budget",
+            started.elapsed(),
+        );
+    }
+
+    /// The scan must not be hostage to one file.
+    ///
+    /// A file that cannot be parsed quickly is skipped and counted, and the
+    /// scan carries on. Exercised through the real bounded reader rather than
+    /// a copy of its logic, against a file lofty cannot make sense of at all.
+    #[test]
+    fn an_unparseable_file_is_skipped_rather_than_waited_on() {
+        let dir = std::env::temp_dir().join("music-app-scan-budget");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Named like audio, containing nothing of the sort.
+        let path = dir.join("not-really.mp3");
+        std::fs::write(&path, vec![0x5au8; 512 * 1024]).unwrap();
+
+        let started = std::time::Instant::now();
+        let got = read_metadata_bounded(path.to_str().unwrap(), None);
+
+        assert!(
+            matches!(got, Read::Abandoned | Read::Unreadable),
+            "nothing should have been parsed from it",
+        );
+        assert!(
+            started.elapsed() < READ_BUDGET * 2,
+            "the reader must return within its budget, took {:?}",
+            started.elapsed(),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And an honest file is unaffected: the budget must not cost anything in
+    /// the case that matters, which is every other file in the library.
+    #[test]
+    fn an_ordinary_file_still_reads_its_tags() {
+        let dir = std::env::temp_dir().join("music-app-scan-budget-ok");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A minimal but genuine WAV, which lofty parses from its header.
+        let path = dir.join("tone.wav");
+        let samples = 44_100u32;
+        let data_len = samples * 2;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&44_100u32.to_le_bytes());
+        wav.extend_from_slice(&88_200u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.extend_from_slice(&vec![0u8; data_len as usize]);
+        std::fs::write(&path, wav).unwrap();
+
+        let started = std::time::Instant::now();
+        let got = read_metadata_bounded(path.to_str().unwrap(), None);
+
+        assert!(matches!(got, Read::Parsed(_)), "a real file must still be read");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "and quickly, took {:?}",
+            started.elapsed(),
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

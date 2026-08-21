@@ -79,6 +79,31 @@
             "your library",
         );
     }
+
+    /**
+     * A number that moves, rather than a spinner that might mean anything.
+     *
+     * A thousand files takes long enough that "Scanning…" alone is
+     * indistinguishable from a hang -- which is exactly how it was
+     * reported. The count only appears once the walk has finished and a
+     * total is actually known; before that the honest word is the verb.
+     */
+    const scanLabel = $derived.by(() => {
+        const progress = trackStore.progress;
+        if (!progress || progress.total === 0) return "Scanning…";
+        return `Scanning ${progress.done} of ${progress.total}…`;
+    });
+
+    /**
+     * The file being read right now.
+     *
+     * Shown under the button while a scan runs, so a count that stops
+     * moving names what it stopped on. "It froze at 743" is a number; "it
+     * froze on this file" is a lead.
+     */
+    const scanFile = $derived(
+        trackStore.progress?.file?.split(/[\/]/).pop() ?? null,
+    );
 </script>
 
 <PageShell>
@@ -240,7 +265,7 @@
                     disabled={trackStore.scanning}
                     onclick={() => trackStore.rescan()}
                 >
-                    {trackStore.scanning ? "Scanning…" : "Rescan"}
+                    {trackStore.scanning ? scanLabel : "Rescan"}
                 </Button>
             </EmptyState>
         {/if}

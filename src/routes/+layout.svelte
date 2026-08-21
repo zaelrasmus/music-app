@@ -15,6 +15,7 @@
 
 	const { children } = $props();
 
+
 	/**
 	 * The window is configured `visible: false`, so showing it is this app's
 	 * job. Done here rather than in a view because the layout is the last thing

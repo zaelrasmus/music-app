@@ -38,6 +38,31 @@
         { id: "icons", label: "Icons only", icon: PanelLeftDashedIcon },
         { id: "hidden", label: "Hidden", icon: EyeOffIcon },
     ];
+
+    /**
+     * A number that moves, rather than a spinner that might mean anything.
+     *
+     * A thousand files takes long enough that "Scanning…" alone is
+     * indistinguishable from a hang -- which is exactly how it was
+     * reported. The count only appears once the walk has finished and a
+     * total is actually known; before that the honest word is the verb.
+     */
+    const scanLabel = $derived.by(() => {
+        const progress = trackStore.progress;
+        if (!progress || progress.total === 0) return "Scanning…";
+        return `Scanning ${progress.done} of ${progress.total}…`;
+    });
+
+    /**
+     * The file being read right now.
+     *
+     * Shown under the button while a scan runs, so a count that stops
+     * moving names what it stopped on. "It froze at 743" is a number; "it
+     * froze on this file" is a lead.
+     */
+    const scanFile = $derived(
+        trackStore.progress?.file?.split(/[\/]/).pop() ?? null,
+    );
 </script>
 
 <PageShell title="Settings" subtitle="Everything here is local to this machine.">
@@ -58,8 +83,18 @@
                         data-icon="inline-start"
                         class={trackStore.scanning ? "animate-spin" : ""}
                     />
-                    {trackStore.scanning ? "Scanning…" : "Rescan"}
+                    {trackStore.scanning ? scanLabel : "Rescan"}
                 </Button>
+                {#if trackStore.scanning && scanFile}
+                    <!-- Which file, so a count that stops moving names its
+                         own cause instead of leaving it to be guessed. -->
+                    <span
+                        class="text-muted-foreground max-w-[18rem] truncate text-xs"
+                        title={trackStore.progress?.file ?? ""}
+                    >
+                        {scanFile}
+                    </span>
+                {/if}
                 <Button
                     size="sm"
                     disabled={trackStore.scanning}
@@ -121,6 +156,29 @@
                         · {summary.errors} unreadable{/if}{#if summary.skippedFolders.length > 0}
                         · {summary.skippedFolders.length} folder(s) unreachable{/if}
                 </p>
+
+                {#if summary.skippedFiles.length > 0}
+                    <!--
+                      Named, because this is the one verdict the scan makes
+                      that could be wrong. A file abandoned for being slow is
+                      absent from the library, and without this nothing would
+                      say which.
+                    -->
+                    <div class="mt-2 flex flex-col gap-0.5">
+                        <span class="text-muted-foreground text-xs">
+                            Gave up reading these — they took too long, which
+                            usually means the file is damaged:
+                        </span>
+                        {#each summary.skippedFiles as path (path)}
+                            <span
+                                class="text-muted-foreground truncate font-mono text-[11px]"
+                                title={path}
+                            >
+                                {path}
+                            </span>
+                        {/each}
+                    </div>
+                {/if}
             {/if}
         </SettingsSection>
 

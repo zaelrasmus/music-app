@@ -1,0 +1,23 @@
+-- Separates "where a track sits" from "whether it belongs".
+--
+-- A playlist that fills itself from an artist had no stored order at all: its
+-- membership was computed on every read, so there were no rows to drag between.
+-- The first reorder therefore wrote the whole visible order down at once, and
+-- from that moment the playlist stopped being derived -- removing the rule would
+-- no longer remove its tracks, because they had become ordinary members.
+--
+-- That transition was invisible, one-way, and surprising, and it existed only
+-- because a row in `playlist_tracks` meant two things at once. This splits them:
+--
+--   by_rule = 0  the user put this here. A member whatever the rules say.
+--   by_rule = 1  an *ordering* row for a track the rule matched. It records
+--                where the track sits and nothing else -- the rule still
+--                decides whether it appears at all.
+--
+-- With the two separated, positions can be written the moment a rule is added.
+-- Dragging works immediately, new matches append at the end, and removing the
+-- rule still removes its tracks, because their rows never conferred membership.
+--
+-- Existing rows are all the first kind: everything written before this column
+-- existed was written by "add to playlist", which is a person deciding.
+ALTER TABLE playlist_tracks ADD COLUMN by_rule INTEGER NOT NULL DEFAULT 0;

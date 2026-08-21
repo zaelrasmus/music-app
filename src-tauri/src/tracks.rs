@@ -7,6 +7,7 @@ use crate::scanner::{self, ScanLock, ScanSummary};
 
 /// Emitted when a scan finishes so the frontend can refetch.
 pub const SCAN_FINISHED_EVENT: &str = "scan-finished";
+pub const SCAN_PROGRESS_EVENT: &str = "scan-progress";
 
 /// Deliberately minimal -- the real track view is the next task.
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -127,7 +128,17 @@ pub async fn rescan_library(
     lock: State<'_, ScanLock>,
     covers: State<'_, crate::covers::CoverStore>,
 ) -> Result<Option<ScanSummary>, String> {
-    let summary = scanner::scan_all(&db.pool, &lock, Some(&covers)).await?;
+    // The scan reports through this, so a thousand files stop looking like a
+    // hang. A closure rather than handing the scanner an `AppHandle`: it stays
+    // testable without a window, which is the same trade the player makes.
+    let reporter = app.clone();
+    let report: scanner::ProgressSink = Some(std::sync::Arc::new(
+        move |progress: scanner::ScanProgress| {
+            let _ = reporter.emit(SCAN_PROGRESS_EVENT, progress);
+        },
+    ));
+
+    let summary = scanner::scan_all(&db.pool, &lock, Some(&covers), &report).await?;
 
     if summary.is_some() {
         app.emit(SCAN_FINISHED_EVENT, ()).map_err(|e| e.to_string())?;

@@ -1,6 +1,5 @@
 <script lang="ts">
     import { Input } from "$components/ui/input";
-    import { writeSetting } from "$lib/settings.svelte";
     import { Button } from "$components/ui/button";
     import TrackMenu from "$components/track-menu.svelte";
     import SourceBadge from "$components/source-badge.svelte";
@@ -84,36 +83,6 @@
     const shownTags = $derived(tags.slice(0, 2));
     const hiddenTags = $derived(tags.slice(2));
 
-    // TEMPORARY, with the window listeners below.
-    let probed: string[] = [];
-    let probeTimer: ReturnType<typeof setTimeout> | null = null;
-
-    function dragProbe(kind: string, event: DragEvent) {
-        const target = event.target as HTMLElement | null;
-        const draggableAncestor = target?.closest?.("[draggable='true']");
-
-        probed.push(
-            [
-                kind,
-                `target=${target?.tagName ?? "?"}`,
-                `role=${target?.getAttribute?.("role") ?? "-"}`,
-                `draggableAncestor=${draggableAncestor ? "yes" : "NO"}`,
-                `defaultPrevented=${event.defaultPrevented}`,
-                `types=${event.dataTransfer?.types?.join("|") || "none"}`,
-                `effect=${event.dataTransfer?.dropEffect ?? "-"}`,
-            ].join(" "),
-        );
-
-        // Batched: `dragover` fires continuously, and one write per event
-        // would hammer the store and drown the interesting lines.
-        if (probeTimer) clearTimeout(probeTimer);
-        probeTimer = setTimeout(() => {
-            const seen = probed.slice(0, 4).concat(probed.slice(-4));
-            probed = [];
-            void writeSetting("__dragProbe", seen);
-        }, 400);
-    }
-
     /** The row element, used as the drag preview when the handle is grabbed. */
     let rowElement = $state<HTMLDivElement | null>(null);
 
@@ -196,22 +165,6 @@
   decision belongs anyway — this component knows what a track looks like, not
   what it is one of.
 -->
-<!--
-  TEMPORARY: drag diagnostics.
-
-  Two fixes have not landed, and guessing a third is worse than measuring. A
-  `dragstart` that never fires and one that fires and is then refused look
-  identical from outside, so this records which actually happens -- into the
-  settings store, because the webview console is not readable from outside the
-  window. Remove once the cause is known.
--->
-<svelte:window
-    ondragstart={(e) => dragProbe("dragstart", e)}
-    ondragover={(e) => dragProbe("dragover", e)}
-    ondrop={(e) => dragProbe("drop", e)}
-    ondragend={(e) => dragProbe("dragend", e)}
-/>
-
 <div
     bind:this={rowElement}
     class="group/row has-[:focus-visible]:ring-ring relative rounded-lg transition-colors has-[:focus-visible]:ring-2
@@ -254,6 +207,19 @@
     <div class="flex items-center gap-3 pr-2 pl-3">
         {#if reorder}
             <!--
+              A note that belongs nowhere else: this list can be reordered at
+              all only because `dragDropEnabled` is false in `tauri.conf.json`.
+
+              With it at its default, Tauri puts an OS-level drop target on the
+              window to offer file-drop events, and on WebView2 that target
+              swallows the webview's own drag events. Measured: `dragstart`
+              fires and then `dragenter`, `dragover` and `drop` never do -- not
+              on the row, not on `window` -- and the drag ends refused. Nothing
+              in JavaScript can fix that, and no drag-and-drop library can
+              either, because they all ride the same events. The app does not
+              use file-drop, so the trade costs nothing.
+            -->
+            <!--
               The drag starts here, not on the row.
 
               Most of a row is a `<button>` -- the whole title block is the play
@@ -271,7 +237,7 @@
                 aria-label="Reorder {track.title}"
                 draggable={reorder.enabled ? "true" : "false"}
                 class="-ml-1.5 shrink-0 {reorder.enabled
-                    ? 'cursor-grab opacity-40 transition-opacity group-hover/row:opacity-80'
+                    ? 'cursor-grab opacity-0 transition-opacity group-hover/row:opacity-70'
                     : 'opacity-20'}"
                 ondragstart={(e) => {
                     if (!reorder?.enabled) return;
