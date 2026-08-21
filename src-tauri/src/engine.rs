@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -128,9 +128,26 @@ enum Command {
 /// behaves.
 pub struct AudioEngine {
     tx: Mutex<Sender<Command>>,
+    /// The rate the output device actually runs at.
+    ///
+    /// Published by the audio thread because only it may touch the device,
+    /// and read from elsewhere because the *decoder* has to match it: rodio
+    /// resamples anything that does not, with a converter its own docs call
+    /// "simple linear interpolation" that measures at -33 dB of added
+    /// distortion. Handing it a matching rate makes it a pass-through.
+    ///
+    /// Starts at the fallback and is corrected within milliseconds of
+    /// startup. A decode that somehow beat the device open would be
+    /// resampled as before -- the old behaviour, not a new failure.
+    output_rate: Arc<AtomicU32>,
 }
 
 impl AudioEngine {
+    /// What ffmpeg should be told to produce.
+    pub fn output_rate(&self) -> u32 {
+        self.output_rate.load(Ordering::Acquire)
+    }
+
     fn send(&self, command: Command) -> Result<(), String> {
         self.tx
             .lock()
@@ -218,21 +235,34 @@ async fn await_reply(
 
 pub fn spawn(events: UnboundedSender<EngineEvent>, ffmpeg: Option<PathBuf>) -> AudioEngine {
     let (tx, rx) = mpsc::channel();
+    let output_rate = Arc::new(AtomicU32::new(crate::transcode::DEFAULT_OUTPUT_RATE));
+    let published = Arc::clone(&output_rate);
+
     std::thread::Builder::new()
         .name("audio".to_string())
-        .spawn(move || run(rx, events, ffmpeg))
+        .spawn(move || run(rx, events, ffmpeg, published))
         .expect("audio thread should spawn");
 
-    AudioEngine { tx: Mutex::new(tx) }
+    AudioEngine {
+        tx: Mutex::new(tx),
+        output_rate,
+    }
 }
 
-fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Option<PathBuf>) {
+fn run(
+    rx: Receiver<Command>,
+    events: UnboundedSender<EngineEvent>,
+    ffmpeg: Option<PathBuf>,
+    output_rate: Arc<AtomicU32>,
+) {
     // Opened once. If there is no device we keep the error and fail every play
     // with it, rather than killing the thread and making every later command
     // report "not running".
     let device = match DeviceSinkBuilder::open_default_sink() {
         Ok(mut sink) => {
             sink.log_on_drop(false);
+            // Told to everyone who builds a decoder, before anything can.
+            output_rate.store(sink.config().sample_rate().get(), Ordering::Release);
             Ok(sink)
         }
         Err(e) => Err(format!("No audio output device: {e}")),
@@ -286,7 +316,13 @@ fn run(rx: Receiver<Command>, events: UnboundedSender<EngineEvent>, ffmpeg: Opti
                             starved = ready.starved;
                             Ok(start(sink, ready.decoded, volume))
                         }
-                        None => build_source(&source, ffmpeg.as_deref(), start_at).map(|built| {
+                        None => build_source(
+                            &source,
+                            ffmpeg.as_deref(),
+                            output_rate.load(Ordering::Acquire),
+                            start_at,
+                        )
+                        .map(|built| {
                             starved = built.starved;
                             start(sink, built.decoded, volume)
                         }),
@@ -486,7 +522,8 @@ fn seek(
         p.pause();
     }
 
-    let rebuilt = build_source(&l.source, ffmpeg, position).map(|built| {
+    let rebuilt = build_source(&l.source, ffmpeg, sink.config().sample_rate().get(), position)
+        .map(|built| {
         let starved = built.starved;
         (start(sink, built.decoded, volume), starved)
     });
@@ -542,9 +579,22 @@ fn start(sink: &rodio::MixerDeviceSink, decoded: Box<dyn Source + Send>, volume:
 /// expensive half: for anything ffmpeg handles it spawns a process and waits
 /// for the first half second of audio. Splitting it lets the coordinator do
 /// that work early, on another thread, for a track that has not started yet.
+/// Builds a decoder for one source.
+///
+/// `output_rate` is the *device's* rate, not a preference. rodio resamples any
+/// source whose rate differs from the mixer's, using a converter its own
+/// documentation calls "simple linear interpolation" -- measured on this
+/// library at 44.1 -> 48 kHz, that is error only 33 dB below the music. Asking
+/// ffmpeg for the device rate makes rodio's converter a pass-through and hands
+/// the job to a resampler that does it properly.
+///
+/// Local files rodio decodes natively are deliberately left alone: they never
+/// pass through here, and giving each of them an ffmpeg process to fix the same
+/// resample would cost far more than it buys.
 pub fn build_source(
     source: &PlayableSource,
     ffmpeg: Option<&Path>,
+    output_rate: u32,
     start_at: Duration,
 ) -> Result<BuiltSource, String> {
     match source {
@@ -576,7 +626,8 @@ pub fn build_source(
                 "This file needs ffmpeg to play, and ffmpeg was not found. \
                  See src-tauri/binaries/README.md.",
             )?;
-            let source = FfmpegSource::open_at(ffmpeg, FfmpegInput::File(path), start_at, None)?;
+            let source =
+                FfmpegSource::open_at(ffmpeg, output_rate, FfmpegInput::File(path), start_at, None)?;
             Ok(BuiltSource {
                 starved: Some(source.starvation_flag()),
                 decoded: Box::new(source),
@@ -592,8 +643,13 @@ pub fn build_source(
             // played. If ffmpeg complains while reading it back, it is
             // thrown away rather than quietly ending the song early on
             // every future play.
-            let source =
-                FfmpegSource::open_at(ffmpeg, FfmpegInput::Disposable(path), start_at, None)?;
+            let source = FfmpegSource::open_at(
+                ffmpeg,
+                output_rate,
+                FfmpegInput::Disposable(path),
+                start_at,
+                None,
+            )?;
             Ok(BuiltSource {
                 starved: Some(source.starvation_flag()),
                 decoded: Box::new(source),
@@ -605,7 +661,8 @@ pub fn build_source(
                 "This file needs ffmpeg to play, and ffmpeg was not found. \
                  See src-tauri/binaries/README.md.",
             )?;
-            let source = FfmpegSource::open_at(ffmpeg, FfmpegInput::File(path), start_at, None)?;
+            let source =
+                FfmpegSource::open_at(ffmpeg, output_rate, FfmpegInput::File(path), start_at, None)?;
             Ok(BuiltSource {
                 starved: Some(source.starvation_flag()),
                 decoded: Box::new(source),
@@ -619,6 +676,7 @@ pub fn build_source(
             )?;
             let source = FfmpegSource::open_at(
                 ffmpeg,
+                output_rate,
                 FfmpegInput::Url(url),
                 start_at,
                 // A seeked decode begins partway in, so what it would write is

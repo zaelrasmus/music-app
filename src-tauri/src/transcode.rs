@@ -13,10 +13,24 @@ use crate::audio_cache::PendingCache;
 /// What we ask ffmpeg to produce. Matching rodio's native sample type means the
 /// bytes off the pipe are already the samples we hand to the mixer -- no
 /// conversion, no allocation.
-const OUTPUT_RATE: u32 = 44_100;
+/// The rate to decode at when the output device has not said what it wants.
+///
+/// Only a fallback. What matters is that ffmpeg's output rate *matches the
+/// device*: rodio resamples anything that does not, and its converter is
+/// documented as "simple linear interpolation ... may introduce audible
+/// distortions". Measured against this library at 44.1 -> 48 kHz, that is
+/// error at -33 dB relative to the music, which is about two percent
+/// distortion on every track. ffmpeg's own resampler does the same job
+/// properly, so the fix is to hand rodio a rate it does not have to touch.
+pub const DEFAULT_OUTPUT_RATE: u32 = 44_100;
 const OUTPUT_CHANNELS: u16 = 2;
 
-const SAMPLES_PER_SECOND: usize = OUTPUT_RATE as usize * OUTPUT_CHANNELS as usize;
+/// Nominal, for sizing buffers only.
+///
+/// The real rate is whatever the device asked for, so a 48 kHz stream drains
+/// this 9% faster than the name suggests -- a 0.46 second prefill rather than
+/// 0.5. Not worth threading a rate through buffer arithmetic to correct.
+const SAMPLES_PER_SECOND: usize = DEFAULT_OUTPUT_RATE as usize * OUTPUT_CHANNELS as usize;
 
 /// Slack between ffmpeg and the speakers, for a local file.
 ///
@@ -78,6 +92,19 @@ pub struct FfmpegSource {
     /// early would make 'did ffmpeg complain' a race -- which, on the one
     /// run where it complained, is the answer that matters.
     stderr_drain: Option<std::thread::JoinHandle<()>>,
+    /// The rate ffmpeg was told to produce, which is the device's own.
+    ///
+    /// Carried rather than assumed, because `Source::sample_rate` has to
+    /// report the same number: rodio compares it against the mixer's and
+    /// resamples if they differ, which is exactly what this avoids.
+    output_rate: u32,
+    /// Samples of silence emitted since real audio last flowed.
+    ///
+    /// Counted because the stream is interleaved: silence has to be inserted
+    /// in whole frames or everything after it lands in the wrong channel.
+    inserted: usize,
+    /// A sample popped but not yet emitted, held while a frame is completed.
+    held: Option<Sample>,
     /// A copy of ours being read, deleted if ffmpeg complains about it.
     ///
     /// Only ever set for [`FfmpegInput::Disposable`], so only ever a file
@@ -125,6 +152,7 @@ impl FfmpegSource {
     /// and tracks the offset itself.
     pub fn open_at(
         ffmpeg: &Path,
+        output_rate: u32,
         input: FfmpegInput<'_>,
         start: Duration,
         cache: Option<PendingCache>,
@@ -165,7 +193,7 @@ impl FfmpegSource {
         command
             // Drop any cover art, then emit bare interleaved f32.
             .args(["-vn", "-f", "f32le", "-acodec", "pcm_f32le"])
-            .args(["-ar", &OUTPUT_RATE.to_string()])
+            .args(["-ar", &output_rate.to_string()])
             .args(["-ac", &OUTPUT_CHANNELS.to_string()])
             .arg("-");
 
@@ -213,6 +241,9 @@ impl FfmpegSource {
             // and one that will break the track later.
             errors: errors.clone(),
             stderr_drain,
+            output_rate,
+            inserted: 0,
+            held: None,
             disposable: match input {
                 FfmpegInput::Disposable(path) => Some(path.to_path_buf()),
                 _ => None,
@@ -310,6 +341,25 @@ fn spawn_reader(mut stdout: ChildStdout, mut producer: Producer<Sample>, finishe
         });
 }
 
+/// How much more silence is owed before real audio may resume.
+///
+/// The stream ffmpeg produces is interleaved: sample 0 is the left channel,
+/// 1 the right, 2 the left again. An underrun inserts silence to keep the
+/// track playing, and the number inserted is however long the stall lasted --
+/// so half the time it is odd, and every sample afterwards is delivered to
+/// the wrong channel for the rest of the track.
+///
+/// Rounding the insertion up to a whole frame costs at most one sample of
+/// silence, 23 microseconds, and is the difference between a stall being
+/// inaudible and permanently swapping the stereo image.
+fn pad_to_frame(inserted: usize, channels: u16) -> usize {
+    let channels = usize::from(channels);
+    match inserted % channels {
+        0 => 0,
+        ragged => channels - ragged,
+    }
+}
+
 /// Waits for room rather than dropping samples. Errors only if the consumer is
 /// gone, which means playback stopped.
 fn push_blocking(producer: &mut Producer<Sample>, sample: Sample) -> Result<(), ()> {
@@ -360,6 +410,11 @@ impl Iterator for FfmpegSource {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        // Held back while the frame a stall interrupted was completed.
+        if let Some(sample) = self.held.take() {
+            return Some(sample);
+        }
+
         match self.consumer.pop() {
             Ok(sample) => {
                 // A relaxed load per sample is a plain memory read; the store
@@ -367,6 +422,18 @@ impl Iterator for FfmpegSource {
                 if self.starved.load(Ordering::Relaxed) {
                     self.starved.store(false, Ordering::Relaxed);
                 }
+
+                // Audio is back, but a stall may have left the frame half
+                // written. Finish it before letting this sample through, or
+                // it plays out of the wrong speaker -- and so does every
+                // sample after it.
+                if pad_to_frame(self.inserted, OUTPUT_CHANNELS) > 0 {
+                    self.inserted = 0;
+                    self.held = Some(sample);
+                    return Some(0.0);
+                }
+
+                self.inserted = 0;
                 Some(sample)
             }
             Err(_) if self.finished.load(Ordering::Acquire) => None,
@@ -376,6 +443,7 @@ impl Iterator for FfmpegSource {
             // rather than played as silence forever.
             Err(_) => {
                 self.starved.store(true, Ordering::Relaxed);
+                self.inserted += 1;
                 Some(0.0)
             }
         }
@@ -394,7 +462,11 @@ impl Source for FfmpegSource {
     }
 
     fn sample_rate(&self) -> SampleRate {
-        SampleRate::new(OUTPUT_RATE).expect("sample rate is a non-zero constant")
+        // Falls back rather than panicking: a zero here would abort the
+        // audio thread, and playing at the wrong rate is recoverable.
+        SampleRate::new(self.output_rate)
+            .or_else(|| SampleRate::new(DEFAULT_OUTPUT_RATE))
+            .expect("the fallback rate is a non-zero constant")
     }
 
     fn total_duration(&self) -> Option<Duration> {
@@ -638,6 +710,85 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Builds a source with no ffmpeg behind it, so starvation can be staged.
+    ///
+    /// A real underrun needs a network stall at the exact moment the buffer
+    /// empties, which is not something a test can arrange. Driving the ring
+    /// buffer by hand is the only way to see what the iterator does when it
+    /// runs dry -- and what it does when it runs dry is the whole question.
+    fn staged_source(capacity: usize) -> (super::Producer<super::Sample>, super::FfmpegSource) {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let (producer, consumer) = super::RingBuffer::<super::Sample>::new(capacity);
+
+        // A process that has already exited. `FfmpegSource` only ever kills
+        // and waits on this; it never reads from it.
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--staged-source-placeholder")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a placeholder process");
+
+        let source = super::FfmpegSource {
+            consumer,
+            finished: Arc::new(AtomicBool::new(false)),
+            starved: Arc::new(AtomicBool::new(false)),
+            child,
+            pending_cache: None,
+            errors: None,
+            stderr_drain: None,
+            output_rate: DEFAULT_OUTPUT_RATE,
+            inserted: 0,
+            held: None,
+            disposable: None,
+        };
+
+        (producer, source)
+    }
+
+    #[test]
+    fn silence_from_a_stall_never_swaps_the_channels() {
+        let (mut producer, mut source) = staged_source(16);
+
+        // One whole frame of real audio: left, then right.
+        producer.push(1.0).unwrap();
+        producer.push(2.0).unwrap();
+
+        let mut heard = vec![source.next().unwrap(), source.next().unwrap()];
+
+        // The stream stalls. One sample of silence goes out -- an odd number,
+        // which is the case that used to break everything after it.
+        heard.push(source.next().unwrap());
+
+        // Audio returns. This sample belongs on the left, where it started.
+        producer.push(3.0).unwrap();
+        heard.push(source.next().unwrap());
+        heard.push(source.next().unwrap());
+
+        assert_eq!(heard, vec![1.0, 2.0, 0.0, 0.0, 3.0]);
+
+        // The real test is the position, not the values: an interleaved stream
+        // puts the left channel on even indices, and 3.0 began on the left.
+        let resumed_at = heard.iter().position(|s| *s == 3.0).unwrap();
+        assert_eq!(
+            resumed_at % usize::from(super::OUTPUT_CHANNELS),
+            0,
+            "audio resumed mid-frame at index {resumed_at}, so it plays out of the wrong speaker",
+        );
+    }
+
+    #[test]
+    fn an_even_stall_is_left_exactly_as_it_is() {
+        // Padding that is not needed would be a sample of silence added to
+        // every underrun for no reason.
+        assert_eq!(super::pad_to_frame(0, 2), 0);
+        assert_eq!(super::pad_to_frame(2, 2), 0);
+        assert_eq!(super::pad_to_frame(1, 2), 1);
+        assert_eq!(super::pad_to_frame(3, 2), 1);
+    }
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
@@ -647,6 +798,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The whole point of the plumbing, tested against the real binary.
+    ///
+    /// rodio resamples any source whose rate differs from the mixer's, with a
+    /// converter its own docs describe as simple linear interpolation. On this
+    /// machine every output device runs at 48 kHz, so a decoder that still
+    /// hands back 44.1 gets silently resampled -- measured at 33 dB below the
+    /// music, roughly two percent distortion, on every track.
+    ///
+    /// Nothing about that failure is visible: no error, no glitch, just a
+    /// quietly worse sound. So the number has to be asserted.
+    #[test]
+    fn the_decoder_produces_the_rate_it_was_asked_for() {
+        let Some(ffmpeg) = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg)
+        else {
+            eprintln!("skipped: no staged ffmpeg to run");
+            return;
+        };
+
+        let dir = std::env::temp_dir().join("music-app-rate-probe");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let tone = dir.join("tone.wav");
+
+        // Deliberately 44100, the rate the app used to hardcode: the test is
+        // that the *device's* rate wins over both the source's and the old
+        // constant.
+        let mut generate = std::process::Command::new(&ffmpeg);
+        crate::sidecar::quiet(&mut generate);
+        let made = generate
+            .args(["-hide_banner", "-nostats", "-y"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=2:sample_rate=44100"])
+            .arg(&tone)
+            .status()
+            .expect("ffmpeg should run");
+        assert!(made.success(), "could not generate the test tone");
+
+        for asked in [48_000_u32, 44_100] {
+            let source = FfmpegSource::open_at(
+                &ffmpeg,
+                asked,
+                FfmpegInput::File(&tone),
+                Duration::ZERO,
+                None,
+            )
+            .expect("a plain wav should decode");
+
+            assert_eq!(
+                source.sample_rate().get(),
+                asked,
+                "decoder reported {} when the device asked for {asked}",
+                source.sample_rate().get(),
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

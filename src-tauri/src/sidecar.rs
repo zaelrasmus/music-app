@@ -248,6 +248,19 @@ fn bundled_candidates(tool: Tool, file_name: &str) -> Vec<PathBuf> {
     candidates
 }
 
+/// The staged binary, without an `AppHandle` to resolve it from.
+///
+/// Tests that exercise a real sidecar have no Tauri app to ask, and the
+/// alternative -- reaching for whatever `ffmpeg` is on PATH -- would quietly
+/// test a different binary from the one that ships.
+#[cfg(test)]
+pub fn staged_for_tests(tool: Tool) -> Option<std::path::PathBuf> {
+    let file_name = format!("{}{EXE_SUFFIX}", tool.base_name());
+    bundled_candidates(tool, &file_name)
+        .into_iter()
+        .find(|path| path.exists())
+}
+
 /// The triple Tauri uses when naming staged sidecars.
 #[cfg(debug_assertions)]
 fn current_target_triple() -> &'static str {

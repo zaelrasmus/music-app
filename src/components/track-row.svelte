@@ -332,7 +332,7 @@
                 aria-label="Reorder {track.title}"
                 draggable={reorder.enabled ? "true" : "false"}
                 class="-ml-1.5 shrink-0 {reorder.enabled
-                    ? 'cursor-grab opacity-0 transition-opacity group-hover/row:opacity-70'
+                    ? 'cursor-grab opacity-40 transition-opacity group-hover/row:opacity-80'
                     : 'opacity-20'}"
                 ondragstart={(e) => {
                     if (!reorder?.enabled) return;
@@ -354,7 +354,7 @@
         {/if}
 
         {#if editing}
-            <div class="flex min-w-0 flex-1 items-center gap-2 py-2">
+            <div class="flex min-w-0 flex-1 items-center gap-2 py-3">
                 <Input
                     bind:value={editTitle}
                     placeholder="Title"
@@ -393,7 +393,7 @@
             -->
             <button
                 type="button"
-                class="flex min-w-0 flex-1 items-center gap-3 py-2 text-left focus-visible:outline-none"
+                class="flex min-w-0 flex-1 items-center gap-3 py-3 text-left focus-visible:outline-none"
                 aria-label={isPlaying ? `Pause ${track.title}` : `Play ${track.title}`}
                 onclick={(e) => {
                     // Modifiers select; a plain click still plays.
@@ -480,7 +480,7 @@
               when the pointer arrives, which is the whole point of pinning the
               width.
             -->
-            <span class="grid h-8 w-12 shrink-0 items-center justify-items-end">
+            <span class="ml-8 grid h-8 w-12 shrink-0 items-center justify-items-end">
                 <!--
                   Both children share one grid cell, so they sit exactly on top
                   of each other and neither can push the other around.

@@ -156,12 +156,12 @@ export function virtualRows(config: {
  * A track row's height before it is measured, in pixels.
  *
  * One number shared by every list that shows tracks, because they all render
- * the same row: 40px of artwork inside 8px of padding, plus a hairline. Each
+ * the same row: 40px of artwork inside 12px of padding, plus a hairline. Each
  * rendered row still reports its real height — a title that wraps to two lines
  * is taller — so this only has to be close, and only matters for the rows
  * nobody has scrolled to yet.
  */
-export const ROW_HEIGHT = 56;
+export const ROW_HEIGHT = 64;
 
 /**
  * A search result row's height before it is measured, in pixels.

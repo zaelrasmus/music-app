@@ -72,16 +72,43 @@ const PREVIEW_LIMIT: usize = 50;
 /// logarithmically -- a linear slider puts almost all audible change in the
 /// bottom fifth. Mapping through decibels is what makes the slider feel even.
 ///
-/// Sixty rather than forty, because forty put the whole usable range in the
-/// bottom of the travel. Measured against this library: every file peaks at
-/// 0.0 dBFS -- modern masters are brick-walled -- so a comfortable listening
-/// level lands around -35 dB, which was slider 0.13. Everything above it was
-/// unreachably loud and there was no room to adjust. The same level now sits
-/// near the middle, with real travel either side of it.
+/// Forty, not sixty. Sixty was tried and was wrong.
 ///
-/// The top stays unity. A player that quietly attenuates at maximum has no
-/// answer left for a track that was mastered quietly.
-const MIN_DB: f32 = -60.0;
+/// The argument for widening it was that a comfortable level sat at slider
+/// 0.13 and needed room either side. That rested on a guess -- that people
+/// listen at about -35 dB -- and the guess was too quiet. Used, sixty put
+/// -43 dB at slider 0.3 and -32 dB at slider 0.5, so half the travel was
+/// inaudible and nothing started sounding like music until past the middle.
+///
+/// The range is what decides how much a given nudge changes: sixty decibels
+/// across the same travel is 0.56 dB per percent against forty's 0.36. Wider
+/// range, coarser control, and every correction between songs overshoots.
+///
+/// Forty puts -29 dB at slider 0.3 and -22 dB at slider 0.5, which is within
+/// three decibels of the curve this shipped with and was not complained
+/// about.
+const MIN_DB: f32 = -40.0;
+
+/// Headroom at the top of the slider, in decibels.
+///
+/// The top used to be unity, on the reasoning that a player which quietly
+/// attenuates at maximum has no answer left for a quietly mastered track.
+/// That reasoning assumed the samples fit in the box. Measured against this
+/// library, they do not: a lossy decode to f32 is not clamped, and brick-walled
+/// masters routinely reconstruct above full scale. 23 of the 26 cached streams
+/// and 10 of 12 sampled local files peak *over* 0 dBFS, the worst at +3.18 dB
+/// -- a sample value of 1.44.
+///
+/// At unity those samples are handed to the device untouched and hard-clipped
+/// there, which is harmonic distortion on exactly the loudest transients. That
+/// is what makes the top of the slider hurt rather than merely being loud, and
+/// it is why it only hurts near the top: below slider 0.95 the attenuation
+/// already pulls the peaks back under full scale.
+///
+/// Four decibels covers the worst peak measured with room to spare. The cost
+/// is that maximum is a little quieter than it was; the alternative is a player
+/// that distorts on most of its own library.
+const MAX_DB: f32 = -4.0;
 
 /// How far into a track it must have been left for the position to survive a
 /// restart.
@@ -130,10 +157,11 @@ fn slider_to_linear(slider: f32, muted: bool) -> f32 {
     }
     let slider = slider.clamp(0.0, 1.0);
     if slider <= 0.0 {
-        // -40 dB is quiet, not silent; the bottom of the slider must be silent.
+        // The bottom of the range is quiet, not silent; the bottom of the
+        // slider must be silent.
         return 0.0;
     }
-    rodio::math::db_to_linear(MIN_DB * (1.0 - slider))
+    rodio::math::db_to_linear(MAX_DB - (MAX_DB - MIN_DB) * (1.0 - slider))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1231,6 +1259,9 @@ impl<E: PlayerEvents> Coordinator<E> {
         let yt_dlp = self.yt_dlp.clone();
         let ffmpeg = self.ffmpeg.clone();
         let prepares = self.prepares.clone();
+        // Only for its output rate: the decode has to be built at whatever the
+        // device runs at, and the engine is the only thing that knows.
+        let engine_for_build = Arc::clone(&self.engine);
 
         tauri::async_runtime::spawn(async move {
             // Preferred only. If it turns out not to decode, the real load
@@ -1254,7 +1285,14 @@ impl<E: PlayerEvents> Coordinator<E> {
             // runtime it would stall every other task.
             let source_for_build = source.clone();
             let built = tauri::async_runtime::spawn_blocking(move || {
-                engine::build_source(&source_for_build, ffmpeg.as_deref(), Duration::ZERO)
+                // The device rate, so the decode comes back at the rate rodio
+                // is already mixing at and never has to be resampled.
+                engine::build_source(
+                    &source_for_build,
+                    ffmpeg.as_deref(),
+                    engine_for_build.output_rate(),
+                    Duration::ZERO,
+                )
             })
             .await;
 
@@ -1879,9 +1917,16 @@ mod tests {
         assert_eq!(resume_position(1200.0, None), 0.0);
     }
 
+    /// The top of the slider is the headroom, not unity.
+    ///
+    /// Deliberately pinned: this is the number that decides whether the loudest
+    /// moment of a track survives or is clipped by the device, so it should not
+    /// drift without someone reading why it is what it is.
     #[test]
-    fn the_top_of_the_slider_is_unity_gain() {
-        assert!((slider_to_linear(1.0, false) - 1.0).abs() < 1e-4);
+    fn the_top_of_the_slider_leaves_headroom() {
+        let expected = rodio::math::db_to_linear(MAX_DB);
+        assert!((slider_to_linear(1.0, false) - expected).abs() < 1e-4);
+        assert!(slider_to_linear(1.0, false) < 1.0);
     }
 
     #[test]
@@ -1907,9 +1952,11 @@ mod tests {
     /// somewhere you can adjust, not pinned against the bottom stop.
     #[test]
     fn a_comfortable_level_sits_in_the_middle_of_the_travel() {
-        // Measured on this library: files peak at 0.0 dBFS, and about -35 dB
-        // of attenuation is a normal listening level for them.
-        let comfortable = rodio::math::db_to_linear(-35.0);
+        // Not a guess this time. At -32 dB -- what the sixty-decibel range put
+        // at slider 0.5 -- tracks were reported as too quiet to listen to, and
+        // the curve this shipped with put -20 dB there and was not. So a real
+        // listening level is around -20, and that is what has to sit mid-travel.
+        let comfortable = rodio::math::db_to_linear(-20.0);
 
         let mut slider = 0.0f32;
         while slider < 1.0 && slider_to_linear(slider, false) < comfortable {
@@ -1919,6 +1966,24 @@ mod tests {
         assert!(
             (0.3..=0.7).contains(&slider),
             "a normal level should land mid-slider, not at {slider}",
+        );
+    }
+
+    /// The reason the top is no longer unity.
+    ///
+    /// A lossy decode to f32 is not clamped, so a brick-walled master
+    /// reconstructs above full scale. Measured with the bundled ffmpeg over
+    /// every cached stream and a sample of local files, the worst peak in this
+    /// library is +3.18 dBFS. Anything the slider can reach must leave that
+    /// much room, or the device clips it.
+    #[test]
+    fn the_loudest_measured_track_does_not_clip_at_full_slider() {
+        let worst_peak = rodio::math::db_to_linear(3.18);
+        let output = worst_peak * slider_to_linear(1.0, false);
+
+        assert!(
+            output <= 1.0,
+            "full slider sends {output} to the device, which clips above 1.0",
         );
     }
 
