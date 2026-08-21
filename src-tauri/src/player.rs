@@ -74,6 +74,47 @@ const PREVIEW_LIMIT: usize = 50;
 /// At the midpoint this gives -20 dB, about 10% amplitude.
 const MIN_DB: f32 = -40.0;
 
+/// How far into a track it must have been left for the position to survive a
+/// restart.
+///
+/// Below this, starting over costs less than two minutes and hands back the
+/// whole song, which is what the user wanted when they pressed play on it.
+const RESUME_MIN_POSITION: f64 = 2.0 * 60.0;
+
+/// How much of a track must remain for resuming to beat starting over.
+///
+/// Under five minutes left is less than one more song, so there is nothing to
+/// save by dropping the user into the middle of it.
+const RESUME_MIN_REMAINING: f64 = 5.0 * 60.0;
+
+/// Where a track restored from the last session should begin.
+///
+/// Resuming mid-track is borrowed from podcast and video players, and it is
+/// right *there* because their content is long, linear and heard once. A song
+/// is none of those things. Dropping someone into the last forty seconds of a
+/// three-minute track they chose to play is not a convenience; it costs them
+/// the song and asks them to drag the handle back to zero.
+///
+/// So a position is kept only when losing it would cost something real: the
+/// listen was already long enough to be worth not repeating, *and* enough of
+/// the track is left to be worth resuming to. Both together mean nothing under
+/// seven minutes can ever resume — which is 96% of this library, and every
+/// track anyone would call a song. What resumes is what the rule was invented
+/// for: long uploads, mixes, sets, anything an hour deep.
+///
+/// An unknown duration is a live stream or a row with no metadata. Neither has
+/// a position worth restoring, so it starts at the beginning like the majority.
+fn resume_position(saved: f64, duration: Option<f64>) -> f64 {
+    let worth_keeping = saved >= RESUME_MIN_POSITION
+        && duration.is_some_and(|total| total - saved >= RESUME_MIN_REMAINING);
+
+    if worth_keeping {
+        saved
+    } else {
+        0.0
+    }
+}
+
 fn slider_to_linear(slider: f32, muted: bool) -> f32 {
     if muted {
         return 0.0;
@@ -965,12 +1006,6 @@ impl<E: PlayerEvents> Coordinator<E> {
     /// seconds of work for a track the user may never press play on. The
     /// position is held instead and applied to the load if and when they do.
     async fn restore(&mut self, track_id: i64, position_secs: f64) {
-        // Only worth restoring a position the user would notice losing, and
-        // never one at the very end -- resuming there just plays silence and
-        // skips on.
-        const MIN_POSITION: f64 = 10.0;
-        const END_MARGIN: f64 = 15.0;
-
         let duration: Option<f64> =
             sqlx::query_scalar("SELECT duration_secs FROM tracks WHERE id = ?")
                 .bind(track_id)
@@ -992,12 +1027,7 @@ impl<E: PlayerEvents> Coordinator<E> {
             return;
         }
 
-        let near_end = duration.is_some_and(|total| position_secs > total - END_MARGIN);
-        let position = if position_secs < MIN_POSITION || near_end {
-            0.0
-        } else {
-            position_secs
-        };
+        let position = resume_position(position_secs, duration);
 
         self.queue
             .set_context(vec![track_id], 0, Some("where you left off".to_string()));
@@ -1696,6 +1726,63 @@ pub async fn seek(position_secs: f64, player: State<'_, PlayerHandle>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The case the whole rule exists for: an ordinary song.
+    ///
+    /// Three and a half minutes, left two minutes in. The old rule resumed it,
+    /// and what the user got on pressing play was the last eighty seconds of a
+    /// song they had chosen to hear.
+    #[test]
+    fn a_song_always_starts_from_the_beginning() {
+        assert_eq!(resume_position(120.0, Some(210.0)), 0.0);
+    }
+
+    /// Nothing under seven minutes can satisfy both halves of the rule at
+    /// once, which is what makes "songs restart" a property rather than a
+    /// threshold anyone has to remember.
+    #[test]
+    fn no_short_track_can_resume_wherever_it_was_left() {
+        for duration in [60.0, 180.0, 210.0, 330.0, 419.0] {
+            let mut position = 0.0;
+            while position < duration {
+                assert_eq!(
+                    resume_position(position, Some(duration)),
+                    0.0,
+                    "a {duration}s track resumed at {position}s",
+                );
+                position += 5.0;
+            }
+        }
+    }
+
+    /// The long upload the rule is *for*. Twenty minutes in on an hour-long
+    /// set is exactly the position nobody wants to find again by dragging.
+    #[test]
+    fn a_long_track_keeps_the_position_it_was_left_at() {
+        assert_eq!(resume_position(1200.0, Some(3600.0)), 1200.0);
+    }
+
+    /// Barely started is not a listen. Restarting costs under two minutes and
+    /// gives back the beginning, which is where a track heard once belongs.
+    #[test]
+    fn a_long_track_barely_begun_starts_over() {
+        assert_eq!(resume_position(45.0, Some(3600.0)), 0.0);
+    }
+
+    /// Near the end there is nothing left to resume *to*: playing the outro
+    /// and skipping on is not what the position was kept for.
+    #[test]
+    fn a_long_track_near_its_end_starts_over() {
+        assert_eq!(resume_position(3500.0, Some(3600.0)), 0.0);
+    }
+
+    /// A live stream, or a row whose duration was never learned. With no total
+    /// there is no way to tell the middle from the end, so it starts over --
+    /// the same answer the overwhelming majority of tracks get.
+    #[test]
+    fn an_unknown_duration_starts_over() {
+        assert_eq!(resume_position(1200.0, None), 0.0);
+    }
 
     #[test]
     fn the_top_of_the_slider_is_unity_gain() {

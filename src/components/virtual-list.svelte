@@ -2,6 +2,7 @@
     import type { Snippet } from "svelte";
     import { virtualRows } from "$lib/virtual.svelte";
     import { scrollContainer } from "$lib/scroll-container.svelte";
+    import { cn } from "$lib/utils";
 
     interface Props {
         rows: Row[];
@@ -62,7 +63,7 @@
   rather than by `top`, which keeps them off the layout path and lets the
   browser move them on the compositor.
 -->
-<ul class="relative {className}" style="height: {virtualizer.totalSize}px">
+<ul class={cn("relative", className)} style="height: {virtualizer.totalSize}px">
     {#each virtualizer.items as item (item.key)}
         <li
             class="absolute top-0 left-0 w-full"

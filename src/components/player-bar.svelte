@@ -278,8 +278,21 @@
             {/if}
         </button>
 
+        <!--
+          102px: ten percent wider than Spotify's, which is 93px.
+
+          That figure is measured rather than eyeballed. Spotify gives the whole
+          volume control `flex: 0 1 125px` and puts a `.control-button` inside
+          it at a fixed 32px, leaving 93px of slider. Our mute button is 32px
+          too, so the two sit in directly comparable space.
+
+          Still lighter than the seek bar — see `compact`. Width is what makes
+          it a volume control; weight is what keeps it from reading as a second
+          progress bar.
+        -->
         <ScrubBar
-            class="w-24 shrink-0"
+            class="w-[102px] shrink-0"
+            compact
             value={player.muted ? 0 : player.volume}
             max={1}
             step={0.05}

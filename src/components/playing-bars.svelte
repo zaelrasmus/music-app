@@ -1,4 +1,6 @@
 <script lang="ts">
+    import { cn } from "$lib/utils";
+
     interface Props {
         /** Paused keeps the bars, frozen — the row is still the current one. */
         animate?: boolean;
@@ -19,7 +21,7 @@
   track — losing the mark entirely would make a paused player look stopped.
 -->
 <span
-    class="flex h-3 items-end gap-[2px] {className}"
+    class={cn("flex h-3 items-end gap-[2px]", className)}
     aria-hidden="true"
     data-animate={animate}
 >

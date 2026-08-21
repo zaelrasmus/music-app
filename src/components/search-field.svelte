@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { cn } from "$lib/utils";
     import { Input } from "$components/ui/input";
     import SearchIcon from "@lucide/svelte/icons/search";
     import XIcon from "@lucide/svelte/icons/x";
@@ -29,7 +30,7 @@
     }
 </script>
 
-<div class="relative {className}">
+<div class={cn("relative", className)}>
     <SearchIcon
         class="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2"
     />

@@ -1102,22 +1102,29 @@ async fn commands_are_answered_while_a_track_is_loading() {
 /// must begin at the saved position rather than at the beginning.
 #[tokio::test]
 async fn a_restored_track_waits_in_the_bar_then_resumes_where_it_was() {
-    const RESUME_AT: f64 = 90.0;
+    // Past two minutes, with far more than five left of the ten the row
+    // claims -- the only shape of listen whose position is kept at all.
+    const RESUME_AT: f64 = 130.0;
+    const CLAIMED_DURATION: i64 = 600;
 
     let base = std::env::temp_dir().join("music-app-resume");
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
 
-    // Long enough that a resume position is well inside it.
+    // Long enough to hold the resume point, and no longer: a genuine ten
+    // minutes of PCM is 53MB of temp file to prove nothing extra. The row's
+    // duration is what the rule reads, and a stated duration disagreeing with
+    // what actually decodes is ordinary for a remote track anyway.
     let wav = base.join("tone.wav");
     write_wav_secs(&wav, 180);
 
     let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
     let track_id: i64 = sqlx::query_scalar(
         "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
-         VALUES ('local', 'Tone', ?, 'present', 180) RETURNING id",
+         VALUES ('local', 'Tone', ?, 'present', ?) RETURNING id",
     )
     .bind(wav.to_str().unwrap())
+    .bind(CLAIMED_DURATION)
     .fetch_one(&db.pool)
     .await
     .unwrap();
