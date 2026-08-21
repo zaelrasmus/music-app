@@ -44,6 +44,37 @@
         return trackStore.tracks.find((t) => t.id === id) ?? null;
     });
 
+    /**
+     * Something is playing that the bar cannot name.
+     *
+     * Only reachable when the two events have drifted: the id arrived and its
+     * details did not. A library track survives it — `trackStore` can describe
+     * that one — but a streamed audition is deliberately not in the library,
+     * so there is nowhere else to look and the bar has an id and nothing else.
+     */
+    const undescribed = $derived(player.trackId !== null && nowPlaying === null);
+
+    /**
+     * Ask again, once.
+     *
+     * The queue payload is pushed, so a lost or late one leaves the bar blank
+     * with no way back — the coordinator only emits on change, and the change
+     * has already happened. Asking costs one round trip and is bounded to a
+     * single attempt per track, because a refresh that did not help will not
+     * help the second time either and this must never become a loop.
+     */
+    // Deliberately not `$state`: the effect reads it as a latch, and making it
+    // reactive would have the effect depend on its own write.
+    let asked: number | null = null;
+
+    $effect(() => {
+        const id = player.trackId;
+        if (id === null || !undescribed || asked === id) return;
+
+        asked = id;
+        void queueStore.refresh();
+    });
+
     // Total comes from the scanned tag, not from rodio, whose total_duration
     // is None for several formats.
     /**
@@ -155,6 +186,21 @@
                     {/if}
                 </span>
             </div>
+        {:else if undescribed}
+            <!--
+              Playing, but not yet describable. "Nothing playing" would be a
+              flat lie with audio coming out of the speakers, and showing the
+              last song's title instead is the lie this branch exists to
+              replace. So: the shape of a track, and an honest label.
+            -->
+            <div class="bg-muted grid size-[52px] shrink-0 place-items-center rounded-lg">
+                <ListMusicIcon class="text-muted-foreground size-5" />
+            </div>
+            <div class="flex min-w-0 flex-col gap-0.5">
+                <span class="text-muted-foreground truncate text-[13px] leading-tight">
+                    Loading track details…
+                </span>
+            </div>
         {:else}
             <div class="bg-muted grid size-[52px] shrink-0 place-items-center rounded-lg">
                 <ListMusicIcon class="text-muted-foreground size-5" />
@@ -189,7 +235,10 @@
             </button>
 
             <!-- The one solid control. Everything else on this bar is a
-                 modifier; this is the verb. -->
+                 modifier; this is the verb.
+
+                 Disabled on there being no track, not on being unable to name
+                 one: a bar that cannot show the title must still pause. -->
             <button
                 type="button"
                 class="bg-foreground text-background grid size-9 shrink-0 place-items-center rounded-full transition-transform hover:scale-105 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background active:scale-95 disabled:opacity-50 disabled:hover:scale-100"
@@ -198,7 +247,7 @@
                     : player.state === "playing"
                       ? "Pause"
                       : "Play"}
-                disabled={loading || !nowPlaying}
+                disabled={loading || player.trackId === null}
                 onclick={() => player.togglePlayPause()}
             >
                 {#if loading}

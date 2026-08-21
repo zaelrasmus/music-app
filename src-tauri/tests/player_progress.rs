@@ -1725,3 +1725,173 @@ async fn a_track_that_never_starts_still_resets_the_position() {
          showing the previous track's, got {ticks:?}",
     );
 }
+
+/// The bar's two halves must describe the same track.
+///
+/// The id arrives on `player-state` and the title, artist and artwork arrive
+/// on `player-queue`. Anything that reads both — the player bar does — is
+/// entitled to assume they agree, and has no way to draw anything sensible if
+/// they do not: a streamed audition is not in the library, so there is no
+/// second place to look the details up.
+#[tokio::test]
+async fn the_state_and_the_queue_agree_about_what_is_playing() {
+    let base = std::env::temp_dir().join("music-app-bar-agreement");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let wav = base.join("audition.wav");
+    write_wav(&wav);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    // Exactly what auditioning a search result leaves behind: a remote track
+    // that is deliberately *not* in the library. Held as `downloaded` against
+    // a real file so it plays without a network.
+    let track_id: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks \
+         (source, title, artist, duration_secs, state, in_library, local_path, \
+          remote_id, remote_url) \
+         VALUES ('youtube', 'An Audition', 'A Channel', 3, 'downloaded', 0, ?, \
+                 'abcdefghijk', 'https://www.youtube.com/watch?v=abcdefghijk') \
+         RETURNING id",
+    )
+    .bind(wav.to_str().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+            context_name: Some("YouTube search".to_string()),
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let state = recorder
+        .0
+        .states
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("playing emits a state");
+    let queue = recorder
+        .0
+        .queues
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .expect("playing emits a queue");
+
+    eprintln!("state.track_id: {:?}", state.track_id);
+    eprintln!("queue.current:  {:?}", queue.current.as_ref().map(|c| (c.track_id, &c.title)));
+
+    assert_eq!(state.track_id, Some(track_id), "the state names the track");
+
+    let current = queue.current.expect("the queue names a current track");
+    assert_eq!(current.track_id, track_id, "the queue names the same track");
+    assert_eq!(current.title, "An Audition", "and can describe it");
+    assert_eq!(current.artist.as_deref(), Some("A Channel"));
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The same agreement, across a change of track.
+///
+/// The cold-start case proves the payloads are built correctly. This proves
+/// nothing is left behind: the reported symptom was the *previous* song's
+/// title sitting over the new song's audio, which is what a queue event that
+/// lags the state event by one track would look like.
+#[tokio::test]
+async fn changing_track_leaves_nothing_of_the_previous_one_in_the_bar() {
+    let base = std::env::temp_dir().join("music-app-bar-transition");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let first = base.join("first.wav");
+    let second = base.join("second.wav");
+    write_wav(&first);
+    write_wav(&second);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    let local: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+         VALUES ('local', 'A Local Song', ?, 'present', 3) RETURNING id",
+    )
+    .bind(first.to_str().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let online: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks \
+         (source, title, artist, duration_secs, state, in_library, local_path, \
+          remote_id, remote_url) \
+         VALUES ('youtube', 'An Audition', 'A Channel', 3, 'downloaded', 0, ?, \
+                 'abcdefghijk', 'https://www.youtube.com/watch?v=abcdefghijk') \
+         RETURNING id",
+    )
+    .bind(second.to_str().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+
+    for id in [local, online] {
+        handle
+            .send(PlayerCommand::PlayQueue {
+                track_ids: vec![id],
+                start_index: 0,
+                context_name: Some("YouTube search".to_string()),
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+
+    let states: Vec<Option<i64>> = recorder
+        .0
+        .states
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.track_id)
+        .collect();
+    let queues: Vec<(Option<i64>, Option<String>)> = recorder
+        .0
+        .queues
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|q| {
+            (
+                q.current.as_ref().map(|c| c.track_id),
+                q.current.as_ref().map(|c| c.title.clone()),
+            )
+        })
+        .collect();
+
+    eprintln!("local={local} online={online}");
+    eprintln!("states: {states:?}");
+    eprintln!("queues: {queues:?}");
+
+    assert_eq!(states.last(), Some(&Some(online)), "the state names the new track");
+    assert_eq!(
+        queues.last().map(|(id, _)| *id),
+        Some(Some(online)),
+        "the queue names the new track too, got {queues:?}",
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
