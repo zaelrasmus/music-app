@@ -26,6 +26,19 @@
         cover?: string | null;
         /** A real image, when the user chose one. Falls back to generated. */
         coverKey?: string | null;
+        /** A remote picture, for an artist whose avatar is not stored. */
+        coverSrc?: string | null;
+        /**
+         * Draws the head as a person rather than as a collection.
+         *
+         * A round, larger picture, because that is what a circle means
+         * everywhere else in this app and in every other music player: a
+         * collection is a square, a person is not. A playlist that fills
+         * itself from one artist *is* that artist's page, and looking like a
+         * different kind of thing than the provider's page for the same person
+         * is the confusion worth avoiding.
+         */
+        artist?: boolean;
         /** "56 songs", "3h 12m", "12 offline" — joined with separators. */
         meta?: (string | null)[];
         onPlay?: () => void;
@@ -45,6 +58,8 @@
         title,
         cover = null,
         coverKey = null,
+        coverSrc = null,
+        artist = false,
         meta = [],
         onPlay,
         onShuffle,
@@ -75,7 +90,10 @@
             <CoverArt
                 seed={cover}
                 {coverKey}
-                class="size-[104px] rounded-xl"
+                src={coverSrc}
+                class={artist
+                    ? "size-28 rounded-full shadow-sm sm:size-32"
+                    : "size-[104px] rounded-xl"}
                 glyph={false}
             />
         {/if}

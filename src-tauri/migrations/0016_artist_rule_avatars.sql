@@ -1,0 +1,17 @@
+-- The artist's own picture, for a playlist that fills itself from them.
+--
+-- Nothing in the database held one before this. `tracks.remote_thumbnail_url`
+-- is *song* art -- a single release's cover -- and using it as an artist's face
+-- puts one arbitrary track's artwork on a collection of forty, which looks like
+-- a bug because it is one.
+--
+-- Stored on the rule rather than in a table of its own: an avatar is only ever
+-- wanted where a rule names an artist, it is worth nothing (the provider still
+-- has it), and hanging it off the rule means it is removed by the same cascade
+-- when the rule goes.
+--
+-- Nullable and expected to be null for a while. It is filled in the background
+-- after the rule is created, because finding it is a network round trip and
+-- naming an artist should not wait on one. A playlist with no avatar falls back
+-- to art generated from its name, exactly as any other playlist does.
+ALTER TABLE playlist_artist_rules ADD COLUMN avatar_url TEXT;

@@ -25,6 +25,10 @@
         library.load();
         trackStore.load();
         playlistStore.load();
+        // The artists a rule can name, and the pictures an artist playlist
+        // borrows. Loaded once here rather than per panel, because both the
+        // grid and the picker read it.
+        playlistStore.loadArtists();
         tagStore.load();
         tagStore.loadPalette();
         // `restore` refreshes once the saved sort is known, so the list is not

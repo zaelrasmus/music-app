@@ -7,7 +7,7 @@ mod downloads;
 mod engine;
 mod library;
 mod playable;
-mod playlists;
+pub mod playlists;
 pub mod player;
 mod providers;
 mod queue;
@@ -201,6 +201,9 @@ pub fn run() {
             playlists::add_tracks_to_playlist,
             playlists::remove_track_from_playlist,
             playlists::reorder_playlist_track,
+            playlists::list_library_artists,
+            playlists::add_playlist_artist_rule,
+            playlists::remove_playlist_artist_rule,
             tags::assign_tag,
             tags::remove_tag_from_track,
             tags::list_tags,

@@ -3,6 +3,29 @@ import { toast } from "svelte-sonner";
 import { player } from "$lib/player.svelte";
 import type { Track } from "$lib/tracks.svelte";
 
+/** One name that counts as a playlist's artist. */
+export type ArtistRule = {
+  artistKey: string;
+  label: string;
+  /**
+   * The artist's own picture, found in the background after the rule was made.
+   *
+   * Null until it arrives, and null forever when the provider has nothing to
+   * offer. Deliberately *not* a track thumbnail: that is one release's cover,
+   * and standing it in for the artist puts an arbitrary song's artwork on a
+   * collection of forty.
+   */
+  avatarUrl: string | null;
+};
+
+/** An artist present in the library, for the picker and the browse list. */
+export type LibraryArtist = {
+  artistKey: string;
+  name: string;
+  trackCount: number;
+  source: string | null;
+};
+
 export type Playlist = {
   id: number;
   name: string;
@@ -10,7 +33,30 @@ export type Playlist = {
   createdAt: number;
   trackCount: number;
   coverKey?: string | null;
+  /**
+   * The artist names this playlist fills itself from.
+   *
+   * Empty for an ordinary playlist. Non-empty is what makes it an artist
+   * collection, and the only thing the UI reads to decide that -- so the
+   * circle it draws can never disagree with how the playlist behaves.
+   */
+  artistRules: ArtistRule[];
 };
+
+/** Whether a playlist fills itself from exactly one artist. */
+export function isArtistPlaylist(playlist: Playlist) {
+  return (playlist.artistRules?.length ?? 0) > 0;
+}
+
+/**
+ * Whether to draw it as a circle.
+ *
+ * One artist only. Two rules means two faces, and a circle showing one of
+ * them would be a claim about identity nobody made.
+ */
+export function drawsAsArtist(playlist: Playlist) {
+  return (playlist.artistRules?.length ?? 0) === 1;
+}
 
 export type PlaylistDetail = {
   playlist: Playlist;
@@ -31,6 +77,95 @@ class PlaylistStore {
   /** The opened playlist, or null when showing the list. */
   open = $state<PlaylistDetail | null>(null);
   loading = $state(false);
+
+  /** Every artist in the library, for the rule picker and the browse list. */
+  artists = $state<LibraryArtist[]>([]);
+
+  /** Filter over playlist *names*. Separate from the in-playlist filter. */
+  listQuery = $state("");
+
+  /**
+   * Which kinds of playlist the list shows.
+   *
+   * Derived from the rules rather than stored anywhere: a playlist is an
+   * artist because it fills itself from one, so this can never need
+   * maintaining and a new playlist classifies itself.
+   */
+  kind = $state<"all" | "artists" | "other">("all");
+
+  get visiblePlaylists() {
+    const needle = this.listQuery.trim().toLowerCase();
+    return this.playlists.filter((playlist) => {
+      if (this.kind === "artists" && !isArtistPlaylist(playlist)) return false;
+      if (this.kind === "other" && isArtistPlaylist(playlist)) return false;
+      if (!needle) return true;
+      return (
+        playlist.name.toLowerCase().includes(needle) ||
+        playlist.artistRules?.some((rule) =>
+          rule.label.toLowerCase().includes(needle),
+        )
+      );
+    });
+  }
+
+  async loadArtists() {
+    try {
+      this.artists = await invoke<LibraryArtist[]>("list_library_artists");
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
+  /**
+   * Makes an artist one of the names a playlist fills itself from.
+   *
+   * The list is reloaded as well as the open playlist: a rule changes the
+   * track count and the shape of the row behind this screen.
+   */
+  async addArtistRule(playlistId: number, label: string) {
+    try {
+      await invoke<Playlist>("add_playlist_artist_rule", { playlistId, label });
+      await this.refreshOpen();
+      await this.load();
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
+  async removeArtistRule(playlistId: number, artistKey: string) {
+    try {
+      await invoke<Playlist>("remove_playlist_artist_rule", {
+        playlistId,
+        artistKey,
+      });
+      await this.refreshOpen();
+      await this.load();
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
+  /**
+   * Creates a playlist that fills itself from this artist.
+   *
+   * The path from "I like this artist" to "here are their songs" in one
+   * gesture -- which is the only reason the artist browse list exists.
+   */
+  async createFromArtist(artist: LibraryArtist) {
+    try {
+      const created = await invoke<Playlist>("create_playlist", {
+        name: artist.name,
+      });
+      await invoke<Playlist>("add_playlist_artist_rule", {
+        playlistId: created.id,
+        label: artist.name,
+      });
+      await this.load();
+      await this.openPlaylist(created.id);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
 
   async load() {
     try {

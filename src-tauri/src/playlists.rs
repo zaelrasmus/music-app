@@ -24,6 +24,40 @@ pub struct Playlist {
     pub source: Option<String>,
     /// The provider page it was built from.
     pub source_url: Option<String>,
+    /// The artist names this playlist fills itself from.
+    ///
+    /// Empty for an ordinary playlist. Non-empty is what makes it an artist
+    /// collection -- which is also what the UI draws as a circle rather than a
+    /// square, so the shape can never disagree with the behaviour.
+    #[sqlx(skip)]
+    pub artist_rules: Vec<ArtistRule>,
+}
+
+/// One name that counts as a playlist's artist.
+#[derive(Debug, Clone, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistRule {
+    /// Matched against. Trimmed and lowercased.
+    pub artist_key: String,
+    /// What the user picked, for the chip.
+    pub label: String,
+    /// The artist's own picture, found in the background after the rule was
+    /// made. `None` until it arrives, and `None` forever if the provider has
+    /// nothing to offer -- in which case the playlist keeps its generated art,
+    /// which is a better answer than one track's cover standing in for forty.
+    pub avatar_url: Option<String>,
+}
+
+/// An artist present in the library, for the picker and the browse list.
+#[derive(Debug, Clone, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryArtist {
+    pub artist_key: String,
+    pub name: String,
+    pub track_count: i64,
+    /// Which provider their tracks came from, so an avatar can be looked for
+    /// in the right place. `None` for an artist known only from local files.
+    pub source: Option<String>,
 }
 
 /// A playlist together with its tracks, in order.
@@ -44,6 +78,49 @@ pub struct AddOutcome {
     pub added: usize,
     /// Already present, so left alone.
     pub skipped: usize,
+}
+
+/// How many tracks a playlist really holds, as SQL, correlated on `p.id`.
+///
+/// The `CASE` is a fast path, not a micro-optimisation: without rules the
+/// answer is a two-row lookup in `playlist_tracks`, and taking the general
+/// branch would scan every track in the library once per playlist just to
+/// discover that none of them qualify.
+const MEMBER_COUNT: &str = "
+    CASE WHEN EXISTS (SELECT 1 FROM playlist_artist_rules r WHERE r.playlist_id = p.id)
+         THEN (SELECT COUNT(*) FROM tracks t
+               LEFT JOIN playlist_tracks pt
+                      ON pt.track_id = t.id AND pt.playlist_id = p.id
+               WHERE (pt.track_id IS NOT NULL
+                      OR (t.in_library = 1
+                          AND lower(trim(COALESCE(NULLIF(trim(t.remote_uploader), ''), t.artist)))
+                              IN (SELECT artist_key FROM playlist_artist_rules
+                                  WHERE playlist_id = p.id)))
+                 AND t.id NOT IN (SELECT track_id FROM playlist_excluded_tracks
+                                  WHERE playlist_id = p.id))
+         ELSE (SELECT COUNT(*) FROM playlist_tracks pt WHERE pt.playlist_id = p.id)
+    END AS track_count";
+
+/// How a track's artist is identified for matching, as SQL.
+///
+/// `remote_uploader` first because it is the provider's own name for the
+/// channel and nothing in this app ever edits it. `artist` is the *display*
+/// copy the user may rename, and matching on that would silently drop a track
+/// out of its own artist's playlist the moment they tidied its title.
+///
+/// One constant rather than the expression written out at each site: it is
+/// also the expression the index in migration 0015 is built on, and an index
+/// that does not match its query is simply a slower query nobody notices.
+const ARTIST_KEY: &str =
+    "lower(trim(COALESCE(NULLIF(trim(t.remote_uploader), ''), t.artist)))";
+
+/// The same, for queries that do not alias `tracks` as `t`.
+const ARTIST_KEY_BARE: &str =
+    "lower(trim(COALESCE(NULLIF(trim(remote_uploader), ''), artist)))";
+
+/// Trimmed and lowercased, so one name in two casings is one artist.
+pub(crate) fn artist_key_of(name: &str) -> String {
+    name.trim().to_lowercase()
 }
 
 fn clean_name(name: &str) -> Result<String, String> {
@@ -172,17 +249,23 @@ pub async fn delete_playlist(db: State<'_, Db>, playlist_id: i64) -> Result<(), 
 
 #[tauri::command]
 pub async fn list_playlists(db: State<'_, Db>) -> Result<Vec<Playlist>, String> {
-    sqlx::query_as(
-        "SELECT p.id, p.name, p.cover_key, p.created_at, p.source, p.source_url,
-                COUNT(pt.track_id) AS track_count
+    // `QueryBuilder` because the count is composed rather than literal, and
+    // it owns its string -- `query_as` borrows one, which cannot outlive the
+    // statement that built it.
+    let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
+        "SELECT p.id, p.name, p.cover_key, p.created_at, p.source, p.source_url, {MEMBER_COUNT}
          FROM playlists p
-         LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
-         GROUP BY p.id
-         ORDER BY p.created_at DESC, p.id DESC",
-    )
-    .fetch_all(&db.pool)
-    .await
-    .map_err(|e| e.to_string())
+         ORDER BY p.created_at DESC, p.id DESC"
+    ));
+
+    let mut playlists: Vec<Playlist> = query
+        .build_query_as()
+        .fetch_all(&db.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    attach_rules(&db.pool, &mut playlists).await?;
+    Ok(playlists)
 }
 
 /// A playlist's tracks, optionally narrowed by text and tags.
@@ -200,6 +283,23 @@ pub async fn get_playlist(
     mode: Option<TagMode>,
 ) -> Result<PlaylistDetail, String> {
     let playlist = load_playlist(&db.pool, playlist_id).await?;
+    let tracks = playlist_tracks(&db.pool, playlist_id, search, tag_ids, mode).await?;
+    Ok(PlaylistDetail { playlist, tracks })
+}
+
+/// Which tracks a playlist holds, in order.
+///
+/// A free function taking a pool rather than only a command, because this is
+/// where membership is actually decided -- rule matches, hand-added rows and
+/// exclusions resolved together -- and a test that had to reach it through
+/// Tauri would end up re-typing the query instead of running it.
+pub async fn playlist_tracks(
+    pool: &sqlx::SqlitePool,
+    playlist_id: i64,
+    search: Option<String>,
+    tag_ids: Option<Vec<i64>>,
+    mode: Option<TagMode>,
+) -> Result<Vec<Track>, String> {
 
     let tag_ids = tag_ids.unwrap_or_default();
     let mode = mode.unwrap_or_default();
@@ -207,17 +307,23 @@ pub async fn get_playlist(
 
     // Typed, but nothing searchable survived sanitising.
     if search.as_deref().is_some_and(|s| !s.trim().is_empty()) && expression.is_none() {
-        return Ok(PlaylistDetail {
-            playlist,
-            tracks: Vec::new(),
-        });
+        return Ok(Vec::new());
     }
 
+    // Membership, resolved here rather than materialised into
+    // `playlist_tracks`: a rule is a standing statement about what belongs,
+    // and copying its answer into rows would need a sync step that can fall
+    // behind and a second copy of the truth that can disagree.
+    //
+    // `LEFT JOIN` rather than `JOIN`, so a track admitted only by a rule still
+    // appears -- and `pt.position` being NULL is exactly what marks it as one.
     let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(
         "SELECT t.id, t.source, t.title, t.artist, t.album, t.duration_secs, t.state, t.cover_key, t.in_library, t.remote_thumbnail_url
-         FROM playlist_tracks pt
-         JOIN tracks t ON t.id = pt.track_id",
+         FROM tracks t
+         LEFT JOIN playlist_tracks pt
+                ON pt.track_id = t.id AND pt.playlist_id = ",
     );
+    query.push_bind(playlist_id);
 
     if expression.is_some() {
         query.push(" JOIN tracks_fts ON tracks_fts.rowid = t.id");
@@ -226,7 +332,29 @@ pub async fn get_playlist(
         query.push(" JOIN track_tags tt ON tt.track_id = t.id");
     }
 
-    query.push(" WHERE pt.playlist_id = ").push_bind(playlist_id);
+    // `in_library` on the rule branch and not on the hand-added one, because
+    // they are different statements. A rule says "everything by this artist",
+    // and in this app the library *is* the keeping: a track auditioned once and
+    // not kept, or carried in by an imported playlist, was never claimed. Adding
+    // one by hand is claiming it, and outranks the rule.
+    //
+    // Without this the picker and the rule disagree -- it offers an artist with
+    // two tracks and the rule admits thirty-nine, which is the kind of surprise
+    // that stops anyone trusting a list they did not enumerate.
+    query
+        .push(" WHERE (pt.track_id IS NOT NULL OR (t.in_library = 1 AND ")
+        .push(ARTIST_KEY)
+        .push(" IN (SELECT artist_key FROM playlist_artist_rules WHERE playlist_id = ")
+        .push_bind(playlist_id)
+        .push(")))");
+
+    // Removal has to mean something on a list nobody enumerated: without this
+    // the rule would put back whatever the user took out, every time.
+    query
+        .push(" AND t.id NOT IN (SELECT track_id FROM playlist_excluded_tracks")
+        .push(" WHERE playlist_id = ")
+        .push_bind(playlist_id)
+        .push(")");
 
     if let Some(expression) = &expression {
         query.push(" AND tracks_fts MATCH ").push_bind(expression);
@@ -251,17 +379,17 @@ pub async fn get_playlist(
         }
     }
 
-    // Always playlist order. `added_at` breaks ties so it stays deterministic
-    // even if positions were ever to collide.
-    query.push(" ORDER BY pt.position, pt.added_at, t.id");
+    // Hand-placed tracks keep the order the user gave them; everything a rule
+    // brought in follows, oldest first. `pt.position IS NULL` sorts the two
+    // groups -- false before true -- which is what keeps a curated top half
+    // curated as the bottom half grows on its own.
+    query.push(" ORDER BY (pt.position IS NULL), pt.position, pt.added_at, t.date_added, t.id");
 
-    let tracks = query
+    query
         .build_query_as::<Track>()
-        .fetch_all(&db.pool)
+        .fetch_all(pool)
         .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(PlaylistDetail { playlist, tracks })
+        .map_err(|e| e.to_string())
 }
 
 /// Appends tracks, ignoring any already present.
@@ -291,6 +419,17 @@ pub async fn add_tracks_to_playlist(
     };
 
     for track_id in track_ids {
+        // Adding is the opposite decision to removing, so it retracts one.
+        // Without this, re-adding a track the user had taken out would insert
+        // a row that the exclusion then hides -- a button that appears to do
+        // nothing, which is the same trap the exclusion was invented to close.
+        sqlx::query("DELETE FROM playlist_excluded_tracks WHERE playlist_id = ? AND track_id = ?")
+            .bind(playlist_id)
+            .bind(track_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
         let inserted = sqlx::query(
             "INSERT INTO playlist_tracks (playlist_id, track_id, position)
              VALUES (?, ?, ?)
@@ -325,9 +464,28 @@ pub async fn remove_track_from_playlist(
 ) -> Result<(), String> {
     let mut tx = db.pool.begin().await.map_err(|e| e.to_string())?;
 
+    // Recorded whatever happens below. On a list nobody enumerated, deleting
+    // the row is not enough -- a rule would put the track straight back and
+    // the button would appear to do nothing. This is what makes "remove" mean
+    // "and stay out".
+    //
+    // Written even when no rule matches today, because one may be added
+    // tomorrow, and the user's decision about this track should outlive that.
+    sqlx::query(
+        "INSERT INTO playlist_excluded_tracks (playlist_id, track_id)
+         VALUES (?, ?) ON CONFLICT DO NOTHING",
+    )
+    .bind(playlist_id)
+    .bind(track_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| e.to_string())?;
+
     let Some(position) = position_of(&mut tx, playlist_id, track_id).await? else {
-        // Already gone: the goal is that it is absent, and it is.
-        return Ok(());
+        // No hand-placed row to remove. Either it was only ever here because a
+        // rule said so -- in which case the exclusion above is the whole job --
+        // or it was already gone, and the goal is that it is absent.
+        return tx.commit().await.map_err(|e| e.to_string());
     };
 
     sqlx::query("DELETE FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?")
@@ -404,19 +562,58 @@ pub async fn reorder_playlist_track(
 // --- helpers -----------------------------------------------------------
 
 async fn load_playlist(pool: &sqlx::SqlitePool, playlist_id: i64) -> Result<Playlist, String> {
-    sqlx::query_as(
-        "SELECT p.id, p.name, p.cover_key, p.created_at, p.source, p.source_url,
-                COUNT(pt.track_id) AS track_count
+    let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
+        "SELECT p.id, p.name, p.cover_key, p.created_at, p.source, p.source_url, {MEMBER_COUNT}
          FROM playlists p
-         LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
-         WHERE p.id = ?
-         GROUP BY p.id",
+         WHERE p.id = "
+    ));
+    query.push_bind(playlist_id);
+
+    let mut found: Vec<Playlist> = query
+        .build_query_as()
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    attach_rules(pool, &mut found).await?;
+
+    found
+        .pop()
+        .ok_or_else(|| "That playlist no longer exists.".to_string())
+}
+
+/// Fills in each playlist's rules.
+///
+/// One query for the whole list rather than one per playlist: the rules are
+/// what decide whether a row draws as an artist, so every list that shows a
+/// playlist needs them and none of them should pay per row for it.
+async fn attach_rules(
+    pool: &sqlx::SqlitePool,
+    playlists: &mut [Playlist],
+) -> Result<(), String> {
+    if playlists.is_empty() {
+        return Ok(());
+    }
+
+    let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT playlist_id, artist_key, label, avatar_url FROM playlist_artist_rules
+         ORDER BY added_at, artist_key",
     )
-    .bind(playlist_id)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "That playlist no longer exists.".to_string())
+    .map_err(|e| e.to_string())?;
+
+    for (playlist_id, artist_key, label, avatar_url) in rows {
+        if let Some(playlist) = playlists.iter_mut().find(|p| p.id == playlist_id) {
+            playlist.artist_rules.push(ArtistRule {
+                artist_key,
+                label,
+                avatar_url,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 async fn ensure_playlist_exists(
@@ -648,4 +845,178 @@ mod import_tests {
             assert_eq!(found, 1, "{table}.{column} is missing");
         }
     }
+}
+
+// --- artist rules ------------------------------------------------------
+
+/// Every artist present in the library, most tracks first.
+///
+/// Feeds both the chip picker and the browse list, because they are the same
+/// question asked from two places: *who is in here?* Only library tracks
+/// count -- an artist you auditioned once and did not keep is not someone you
+/// are collecting.
+///
+/// Tracks with no artist at all are excluded rather than gathered under an
+/// "Unknown" heading. They are 98% of a local library scanned from files with
+/// no tags, and a rule naming them would sweep the entire library into one
+/// playlist -- which is never what anybody meant.
+#[tauri::command]
+pub async fn list_library_artists(db: State<'_, Db>) -> Result<Vec<LibraryArtist>, String> {
+    let sql = format!(
+        "SELECT {ARTIST_KEY_BARE} AS artist_key,
+                MIN(COALESCE(NULLIF(trim(remote_uploader), ''), artist)) AS name,
+                COUNT(*) AS track_count,
+                MIN(NULLIF(source, 'local')) AS source
+         FROM tracks
+         WHERE in_library = 1
+           AND {ARTIST_KEY_BARE} IS NOT NULL
+           AND {ARTIST_KEY_BARE} <> ''
+         GROUP BY artist_key
+         ORDER BY track_count DESC, name"
+    );
+
+    let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(sql);
+    query
+        .build_query_as()
+        .fetch_all(&db.pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Makes `label` one of the names this playlist fills itself from.
+///
+/// Idempotent: naming the same artist twice is a no-op rather than an error,
+/// because the user's intent ("this artist counts") is already satisfied.
+#[tauri::command]
+pub async fn add_playlist_artist_rule(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    playlist_id: i64,
+    label: String,
+) -> Result<Playlist, String> {
+    let key = artist_key_of(&label);
+    if key.is_empty() {
+        return Err("That is not a name this can match on.".to_string());
+    }
+
+    sqlx::query(
+        "INSERT INTO playlist_artist_rules (playlist_id, artist_key, label)
+         VALUES (?, ?, ?)
+         ON CONFLICT(playlist_id, artist_key) DO UPDATE SET label = excluded.label",
+    )
+    .bind(playlist_id)
+    .bind(&key)
+    .bind(label.trim())
+    .execute(&db.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Adding a rule can readmit tracks the user removed while it was absent,
+    // which would be a surprise -- the exclusions were about *this* playlist,
+    // and it has just changed its mind about what belongs.
+    //
+    // Deliberately not cleared: an exclusion is a decision about one track,
+    // and a rule is a decision about a name. Neither overrules the other, and
+    // silently discarding the more specific one is the wrong way round.
+
+    // Spawned, not awaited: finding the picture is a provider round trip of
+    // several seconds, and naming an artist should take effect immediately.
+    // The playlist keeps its generated art until this lands.
+    find_avatar(app, db.pool.clone(), playlist_id, key, label);
+
+    load_playlist(&db.pool, playlist_id).await
+}
+
+/// Looks for the artist's own picture, and files it against the rule.
+///
+/// Best effort throughout, and silent when it fails: nothing the user asked
+/// for depends on the result. The worst case is a playlist that keeps the art
+/// generated from its name, which is what every other playlist has.
+///
+/// Found by asking the provider the same question the artist search asks --
+/// there is no stored artist anywhere in this app, only tracks, and a track's
+/// thumbnail is its own cover rather than the person who made it.
+fn find_avatar(
+    app: tauri::AppHandle,
+    pool: sqlx::SqlitePool,
+    playlist_id: i64,
+    artist_key: String,
+    label: String,
+) {
+    tauri::async_runtime::spawn(async move {
+        // Which provider to ask is decided by where the tracks came from. An
+        // artist known only from local files has none, and gets no picture.
+        let mut probe: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
+            "SELECT MIN(NULLIF(source, 'local')) FROM tracks
+             WHERE in_library = 1 AND {ARTIST_KEY_BARE} = "
+        ));
+        probe.push_bind(&artist_key);
+
+        let source: Option<String> = probe
+            .build_query_scalar()
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+
+        let Some(provider) = source
+            .as_deref()
+            .and_then(crate::providers::Provider::from_source)
+        else {
+            return;
+        };
+
+        let found = crate::collections::search_collections(
+            app,
+            provider,
+            crate::providers::SearchKind::Artist,
+            label.clone(),
+        )
+        .await;
+
+        // The first result, and only when its name is the one asked for. A
+        // near miss would put a stranger's face on the playlist, which is
+        // worse than no face at all.
+        let avatar = found.ok().and_then(|collections| {
+            collections.into_iter().find_map(|collection| {
+                (artist_key_of(&collection.title) == artist_key)
+                    .then_some(collection.thumbnail_url)
+                    .flatten()
+            })
+        });
+
+        let Some(avatar) = avatar else {
+            return;
+        };
+
+        let _ = sqlx::query(
+            "UPDATE playlist_artist_rules SET avatar_url = ?
+             WHERE playlist_id = ? AND artist_key = ?",
+        )
+        .bind(avatar)
+        .bind(playlist_id)
+        .bind(&artist_key)
+        .execute(&pool)
+        .await;
+    });
+}
+
+/// Stops this playlist filling itself from `artist_key`.
+///
+/// Tracks the rule brought in simply stop appearing. Anything the user added
+/// by hand stays, because that was a separate decision.
+#[tauri::command]
+pub async fn remove_playlist_artist_rule(
+    db: State<'_, Db>,
+    playlist_id: i64,
+    artist_key: String,
+) -> Result<Playlist, String> {
+    sqlx::query("DELETE FROM playlist_artist_rules WHERE playlist_id = ? AND artist_key = ?")
+        .bind(playlist_id)
+        .bind(artist_key_of(&artist_key))
+        .execute(&db.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    load_playlist(&db.pool, playlist_id).await
 }

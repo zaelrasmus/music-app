@@ -463,3 +463,219 @@ async fn tag_filtering_a_playlist_preserves_its_order() {
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// --- artist rules ------------------------------------------------------
+//
+// A playlist with a rule is not enumerated anywhere: membership is decided at
+// read time from the rule, the hand-added rows and the exclusions together.
+// These call the real resolver rather than re-typing its query, because a test
+// that re-types the query passes whatever the query becomes.
+
+async fn seed_remote(pool: &SqlitePool, uploader: &str, titles: &[&str]) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for title in titles {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO tracks (source, title, artist, remote_uploader, state, remote_id, remote_url)
+             VALUES ('youtube', ?, ?, ?, 'saved', ?, ?) RETURNING id",
+        )
+        .bind(title)
+        .bind(uploader)
+        .bind(uploader)
+        .bind(format!("id-{title}"))
+        .bind(format!("https://www.youtube.com/watch?v=id-{title}"))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    ids
+}
+
+async fn rule(pool: &SqlitePool, playlist: i64, label: &str) {
+    sqlx::query(
+        "INSERT INTO playlist_artist_rules (playlist_id, artist_key, label) VALUES (?, ?, ?)",
+    )
+    .bind(playlist)
+    .bind(label.trim().to_lowercase())
+    .bind(label)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn members(pool: &SqlitePool, playlist: i64) -> Vec<i64> {
+    music_app_lib::playlists::playlist_tracks(pool, playlist, None, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|track| track.id)
+        .collect()
+}
+
+/// The whole point: nobody put these tracks in, and they are in.
+#[tokio::test]
+async fn a_rule_admits_an_artists_tracks_without_anyone_adding_them() {
+    let (db, base) = fixture("rule-admits").await;
+    let mine = seed_remote(&db.pool, "ivycomb", &["Y2K", "Strays"]).await;
+    let theirs = seed_remote(&db.pool, "someone else", &["Unrelated"]).await;
+
+    let playlist = new_playlist(&db.pool).await;
+    rule(&db.pool, playlist, "ivycomb").await;
+
+    let held = members(&db.pool, playlist).await;
+    assert_eq!(held, mine, "the rule should hold exactly this artist's tracks");
+    assert!(!held.contains(&theirs[0]));
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// One artist, two names, because a SoundCloud handle and a YouTube channel
+/// are not obliged to match. This is the case that made rules necessary.
+#[tokio::test]
+async fn several_names_can_mean_one_artist() {
+    let (db, base) = fixture("rule-aliases").await;
+    let sc = seed_remote(&db.pool, "ivycomb", &["Y2K"]).await;
+    let yt = seed_remote(&db.pool, "Ivycomb Music", &["Vancouver"]).await;
+
+    let playlist = new_playlist(&db.pool).await;
+    rule(&db.pool, playlist, "ivycomb").await;
+    rule(&db.pool, playlist, "Ivycomb Music").await;
+
+    let held = members(&db.pool, playlist).await;
+    assert!(held.contains(&sc[0]) && held.contains(&yt[0]), "got {held:?}");
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Case is not identity. `IVYCOMB` and `ivycomb` are one artist.
+#[tokio::test]
+async fn matching_ignores_case_and_padding() {
+    let (db, base) = fixture("rule-case").await;
+    let ids = seed_remote(&db.pool, "IVYCOMB", &["Y2K"]).await;
+
+    let playlist = new_playlist(&db.pool).await;
+    rule(&db.pool, playlist, "  ivycomb  ").await;
+
+    assert_eq!(members(&db.pool, playlist).await, ids);
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The mirror-upload case: a track by this artist posted under someone else's
+/// channel. No rule can know, so the user says so by hand — and it has to sit
+/// alongside the rule's own matches rather than replacing them.
+#[tokio::test]
+async fn a_hand_added_track_joins_the_rules_matches() {
+    let (db, base) = fixture("rule-manual").await;
+    let matched = seed_remote(&db.pool, "Link\"0", &["Threshold"]).await;
+    let mirror = seed_remote(&db.pool, "some reupload channel", &["Ventors"]).await;
+
+    let playlist = new_playlist(&db.pool).await;
+    rule(&db.pool, playlist, "Link\"0").await;
+    add(&db.pool, playlist, &mirror).await;
+
+    let held = members(&db.pool, playlist).await;
+    assert!(held.contains(&matched[0]), "rule match missing: {held:?}");
+    assert!(held.contains(&mirror[0]), "hand-added missing: {held:?}");
+    assert_eq!(held.len(), 2);
+
+    // And the hand-placed one comes first: what the user arranged keeps its
+    // place while the rule's matches accumulate below it.
+    assert_eq!(held[0], mirror[0], "curated order lost: {held:?}");
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Removal has to mean something on a list nobody enumerated.
+///
+/// Without the exclusion the rule simply puts the track back, so "remove"
+/// becomes a button that does nothing — the user clicks it, the row returns,
+/// and there is no way to win.
+#[tokio::test]
+async fn an_excluded_track_stays_out_even_though_the_rule_matches_it() {
+    let (db, base) = fixture("rule-exclusion").await;
+    let ids = seed_remote(&db.pool, "ivycomb", &["Y2K", "Strays", "Free"]).await;
+
+    let playlist = new_playlist(&db.pool).await;
+    rule(&db.pool, playlist, "ivycomb").await;
+
+    sqlx::query("INSERT INTO playlist_excluded_tracks (playlist_id, track_id) VALUES (?, ?)")
+        .bind(playlist)
+        .bind(ids[1])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let held = members(&db.pool, playlist).await;
+    assert_eq!(held, vec![ids[0], ids[2]], "the excluded track came back");
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// An exclusion outranks a hand-added row too, so the two mechanisms cannot
+/// disagree about a track that is both.
+#[tokio::test]
+async fn an_exclusion_also_hides_a_hand_added_track() {
+    let (db, base) = fixture("rule-exclusion-manual").await;
+    let ids = seed_tracks(&db.pool, 2).await;
+
+    let playlist = new_playlist(&db.pool).await;
+    add(&db.pool, playlist, &ids).await;
+
+    sqlx::query("INSERT INTO playlist_excluded_tracks (playlist_id, track_id) VALUES (?, ?)")
+        .bind(playlist)
+        .bind(ids[0])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    assert_eq!(members(&db.pool, playlist).await, vec![ids[1]]);
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A rule collects what you kept, not everything that ever passed through.
+///
+/// `in_library` is this app's "I kept this" — a track auditioned once, or
+/// carried in by an imported playlist, was never claimed. Without this the
+/// picker offers an artist with two tracks and the rule admits thirty-nine,
+/// and a list nobody enumerated stops being trustworthy the first time it
+/// does that.
+#[tokio::test]
+async fn a_rule_collects_only_library_tracks() {
+    let (db, base) = fixture("rule-in-library").await;
+    let ids = seed_remote(&db.pool, "Link\"0", &["Threshold", "Ventors", "Ghin"]).await;
+
+    // Two auditioned and not kept, exactly as `save_remote_track` leaves them.
+    for id in &ids[1..] {
+        sqlx::query("UPDATE tracks SET in_library = 0 WHERE id = ?")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
+    let playlist = new_playlist(&db.pool).await;
+    rule(&db.pool, playlist, "Link\"0").await;
+
+    assert_eq!(
+        members(&db.pool, playlist).await,
+        vec![ids[0]],
+        "the rule took in tracks that were never kept",
+    );
+
+    // Adding one by hand is claiming it, and outranks the rule.
+    add(&db.pool, playlist, &[ids[2]]).await;
+    let held = members(&db.pool, playlist).await;
+    assert!(held.contains(&ids[2]), "a hand-added track must show: {held:?}");
+    assert!(!held.contains(&ids[1]), "the other stays out: {held:?}");
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
