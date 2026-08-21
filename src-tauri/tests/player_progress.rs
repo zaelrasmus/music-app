@@ -24,6 +24,10 @@ static NETWORK: LazyLock<tokio::sync::Mutex<()>> =
 #[derive(Default)]
 struct Captured {
     progress: Mutex<Vec<f64>>,
+    /// Background cache fills, as (track, title). `None` is the finish.
+    caching: Mutex<Vec<(i64, Option<String>)>>,
+    /// Progress again, but keeping which track each tick was about.
+    ticks: Mutex<Vec<(Option<i64>, f64)>>,
     states: Mutex<Vec<PlayerStatus>>,
     errors: Mutex<Vec<String>>,
     queues: Mutex<Vec<QueueState>>,
@@ -40,13 +44,20 @@ impl PlayerEvents for Recorder {
 
     fn progress(&self, progress: PlayerProgress) {
         self.0.progress.lock().unwrap().push(progress.position_secs);
+        self.0
+            .ticks
+            .lock()
+            .unwrap()
+            .push((progress.track_id, progress.position_secs));
     }
 
     fn error(&self, message: String) {
         self.0.errors.lock().unwrap().push(message);
     }
 
-    fn caching(&self, _track_id: i64, _title: Option<String>) {}
+    fn caching(&self, track_id: i64, title: Option<String>) {
+        self.0.caching.lock().unwrap().push((track_id, title));
+    }
 
     fn queue(&self, queue: QueueState) {
         self.0.queues.lock().unwrap().push(queue);
@@ -1493,4 +1504,217 @@ async fn a_play_is_recorded_only_once_it_has_been_listened_to() {
 
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Leaving a streamed track part-way through must announce the cache fill.
+///
+/// The announcement itself is cosmetic -- a grey line in the activity panel --
+/// but the path it runs on is not. It reads the row on a spawned task, and a
+/// column the statement did not select makes `Row::get` panic there. Release
+/// builds abort on panic, so that panic is not a lost background task: it is
+/// the whole application disappearing the moment the user presses Next.
+///
+/// Which is why this asserts on the *title*. Nothing else in the payload comes
+/// from a column that only this feature needs, and a column only one feature
+/// needs is the one that gets dropped.
+#[tokio::test]
+async fn leaving_a_streamed_track_part_way_announces_the_cache_fill() {
+    let _guard = NETWORK.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-abandoned-copy");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let wav = base.join("kept.wav");
+    // Long enough that half of it is comfortably clear of the load, which
+    // costs the better part of a second before the first sample is heard.
+    write_wav_secs(&wav, 6);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    // Inserted as `downloaded` so it plays from the file with no network, and
+    // so the schema accepts a `local_path` at all -- a `saved` row may not
+    // carry one. It is flipped to `saved` below, once it is playing, which is
+    // exactly what deleting a download while it plays does.
+    sqlx::query(
+        "INSERT INTO tracks \
+         (source, title, artist, duration_secs, state, local_path, \
+          remote_id, remote_url) \
+         VALUES ('youtube', 'Kept For Later', 'Someone', 6, 'downloaded', ?, \
+                 'abcdefghijk', 'https://www.youtube.com/watch?v=abcdefghijk')",
+    )
+    .bind(wav.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let track_id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    // The tool paths are never reached: the fetch they would run happens after
+    // the announcement, and fails immediately with nothing at these paths.
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        Some(base.join("no-such-ffmpeg.exe")),
+        Some(base.join("no-such-yt-dlp.exe")),
+        Some(music_app_lib::audio_cache::AudioCache::new(
+            base.join("cache"),
+        )),
+    );
+
+    handle
+        .send(PlayerCommand::SetKeepAbandoned(true))
+        .unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Past half of the six seconds the row claims, which is the threshold
+    // for a part-way listen being worth keeping.
+    tokio::time::sleep(Duration::from_millis(4000)).await;
+
+    if recorder
+        .0
+        .errors
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.contains("No audio output device"))
+    {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    sqlx::query("UPDATE tracks SET state = 'saved', local_path = NULL WHERE id = ?")
+        .bind(track_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    handle.send(PlayerCommand::Stop).unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let caching = recorder.0.caching.lock().unwrap().clone();
+    // Both printed: an empty list is either the announcement never happening
+    // or the listen never reaching the halfway mark, and only the positions
+    // tell the two apart.
+    eprintln!("caching:  {caching:?}");
+    eprintln!("progress: {:?}", recorder.0.progress.lock().unwrap());
+
+    assert!(
+        caching.contains(&(track_id, Some("Kept For Later".to_string()))),
+        "abandoning a streamed track past halfway should announce the fill \
+         with the track's title, got {caching:?}",
+    );
+}
+
+/// A track that is starting must say where it starts, before it gets there.
+///
+/// The bar shows the last position it was told about. Nothing tells it a track
+/// changed — the position and the track arrive as separate events — so until
+/// the new track produces a tick of its own, the bar goes on counting through
+/// the previous one. For a local file that is imperceptible. For a stream it
+/// is the several seconds yt-dlp spends resolving, which is exactly what "the
+/// song did not restart" means.
+///
+/// The second track here cannot load at all, which is what makes this an
+/// assertion rather than a race: the only tick it can ever produce is the one
+/// emitted when its load *begins*.
+#[tokio::test]
+async fn a_track_that_never_starts_still_resets_the_position() {
+    let _guard = NETWORK.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-position-reset");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let wav = base.join("plays.wav");
+    write_wav_secs(&wav, 6);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state) \
+         VALUES ('local', 'Plays', ?, 'present')",
+    )
+    .bind(wav.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // Present as far as the row is concerned, and not on disk. Resolving it
+    // fails the way a stream fails, without the network being involved.
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state) \
+         VALUES ('local', 'Will Not Load', ?, 'present')",
+    )
+    .bind(base.join("gone.wav").to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM tracks ORDER BY id")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    let (playable, broken) = (ids[0], ids[1]);
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![playable],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Far enough in that carrying this position over would be obvious.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    if recorder
+        .0
+        .errors
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.contains("No audio output device"))
+    {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    let before = recorder.0.ticks.lock().unwrap().clone();
+    assert!(
+        before.iter().any(|&(id, secs)| id == Some(playable) && secs > 1.0),
+        "the first track should have been playing for a while, got {before:?}",
+    );
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![broken],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    let ticks = recorder.0.ticks.lock().unwrap().clone();
+    eprintln!("ticks: {ticks:?}");
+
+    assert!(
+        ticks.contains(&(Some(broken), 0.0)),
+        "starting a track should announce its position, so the bar stops \
+         showing the previous track's, got {ticks:?}",
+    );
 }

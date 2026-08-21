@@ -99,6 +99,18 @@ class PlayerStore {
       // Leaving a track is when one most often becomes cached, so this is the
       // moment the badges elsewhere go stale.
       if (s.trackId !== previousTrack) {
+        // A position belongs to the track it was measured in. Carrying the
+        // old one over means the bar keeps counting where the last track got
+        // to -- for a stream, the several seconds until the new track's first
+        // tick arrives, which reads as "the song did not restart".
+        //
+        // Zero rather than the resume point: the backend sends that as a
+        // progress tick immediately after this, and it is the only thing that
+        // knows there is one.
+        this.positionSecs = 0;
+        // The handle cannot still be being dragged in a track that is no
+        // longer playing, and leaving the flag set would freeze the bar.
+        this.scrubbing = false;
         void cacheStore.refreshCached();
         // The track just left may have become a history entry; the backend
         // decides whether it counted, so ask rather than guess.

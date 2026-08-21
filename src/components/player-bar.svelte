@@ -22,16 +22,27 @@
     import WifiOffIcon from "@lucide/svelte/icons/wifi-off";
 
     /**
-     * The backend hydrates the queue payload itself, so it knows about a
-     * YouTube result saved seconds ago that the library list has not reloaded
-     * yet. `trackStore` is the fallback for the moment before the first queue
-     * event arrives.
+     * What is playing, described by whichever list can describe it.
+     *
+     * `player.trackId` is the identity and nothing else gets a vote. The two
+     * sources arrive as separate events — `player-state` carries the id,
+     * `player-queue` carries the details — so between them the queue still
+     * describes the *previous* track. Reading it unconditionally is what put
+     * the last song's title and artwork over the new song's audio.
+     *
+     * The queue payload is preferred where it agrees, because the backend
+     * hydrates it directly and so knows about a YouTube result saved seconds
+     * ago that the library list has not reloaded yet.
      */
-    const nowPlaying = $derived(
-        queueStore.current ??
-            trackStore.tracks.find((t) => t.id === player.trackId) ??
-            null,
-    );
+    const nowPlaying = $derived.by(() => {
+        const id = player.trackId;
+        if (id === null) return null;
+
+        const queued = queueStore.current;
+        if (queued?.trackId === id) return queued;
+
+        return trackStore.tracks.find((t) => t.id === id) ?? null;
+    });
 
     // Total comes from the scanned tag, not from rodio, whose total_duration
     // is None for several formats.

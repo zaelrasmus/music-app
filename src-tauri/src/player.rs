@@ -812,6 +812,13 @@ impl<E: PlayerEvents> Coordinator<E> {
         // stream is being fetched.
         self.state = PlaybackState::Loading;
         self.emit_state();
+        // Where this track is about to begin, said now rather than when the
+        // load returns. Resolving a stream takes seconds, and until this the
+        // only position anyone had was the *previous* track's -- so the bar
+        // spent those seconds counting on through a track that had already
+        // stopped. State first: a tick whose track the frontend does not yet
+        // know about is discarded.
+        self.emit_progress(start_at);
 
         let pool = self.pool.clone();
         let engine = Arc::clone(&self.engine);
@@ -1068,7 +1075,13 @@ impl<E: PlayerEvents> Coordinator<E> {
 
         tauri::async_runtime::spawn(async move {
             let Ok(Some(row)) = sqlx::query(
-                "SELECT source, state, remote_id, remote_url, duration_secs \
+                // `title` is listed only for the activity panel, which makes it
+                // the easy one to drop as unused -- and the loss is invisible
+                // until runtime: `Row::get` panics on a column the statement
+                // never selected. This runs on a spawned task in a build that
+                // aborts on panic, so that panic takes the whole app down the
+                // moment a track is left part-way through.
+                "SELECT source, state, title, remote_id, remote_url, duration_secs \
                  FROM tracks WHERE id = ?",
             )
             .bind(track_id)

@@ -5,6 +5,7 @@ import {
   observeElementRect,
   type VirtualItem,
 } from "@tanstack/svelte-virtual";
+import { untrack } from "svelte";
 
 export type { VirtualItem };
 
@@ -97,7 +98,11 @@ export function virtualRows(config: {
     if (!element) return;
 
     const virtualizer = new Virtualizer<HTMLElement, HTMLElement>({
-      count: config.count(),
+      // Untracked, or this effect depends on the row count and the teardown
+      // below runs on every list change -- discarding every measured height
+      // and resetting the scroll position, which is the exact outcome the
+      // second effect exists to avoid. The count is kept current there.
+      count: untrack(config.count),
       getScrollElement: () => element,
       estimateSize: (index) =>
         typeof config.estimateSize === "function"
