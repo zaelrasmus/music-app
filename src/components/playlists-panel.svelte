@@ -12,6 +12,11 @@
     import { ROW_HEIGHT } from "$lib/virtual.svelte";
     import CoverArt from "$components/cover-art.svelte";
     import { drawsAsArtist } from "$lib/playlists.svelte";
+    import { PLAYLIST_GRID_SORTS } from "$lib/playlists.svelte";
+    import ArrowUpNarrowWideIcon from "@lucide/svelte/icons/arrow-up-narrow-wide";
+    import ArrowDownWideNarrowIcon from "@lucide/svelte/icons/arrow-down-wide-narrow";
+    import SortControl from "$components/sort-control.svelte";
+    import { PLAYLIST_SORT_OPTIONS } from "$lib/sorting";
     import { playlistStore } from "$lib/playlists.svelte";
     import { downloads } from "$lib/downloads.svelte";
     import { player } from "$lib/player.svelte";
@@ -24,6 +29,7 @@
     import Trash2Icon from "@lucide/svelte/icons/trash-2";
     import PencilIcon from "@lucide/svelte/icons/pencil";
     import XIcon from "@lucide/svelte/icons/x";
+    import BookmarkPlusIcon from "@lucide/svelte/icons/bookmark-plus";
     import ChevronLeftIcon from "@lucide/svelte/icons/chevron-left";
     import ListMusicIcon from "@lucide/svelte/icons/list-music";
     import MoreHorizontalIcon from "@lucide/svelte/icons/more-horizontal";
@@ -63,7 +69,13 @@
      * shown. Filter the list and index 2 might be position 17, so a drop would
      * move the track somewhere the user did not point at.
      */
-    const reorderable = $derived(!playlistStore.filtering);
+    // Dragging belongs to the playlist's own order and nothing else. Under a
+    // filter or any other sort, a row's position on screen has stopped being
+    // its position in the playlist, so moving it there would mean something
+    // different from what it looks like.
+    const reorderable = $derived(
+        !playlistStore.filtering && !playlistStore.sorted,
+    );
 
     async function drop(toIndex: number) {
         const from = dragFrom;
@@ -144,6 +156,24 @@
         void playlistStore.loadArtists();
     });
 
+    /**
+     * Tracks here that are not in the library.
+     *
+     * An imported playlist is all of them: importing says "I want this list",
+     * not "I want fifty tracks in my library". They stay invisible to anything
+     * keyed on membership -- artist rules above all -- until they are claimed.
+     */
+    // Counted from the shown tracks, which is why the action is withheld while
+    // a filter is on: the command files the *whole* playlist, so a label read
+    // off a narrowed list would promise three and do thirty-seven. Reordering
+    // is withheld for the same reason a row's position stops meaning what it
+    // shows.
+    const unclaimed = $derived(
+        playlistStore.filtering
+            ? 0
+            : (detail?.tracks ?? []).filter((t) => t.inLibrary === false).length,
+    );
+
     /** Whether the "fills itself from" picker is open. */
     let pickingArtist = $state(false);
 
@@ -153,6 +183,15 @@
             (detail?.playlist.artistRules ?? []).map((r) => r.artistKey),
         );
         return playlistStore.artists.filter((a) => !already.has(a.artistKey));
+    });
+
+    /** What the flip will do next, in the words of the field it applies to. */
+    const gridDirectionLabel = $derived.by(() => {
+        const option = PLAYLIST_GRID_SORTS.find(
+            (o) => o.id === playlistStore.gridSort,
+        );
+        if (!option) return "Reverse order";
+        return playlistStore.gridDirection === "asc" ? option.asc : option.desc;
     });
 
     const kinds = [
@@ -198,6 +237,46 @@
                     oninput={(v) => (playlistStore.listQuery = v)}
                     onclear={() => (playlistStore.listQuery = "")}
                 />
+
+                <!--
+                  Recently played by default, because with seventy of them that
+                  is nearly always the one being looked for. Both orders start
+                  empty on every playlist that existed before them, so they say
+                  nothing useful until the app has been used for a while --
+                  creation date breaks the tie until then.
+                -->
+                <div class="flex shrink-0 items-center gap-1">
+                    <select
+                        class="bg-muted text-foreground rounded-full px-3 py-1 text-xs"
+                        aria-label="Order playlists by"
+                        value={playlistStore.gridSort}
+                        onchange={(e) =>
+                            playlistStore.setGridSort(
+                                e.currentTarget.value as (typeof PLAYLIST_GRID_SORTS)[number]["id"],
+                            )}
+                    >
+                        {#each PLAYLIST_GRID_SORTS as option (option.id)}
+                            <option value={option.id}>{option.label}</option>
+                        {/each}
+                    </select>
+
+                    <!-- Labelled by what it will do, not by "asc": "Z – A" is
+                         a thing you can want, "ascending" is a thing you have
+                         to translate. -->
+                    <button
+                        type="button"
+                        class="text-muted-foreground hover:bg-accent hover:text-foreground grid size-7 place-items-center rounded-full transition-colors"
+                        aria-label={gridDirectionLabel}
+                        title={gridDirectionLabel}
+                        onclick={() => playlistStore.toggleGridDirection()}
+                    >
+                        {#if playlistStore.gridDirection === "asc"}
+                            <ArrowUpNarrowWideIcon class="size-3.5" />
+                        {:else}
+                            <ArrowDownWideNarrowIcon class="size-3.5" />
+                        {/if}
+                    </button>
+                </div>
 
                 <div class="bg-muted flex shrink-0 items-center gap-0.5 rounded-full p-0.5">
                     {#each kinds as option (option.id)}
@@ -396,6 +475,24 @@
                                 <DownloadIcon />
                                 Download for offline
                             </DropdownMenu.Item>
+
+                            <!--
+                              Shown only when there is something to claim, and
+                              it says how many. A count in the label beats a
+                              confirmation dialog: the number is the whole
+                              question, and reading it costs nothing.
+                            -->
+                            {#if unclaimed > 0}
+                                <DropdownMenu.Item
+                                    onSelect={() =>
+                                        playlistStore.addAllToLibrary(
+                                            detail.playlist.id,
+                                        )}
+                                >
+                                    <BookmarkPlusIcon />
+                                    Add {unclaimed} to library
+                                </DropdownMenu.Item>
+                            {/if}
                             <DropdownMenu.Separator />
                             <DropdownMenu.Item
                                 onSelect={async () => {
@@ -411,13 +508,34 @@
                 {/snippet}
 
                 {#snippet toolbar()}
-                    <!-- Filters this playlist only; the library keeps its own. -->
-                    <SearchField
-                        class="max-w-md"
-                        value={playlistStore.query}
-                        placeholder="Filter this playlist…"
-                        oninput={(v) => playlistStore.setQuery(v)}
-                    />
+                    <!--
+                      One row, as in the library. The toolbar stacks whatever it
+                      is given, so controls that belong side by side have to say
+                      so -- otherwise the sort ends up below the search instead
+                      of beside it.
+                    -->
+                    <div class="flex flex-wrap items-center gap-2">
+                        <!-- Filters this playlist only; the library keeps its own. -->
+                        <SearchField
+                            class="min-w-[14rem] max-w-md flex-1"
+                            value={playlistStore.query}
+                            placeholder="Filter this playlist…"
+                            oninput={(v) => playlistStore.setQuery(v)}
+                        />
+
+                        <SortControl
+                            sort={playlistStore.sort}
+                            direction={playlistStore.direction}
+                            options={PLAYLIST_SORT_OPTIONS}
+                            onChange={(sortId, dir) =>
+                                playlistStore.setSort(sortId, dir)}
+                            onToggleDirection={() =>
+                                playlistStore.setSort(
+                                    playlistStore.sort,
+                                    playlistStore.direction === "asc" ? "desc" : "asc",
+                                )}
+                        />
+                    </div>
 
                     <TagFilter
                         selectedIds={playlistStore.selectedTagIds}
@@ -434,6 +552,12 @@
                             Play uses the filtered list. Reordering is off while
                             filtered, because a row's position here is not its
                             position in the playlist.
+                        </p>
+                    {:else if playlistStore.sorted}
+                        <p class="text-muted-foreground text-xs">
+                            Sorted view. Switch to Custom order to drag rows —
+                            this is a way of looking at the playlist, not the
+                            order it is stored in.
                         </p>
                     {/if}
 
@@ -558,7 +682,17 @@
                 {/if}
             </EmptyState>
         {:else}
-            <VirtualList rows={detail.tracks} estimateSize={ROW_HEIGHT}>
+            <!--
+              Keyed by track, not by position. These rows are dragged into
+              new positions -- that is the whole feature -- and identifying
+              them by the position they happen to occupy means the row you
+              picked up is not the row that lands.
+            -->
+            <VirtualList
+                rows={detail.tracks}
+                estimateSize={ROW_HEIGHT}
+                key={(track) => track.id}
+            >
                 {#snippet row(track, index)}
                     <TrackRow
                         {track}

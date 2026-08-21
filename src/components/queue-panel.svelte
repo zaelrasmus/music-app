@@ -4,6 +4,7 @@
     import VirtualList from "$components/virtual-list.svelte";
     import { player } from "$lib/player.svelte";
     import XIcon from "@lucide/svelte/icons/x";
+    import RepeatIcon from "@lucide/svelte/icons/repeat";
     import GripVerticalIcon from "@lucide/svelte/icons/grip-vertical";
     import ListMusicIcon from "@lucide/svelte/icons/list-music";
 
@@ -76,7 +77,7 @@
         built.push({
             kind: "heading",
             key: "h-queue",
-            text: "Queue",
+            text: player.loopQueue ? "Queue · on a loop" : "Queue",
             clearable: queueStore.manual.length > 0,
         });
 
@@ -179,14 +180,47 @@
                 <ListMusicIcon class="size-4" />
                 Up next
             </h2>
-            <button
-                type="button"
-                class="text-muted-foreground hover:bg-accent hover:text-foreground grid size-7 place-items-center rounded-md transition-colors"
-                aria-label="Close queue"
-                onclick={() => queueStore.toggle()}
-            >
-                <XIcon class="size-4" />
-            </button>
+            <div class="flex shrink-0 items-center gap-0.5">
+                <!--
+                  Loop the queue, not the playlist.
+
+                  Repeat lives on the player bar and acts on the context -- a
+                  whole album or library view. This acts on the handful of
+                  tracks picked out by hand, which is why it lives here, beside
+                  them, rather than as a fourth repeat mode meaning something
+                  different from the other three.
+
+                  Shown only when there is a queue to loop: an unlit control for
+                  an empty list is a question nobody asked.
+                -->
+                {#if queueStore.manual.length > 0}
+                    <button
+                        type="button"
+                        class="grid size-7 place-items-center rounded-md transition-colors {player.loopQueue
+                            ? 'text-primary bg-accent'
+                            : 'text-muted-foreground hover:bg-accent hover:text-foreground'}"
+                        aria-label={player.loopQueue
+                            ? "Stop looping the queue"
+                            : "Loop the queue"}
+                        title={player.loopQueue
+                            ? "Looping these tracks"
+                            : "Play these tracks on a loop"}
+                        aria-pressed={player.loopQueue}
+                        onclick={() => player.toggleLoopQueue()}
+                    >
+                        <RepeatIcon class="size-4" />
+                    </button>
+                {/if}
+
+                <button
+                    type="button"
+                    class="text-muted-foreground hover:bg-accent hover:text-foreground grid size-7 place-items-center rounded-md transition-colors"
+                    aria-label="Close queue"
+                    onclick={() => queueStore.toggle()}
+                >
+                    <XIcon class="size-4" />
+                </button>
+            </div>
         </header>
 
         <div
@@ -234,9 +268,18 @@
                                 ? 'bg-accent ring-primary/40 ring-1'
                                 : ''}"
                             draggable="true"
-                            ondragstart={() => (dragFrom = item.index ?? null)}
+                            ondragstart={(e) => {
+                                // A drag with no payload is refused by every
+                                // drop target. See `track-row.svelte`.
+                                e.dataTransfer?.setData("text/plain", "row");
+                                if (e.dataTransfer)
+                                    e.dataTransfer.effectAllowed = "move";
+                                dragFrom = item.index ?? null;
+                            }}
                             ondragover={(e) => {
                                 e.preventDefault();
+                                if (e.dataTransfer)
+                                    e.dataTransfer.dropEffect = "move";
                                 dragOver = item.index ?? null;
                             }}
                             ondragleave={() => {

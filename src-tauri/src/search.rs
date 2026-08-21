@@ -34,6 +34,17 @@ pub enum Sort {
     /// When the provider published it. Unknown for most YouTube tracks.
     DateUploaded,
     Duration,
+    /// When it was last listened to.
+    ///
+    /// Trustworthy because of where it is written: `record_play` only fires
+    /// after thirty seconds or a natural end, so this means *listened to*
+    /// rather than *skipped past while looking for something else*.
+    LastPlayed,
+    /// How many times it has been listened to, by the same measure.
+    PlayCount,
+    /// The order the user put them in. Playlists only, and the only sort
+    /// under which dragging a row means anything.
+    Custom,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -54,7 +65,7 @@ impl Sort {
     /// Unknown values sort last in *both* directions. A NULL upload date means
     /// "not published information", and letting it lead a descending sort would
     /// put the least-known tracks where the newest ones belong.
-    fn order_by(self, direction: Direction) -> &'static str {
+    pub(crate) fn order_by(self, direction: Direction) -> &'static str {
         let desc = direction == Direction::Desc;
         match self {
             // Handled by the caller, which knows whether a query is present.
@@ -79,6 +90,17 @@ impl Sort {
                 " ORDER BY t.duration_secs IS NULL, t.duration_secs DESC, t.title"
             }
             Sort::Duration => " ORDER BY t.duration_secs IS NULL, t.duration_secs ASC, t.title",
+            // Never played sorts last either way, for the same reason an
+            // unknown upload date does: "no information" is not "longest ago",
+            // and letting it lead would bury what was actually played.
+            Sort::LastPlayed if desc => " ORDER BY t.last_played IS NULL, t.last_played DESC, t.title",
+            Sort::LastPlayed => " ORDER BY t.last_played IS NULL, t.last_played ASC, t.title",
+            Sort::PlayCount if desc => " ORDER BY t.play_count DESC, t.title",
+            Sort::PlayCount => " ORDER BY t.play_count ASC, t.title",
+            // Meaningless outside a playlist, where the caller substitutes the
+            // stored order. Falling back to Auto keeps a stale persisted value
+            // from reaching the library as an empty ORDER BY.
+            Sort::Custom => "",
         }
     }
 }

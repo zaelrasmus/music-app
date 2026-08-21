@@ -3,7 +3,7 @@ use sqlx::{FromRow, QueryBuilder, Sqlite, SqliteConnection};
 use tauri::State;
 
 use crate::db::Db;
-use crate::search::{to_fts_expression, TagMode};
+use crate::search::{to_fts_expression, Direction, Sort, TagMode};
 use crate::tracks::Track;
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -78,6 +78,50 @@ pub struct AddOutcome {
     pub added: usize,
     /// Already present, so left alone.
     pub skipped: usize,
+}
+
+/// How the playlist grid is ordered.
+///
+/// A separate vocabulary from the track `Sort`, because the questions are not
+/// the same: a playlist has no artist, no duration and no upload date, and
+/// reusing an enum whose options mostly do not apply would put five dead
+/// entries in the menu to save one type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlaylistSort {
+    /// Which list you put on last. The default, because with seventy of them
+    /// that is nearly always the one being looked for.
+    #[default]
+    LastPlayed,
+    MostPlayed,
+    Name,
+    DateCreated,
+}
+
+impl PlaylistSort {
+    /// Unknowns sort last in *both* directions. "Never played" is not "longest
+    /// ago": letting it lead an ascending sort would fill the top of the grid
+    /// with the playlists there is least to say about. `created_at` breaks the
+    /// tie, which is the order the grid had before either of these existed.
+    fn order_by(self, direction: crate::search::Direction) -> &'static str {
+        let desc = direction == crate::search::Direction::Desc;
+        match self {
+            PlaylistSort::LastPlayed if desc => {
+                " ORDER BY p.last_played IS NULL, p.last_played DESC, p.created_at DESC, p.id DESC"
+            }
+            PlaylistSort::LastPlayed => {
+                " ORDER BY p.last_played IS NULL, p.last_played ASC, p.created_at ASC, p.id"
+            }
+            PlaylistSort::MostPlayed if desc => {
+                " ORDER BY p.play_count DESC, p.created_at DESC, p.id DESC"
+            }
+            PlaylistSort::MostPlayed => " ORDER BY p.play_count ASC, p.created_at ASC, p.id",
+            PlaylistSort::Name if desc => " ORDER BY p.name COLLATE NOCASE DESC, p.id",
+            PlaylistSort::Name => " ORDER BY p.name COLLATE NOCASE ASC, p.id",
+            PlaylistSort::DateCreated if desc => " ORDER BY p.created_at DESC, p.id DESC",
+            PlaylistSort::DateCreated => " ORDER BY p.created_at ASC, p.id",
+        }
+    }
 }
 
 /// How many tracks a playlist really holds, as SQL, correlated on `p.id`.
@@ -248,14 +292,21 @@ pub async fn delete_playlist(db: State<'_, Db>, playlist_id: i64) -> Result<(), 
 }
 
 #[tauri::command]
-pub async fn list_playlists(db: State<'_, Db>) -> Result<Vec<Playlist>, String> {
+pub async fn list_playlists(
+    db: State<'_, Db>,
+    sort: Option<PlaylistSort>,
+    direction: Option<crate::search::Direction>,
+) -> Result<Vec<Playlist>, String> {
     // `QueryBuilder` because the count is composed rather than literal, and
     // it owns its string -- `query_as` borrows one, which cannot outlive the
     // statement that built it.
+    let order = sort
+        .unwrap_or_default()
+        .order_by(direction.unwrap_or(crate::search::Direction::Desc));
+
     let mut query: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
         "SELECT p.id, p.name, p.cover_key, p.created_at, p.source, p.source_url, {MEMBER_COUNT}
-         FROM playlists p
-         ORDER BY p.created_at DESC, p.id DESC"
+         FROM playlists p{order}"
     ));
 
     let mut playlists: Vec<Playlist> = query
@@ -281,9 +332,12 @@ pub async fn get_playlist(
     search: Option<String>,
     tag_ids: Option<Vec<i64>>,
     mode: Option<TagMode>,
+    sort: Option<Sort>,
+    direction: Option<Direction>,
 ) -> Result<PlaylistDetail, String> {
     let playlist = load_playlist(&db.pool, playlist_id).await?;
-    let tracks = playlist_tracks(&db.pool, playlist_id, search, tag_ids, mode).await?;
+    let tracks =
+        playlist_tracks(&db.pool, playlist_id, search, tag_ids, mode, sort, direction).await?;
     Ok(PlaylistDetail { playlist, tracks })
 }
 
@@ -299,6 +353,8 @@ pub async fn playlist_tracks(
     search: Option<String>,
     tag_ids: Option<Vec<i64>>,
     mode: Option<TagMode>,
+    sort: Option<Sort>,
+    direction: Option<Direction>,
 ) -> Result<Vec<Track>, String> {
 
     let tag_ids = tag_ids.unwrap_or_default();
@@ -379,11 +435,25 @@ pub async fn playlist_tracks(
         }
     }
 
-    // Hand-placed tracks keep the order the user gave them; everything a rule
-    // brought in follows, oldest first. `pt.position IS NULL` sorts the two
-    // groups -- false before true -- which is what keeps a curated top half
-    // curated as the bottom half grows on its own.
-    query.push(" ORDER BY (pt.position IS NULL), pt.position, pt.added_at, t.date_added, t.id");
+    // Custom is the playlist's own order and the default: hand-placed tracks
+    // keep the order the user gave them, and everything a rule brought in
+    // follows, oldest first. `pt.position IS NULL` sorts the two groups --
+    // false before true -- which is what keeps a curated top half curated as
+    // the bottom half grows on its own.
+    //
+    // Any other sort is a *view*. It never writes anything, and the caller
+    // turns dragging off while one is active, because a row's position on
+    // screen has stopped being its position in the playlist.
+    match sort.unwrap_or(Sort::Custom) {
+        Sort::Custom | Sort::Auto => {
+            query.push(
+                " ORDER BY (pt.position IS NULL), pt.position, pt.added_at, t.date_added, t.id",
+            );
+        }
+        chosen => {
+            query.push(chosen.order_by(direction.unwrap_or_default()));
+        }
+    }
 
     query
         .build_query_as::<Track>()
@@ -518,6 +588,20 @@ pub async fn reorder_playlist_track(
     track_id: i64,
     new_position: i64,
 ) -> Result<(), String> {
+    // Taking hold of the order is what fixes it.
+    //
+    // A rule's matches have no position -- they are not rows in
+    // `playlist_tracks` at all -- so there is nothing to drag them between. The
+    // first drag in such a playlist therefore writes down the order currently on
+    // screen, and from then on this is an ordinary hand-ordered playlist that
+    // the rule still adds to, at the end.
+    //
+    // The alternative was to give the dragged track a position and leave its
+    // neighbours without one, which sorts hand-placed tracks above rule matches
+    // -- so dragging a row *downwards* would fling it to the top. Freezing the
+    // whole order is the only version where the row lands where it was dropped.
+    materialise_order(&db.pool, playlist_id).await?;
+
     let mut tx = db.pool.begin().await.map_err(|e| e.to_string())?;
 
     let Some(old_position) = position_of(&mut tx, playlist_id, track_id).await? else {
@@ -614,6 +698,51 @@ async fn attach_rules(
     }
 
     Ok(())
+}
+
+/// Writes down the order a playlist is currently showing.
+///
+/// A no-op for a playlist without rules, where every member already has a
+/// position. For one with rules it turns the resolved order into real rows, so
+/// that dragging has something to move.
+///
+/// Idempotent, and safe to call before any reorder: it only ever fills gaps,
+/// never renumbers a track the user already placed.
+async fn materialise_order(pool: &sqlx::SqlitePool, playlist_id: i64) -> Result<(), String> {
+    // The order as shown, which is the order being taken hold of.
+    let shown = playlist_tracks(pool, playlist_id, None, None, None, None, None).await?;
+
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+    let placed: Vec<i64> =
+        sqlx::query_scalar("SELECT track_id FROM playlist_tracks WHERE playlist_id = ?")
+            .bind(playlist_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+    if placed.len() == shown.len() {
+        // Every member is already a row; nothing to write down.
+        return Ok(());
+    }
+
+    // Renumbered from the shown order, so positions stay dense and a UI
+    // ordinal keeps matching a stored one.
+    for (position, track) in shown.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (playlist_id, track_id) DO UPDATE SET position = ?3",
+        )
+        .bind(playlist_id)
+        .bind(track.id)
+        .bind(position as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
+    tx.commit().await.map_err(|e| e.to_string())
 }
 
 async fn ensure_playlist_exists(
@@ -1019,4 +1148,78 @@ pub async fn remove_playlist_artist_rule(
         .map_err(|e| e.to_string())?;
 
     load_playlist(&db.pool, playlist_id).await
+}
+
+/// Files every track in a playlist in the library.
+///
+/// The gesture an imported playlist needs. Importing deliberately does not add
+/// its tracks to the library -- "I want this list here" is not "I want fifty
+/// tracks in my library" -- but that leaves them invisible to anything keyed on
+/// library membership, artist rules above all. This is the one action that says
+/// *actually, I want all of these*, without making the import mean something it
+/// did not.
+///
+/// Returns how many were newly filed. Tracks already in the library are left
+/// alone rather than counted, so the number is what changed.
+///
+/// Only `playlist_tracks` rows can be affected: a rule already requires library
+/// membership, so anything it admitted is filed by definition.
+#[tauri::command]
+pub async fn add_playlist_to_library(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    covers: State<'_, crate::covers::CoverStore>,
+    playlist_id: i64,
+) -> Result<usize, String> {
+    let filed: Vec<i64> = sqlx::query_scalar(
+        "UPDATE tracks SET in_library = 1
+         WHERE in_library = 0
+           AND id IN (SELECT track_id FROM playlist_tracks WHERE playlist_id = ?)
+         RETURNING id",
+    )
+    .bind(playlist_id)
+    .fetch_all(&db.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if filed.is_empty() {
+        return Ok(0);
+    }
+
+    let count = filed.len();
+
+    // Artwork is bought when a track is kept, and this keeps a great many at
+    // once. One task walking the list rather than one task per track: each
+    // fetch is an ffmpeg process, and fifty of those starting together would
+    // stall the machine to decorate a list nobody is looking at yet.
+    let pool = db.pool.clone();
+    let covers = covers.inner().clone();
+    tauri::async_runtime::spawn(async move {
+        for track_id in filed {
+            crate::covers::ensure_for_track(app.clone(), pool.clone(), covers.clone(), track_id)
+                .await;
+        }
+    });
+
+    Ok(count)
+}
+
+/// Notes that a playlist was played.
+///
+/// Counts plays of the *playlist*, not of the tracks in it. A track played from
+/// the library that happens to sit here does not count: "which list did I put on
+/// last" is the question, and answering it from track history would push a
+/// playlist nobody opened to the top of the grid.
+#[tauri::command]
+pub async fn mark_playlist_played(db: State<'_, Db>, playlist_id: i64) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE playlists SET last_played = unixepoch(), play_count = play_count + 1
+         WHERE id = ?",
+    )
+    .bind(playlist_id)
+    .execute(&db.pool)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
 }

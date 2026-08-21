@@ -273,6 +273,16 @@ pub struct PlayerQueue {
     history: VecDeque<HistoryEntry>,
     /// Monotonic, never reused, so a stale id from the UI matches nothing.
     next_entry_id: u64,
+    /// Whether the manual queue recycles instead of draining.
+    ///
+    /// The queue is normally *consumed* -- an entry plays once and is gone,
+    /// which is what makes "play this next" mean next and not forever. Turning
+    /// this on says something different: these few tracks, round and round.
+    ///
+    /// Separate from repeat, which acts on the context. Repeat-all replays a
+    /// playlist; this replays the handful you picked out of one, and the two
+    /// are different intentions that happen to share a word.
+    loop_manual: bool,
 }
 
 impl PlayerQueue {
@@ -288,6 +298,19 @@ impl PlayerQueue {
 
     pub fn manual_len(&self) -> usize {
         self.manual.len()
+    }
+
+    pub fn loops_manual(&self) -> bool {
+        self.loop_manual
+    }
+
+    /// Turns recycling on or off.
+    ///
+    /// Takes effect from the next track: whatever is playing keeps playing,
+    /// because the alternative is a button that interrupts the music to prove
+    /// it was pressed.
+    pub fn set_loop_manual(&mut self, on: bool) {
+        self.loop_manual = on;
     }
 
     pub fn context_upcoming(&self, limit: usize) -> Vec<i64> {
@@ -490,7 +513,16 @@ impl PlayerQueue {
             .position(|entry| entry.entry_id == entry_id)?;
 
         self.push_history();
-        self.manual.drain(..index);
+
+        if self.loop_manual {
+            // Rotate rather than drop. Skipping ahead inside a loop is
+            // choosing where to start, not choosing to lose the ones before
+            // it -- they come round again, which is the entire point.
+            self.manual.rotate_left(index);
+        } else {
+            self.manual.drain(..index);
+        }
+
         self.take_from_manual()
     }
 
@@ -559,6 +591,14 @@ impl PlayerQueue {
 
     fn take_from_manual(&mut self) -> Option<i64> {
         let entry = self.manual.pop_front()?;
+
+        // Back to the end rather than gone. The entry keeps its id, so a row
+        // the user is looking at stays the same row after it has played --
+        // which is what lets them remove or reorder one mid-loop.
+        if self.loop_manual {
+            self.manual.push_back(entry);
+        }
+
         self.current = Some(Playing {
             track_id: entry.track_id,
             origin: Origin::Manual,
@@ -601,6 +641,91 @@ mod tests {
     }
 
     // --- context behaviour (unchanged by the split) ---------------------
+
+    /// Four tracks picked by hand, round and round.
+    #[test]
+    fn a_looping_queue_never_runs_out() {
+        let mut q = PlayerQueue::default();
+        q.set_loop_manual(true);
+        for id in [101, 102, 103, 104] {
+            q.enqueue_last(id);
+        }
+
+        let heard: Vec<Option<i64>> = (0..9).map(|_| q.on_next()).collect();
+
+        assert_eq!(
+            heard,
+            vec![
+                Some(101), Some(102), Some(103), Some(104),
+                Some(101), Some(102), Some(103), Some(104),
+                Some(101),
+            ],
+            "the four should come round in order, forever",
+        );
+        assert_eq!(q.manual_len(), 4, "and none of them consumed");
+    }
+
+    /// Off by default: the queue is normally consumed, and "play this next"
+    /// has to keep meaning next rather than forever.
+    #[test]
+    fn a_queue_is_consumed_unless_asked_otherwise() {
+        let mut q = PlayerQueue::default();
+        q.enqueue_last(101);
+        q.enqueue_last(102);
+
+        assert_eq!(q.on_next(), Some(101));
+        assert_eq!(q.on_next(), Some(102));
+        assert_eq!(q.on_next(), None);
+        assert_eq!(q.manual_len(), 0);
+    }
+
+    /// Skipping ahead inside a loop chooses where to start, not what to lose.
+    #[test]
+    fn jumping_inside_a_loop_keeps_the_ones_it_passed() {
+        let mut q = PlayerQueue::default();
+        q.set_loop_manual(true);
+
+        let ids: Vec<u64> = [101, 102, 103, 104]
+            .into_iter()
+            .map(|id| q.enqueue_last(id))
+            .collect();
+
+        assert_eq!(q.jump_to_manual(ids[2]), Some(103));
+        assert_eq!(q.manual_len(), 4, "nothing should have been dropped");
+
+        // And it carries on round from there.
+        assert_eq!(q.on_next(), Some(104));
+        assert_eq!(q.on_next(), Some(101));
+    }
+
+    /// Without the loop, the same gesture means "not those".
+    #[test]
+    fn jumping_without_a_loop_still_drops_what_it_passed() {
+        let mut q = PlayerQueue::default();
+        let ids: Vec<u64> = [101, 102, 103, 104]
+            .into_iter()
+            .map(|id| q.enqueue_last(id))
+            .collect();
+
+        assert_eq!(q.jump_to_manual(ids[2]), Some(103));
+        assert_eq!(q.manual_len(), 1, "101 and 102 were skipped, not queued");
+        assert_eq!(q.on_next(), Some(104));
+    }
+
+    /// Turning it on mid-listen does not disturb what is playing.
+    #[test]
+    fn a_track_already_playing_is_left_alone() {
+        let mut q = PlayerQueue::default();
+        q.enqueue_last(101);
+        q.enqueue_last(102);
+
+        assert_eq!(q.on_next(), Some(101));
+        q.set_loop_manual(true);
+
+        assert_eq!(q.current(), Some(101), "the button must not skip a track");
+        assert_eq!(q.on_next(), Some(102));
+        assert_eq!(q.on_next(), Some(102), "and 101 is gone, having played");
+    }
 
     #[test]
     fn repeat_off_stops_at_the_end() {

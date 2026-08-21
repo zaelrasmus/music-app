@@ -2,6 +2,7 @@
     import * as DropdownMenu from "$components/ui/dropdown-menu";
     import {
         SORT_OPTIONS,
+        type SortOption,
         sortLabel,
         type Direction,
         type Sort,
@@ -16,6 +17,15 @@
         direction: Direction;
         /** Changes what "Default" means, so the label has to know. */
         searching?: boolean;
+        /**
+         * Which vocabulary to offer.
+         *
+         * A playlist has one option the library does not -- the order the user
+         * put them in -- and no use for "Default", which means relevance while
+         * searching. Passing the list rather than a flag keeps the component
+         * ignorant of where it is being used.
+         */
+        options?: SortOption[];
         onChange: (sort: Sort, direction: Direction) => void;
         onToggleDirection: () => void;
     }
@@ -24,6 +34,7 @@
         sort,
         direction,
         searching = false,
+        options = SORT_OPTIONS,
         onChange,
         onToggleDirection,
     }: Props = $props();
@@ -37,9 +48,12 @@
      * correct direction — so the flip is hidden rather than shown doing
      * nothing.
      */
-    const directional = $derived(sort !== "auto");
+    // "Default" means relevance, and "Custom order" means the order the user
+    // arranged -- neither has a forwards and backwards, so offering a flip on
+    // them shows a control that does nothing when pressed.
+    const directional = $derived(sort !== "auto" && sort !== "custom");
 
-    const current = $derived(SORT_OPTIONS.find((o) => o.id === sort));
+    const current = $derived(options.find((o) => o.id === sort));
 </script>
 
 <div class="flex items-center gap-1">
@@ -61,7 +75,7 @@
         </DropdownMenu.Trigger>
 
         <DropdownMenu.Content align="end" class="w-60">
-            {#each SORT_OPTIONS as option (option.id)}
+            {#each options as option (option.id)}
                 {@const selected = sort === option.id}
                 <DropdownMenu.Item
                     title={option.hint}

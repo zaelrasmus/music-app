@@ -71,8 +71,17 @@ const PREVIEW_LIMIT: usize = 50;
 /// `set_volume` multiplies raw samples, but loudness is perceived roughly
 /// logarithmically -- a linear slider puts almost all audible change in the
 /// bottom fifth. Mapping through decibels is what makes the slider feel even.
-/// At the midpoint this gives -20 dB, about 10% amplitude.
-const MIN_DB: f32 = -40.0;
+///
+/// Sixty rather than forty, because forty put the whole usable range in the
+/// bottom of the travel. Measured against this library: every file peaks at
+/// 0.0 dBFS -- modern masters are brick-walled -- so a comfortable listening
+/// level lands around -35 dB, which was slider 0.13. Everything above it was
+/// unreachably loud and there was no room to adjust. The same level now sits
+/// near the middle, with real travel either side of it.
+///
+/// The top stays unity. A player that quietly attenuates at maximum has no
+/// answer left for a track that was mastered quietly.
+const MIN_DB: f32 = -60.0;
 
 /// How far into a track it must have been left for the position to survive a
 /// restart.
@@ -156,6 +165,8 @@ pub struct PlayerStatus {
     /// Enough for a badge on the queue button without subscribing to the
     /// heavier queue event.
     pub manual_length: usize,
+    /// Whether the queue recycles instead of draining.
+    pub loop_queue: bool,
     /// The stream has run dry without ending -- the connection has stopped
     /// keeping up. Distinct from loading, which is a track that has not
     /// started yet.
@@ -249,6 +260,8 @@ pub enum PlayerCommand {
     SetMuted(bool),
     SetRepeat(RepeatMode),
     SetShuffle(bool),
+    /// Play the queued tracks round and round instead of consuming them.
+    SetLoopQueue(bool),
     SetKeepAbandoned(bool),
     Seek(f64),
 }
@@ -613,6 +626,8 @@ impl<E: PlayerEvents> Coordinator<E> {
             // Both change the preview, so both re-emit the queue.
             PlayerCommand::SetRepeat(mode) => self.queue.set_repeat(mode),
             PlayerCommand::SetShuffle(on) => self.queue.set_shuffle(on),
+
+            PlayerCommand::SetLoopQueue(on) => self.queue.set_loop_manual(on),
 
             PlayerCommand::SetKeepAbandoned(enabled) => self.keep_abandoned = enabled,
 
@@ -1298,6 +1313,7 @@ impl<E: PlayerEvents> Coordinator<E> {
             context_length: self.queue.context_len(),
             context_position: self.queue.context_position(),
             manual_length: self.queue.manual_len(),
+            loop_queue: self.queue.loops_manual(),
             stalled: self.stalled,
         });
     }
@@ -1781,6 +1797,17 @@ pub async fn set_repeat(mode: RepeatMode, player: State<'_, PlayerHandle>) -> Re
     player.send(PlayerCommand::SetRepeat(mode))
 }
 
+/// Plays the queued tracks round and round instead of consuming them.
+///
+/// Deliberately separate from repeat. Repeat acts on the context -- a whole
+/// playlist or library view -- while this acts on the handful of tracks the
+/// user picked out by hand. "Play these four forever" and "play this album
+/// again" are different requests that share a word.
+#[tauri::command]
+pub async fn set_loop_queue(on: bool, player: State<'_, PlayerHandle>) -> Result<(), String> {
+    player.send(PlayerCommand::SetLoopQueue(on))
+}
+
 #[tauri::command]
 pub async fn set_shuffle(shuffle: bool, player: State<'_, PlayerHandle>) -> Result<(), String> {
     player.send(PlayerCommand::SetShuffle(shuffle))
@@ -1873,7 +1900,26 @@ mod tests {
         let half = slider_to_linear(0.5, false);
         // A linear mapping would give 0.5 here, which sounds barely quieter.
         assert!(half < 0.2, "midpoint should be well below half amplitude");
-        assert!(half > 0.05, "but still clearly audible");
+        assert!(half > 0.01, "but still clearly audible");
+    }
+
+    /// The reason the range was widened: a comfortable level has to be
+    /// somewhere you can adjust, not pinned against the bottom stop.
+    #[test]
+    fn a_comfortable_level_sits_in_the_middle_of_the_travel() {
+        // Measured on this library: files peak at 0.0 dBFS, and about -35 dB
+        // of attenuation is a normal listening level for them.
+        let comfortable = rodio::math::db_to_linear(-35.0);
+
+        let mut slider = 0.0f32;
+        while slider < 1.0 && slider_to_linear(slider, false) < comfortable {
+            slider += 0.01;
+        }
+
+        assert!(
+            (0.3..=0.7).contains(&slider),
+            "a normal level should land mid-slider, not at {slider}",
+        );
     }
 
     #[test]

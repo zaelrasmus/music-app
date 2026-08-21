@@ -250,7 +250,11 @@
           is why the query behind it no longer stops at five hundred rows.
         -->
         <div class:opacity-60={libraryView.loading}>
-            <VirtualList rows={libraryView.results} estimateSize={ROW_HEIGHT}>
+            <VirtualList
+                rows={libraryView.results}
+                estimateSize={ROW_HEIGHT}
+                key={(track) => track.id}
+            >
                 {#snippet row(track, index)}
                     <TrackRow {track} queueIds={flatIds} {index} />
                 {/snippet}

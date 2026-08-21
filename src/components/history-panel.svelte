@@ -80,7 +80,11 @@
             hint="Play something for half a minute, or to the end, and it will show up."
         />
     {:else}
-        <VirtualList rows={historyStore.tracks} estimateSize={ROW_HEIGHT}>
+        <VirtualList
+            rows={historyStore.tracks}
+            estimateSize={ROW_HEIGHT}
+            key={(track) => track.id}
+        >
             {#snippet row(track, index)}
                 <TrackRow
                     {track}

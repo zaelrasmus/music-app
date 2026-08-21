@@ -23,6 +23,8 @@ export type PlayerStatus = {
   contextLength: number;
   contextPosition: number;
   manualLength: number;
+  /** Whether the queue recycles instead of draining. */
+  loopQueue: boolean;
   /** The stream has run dry without ending: the connection is not keeping up. */
   stalled: boolean;
 };
@@ -53,6 +55,7 @@ class PlayerStore {
   contextLength = $state(0);
   contextPosition = $state(0);
   manualLength = $state(0);
+  loopQueue = $state(false);
   stalled = $state(false);
 
   /** Authoritative position from the backend, in seconds. */
@@ -94,6 +97,7 @@ class PlayerStore {
       this.contextLength = s.contextLength;
       this.contextPosition = s.contextPosition;
       this.manualLength = s.manualLength;
+      this.loopQueue = s.loopQueue;
       this.stalled = s.stalled;
 
       // Leaving a track is when one most often becomes cached, so this is the
@@ -288,6 +292,17 @@ class PlayerStore {
     const shuffle = !this.shuffle;
     await this.run("set_shuffle", { shuffle });
     await writeSetting("shuffle", shuffle);
+  }
+
+  /**
+   * Plays the queued tracks round and round instead of consuming them.
+   *
+   * Deliberately not persisted. Repeat and shuffle are standing preferences;
+   * this is about the handful of tracks in the queue right now, and having it
+   * survive a restart that empties the queue would be a setting about nothing.
+   */
+  async toggleLoopQueue() {
+    await this.run("set_loop_queue", { on: !this.loopQueue });
   }
 
   /** Called continuously while dragging — updates the handle, does not seek. */

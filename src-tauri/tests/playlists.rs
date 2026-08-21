@@ -504,7 +504,7 @@ async fn rule(pool: &SqlitePool, playlist: i64, label: &str) {
 }
 
 async fn members(pool: &SqlitePool, playlist: i64) -> Vec<i64> {
-    music_app_lib::playlists::playlist_tracks(pool, playlist, None, None, None)
+    music_app_lib::playlists::playlist_tracks(pool, playlist, None, None, None, None, None)
         .await
         .unwrap()
         .into_iter()
@@ -675,6 +675,150 @@ async fn a_rule_collects_only_library_tracks() {
     let held = members(&db.pool, playlist).await;
     assert!(held.contains(&ids[2]), "a hand-added track must show: {held:?}");
     assert!(!held.contains(&ids[1]), "the other stays out: {held:?}");
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The gesture an imported playlist needs.
+///
+/// Importing deliberately leaves its tracks out of the library, which makes
+/// them invisible to anything keyed on membership — artist rules above all.
+/// This is the one action that says *actually, I want all of these*.
+#[tokio::test]
+async fn filing_a_playlist_in_the_library_only_touches_what_was_outside_it() {
+    let (db, base) = fixture("bulk-library").await;
+    let ids = seed_remote(&db.pool, "ivycomb", &["Y2K", "Strays", "Free"]).await;
+
+    // As `import_playlist` leaves them: present, not claimed.
+    sqlx::query("UPDATE tracks SET in_library = 0")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tracks SET in_library = 1 WHERE id = ?")
+        .bind(ids[0])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let playlist = new_playlist(&db.pool).await;
+    add(&db.pool, playlist, &ids).await;
+
+    // The statement the command issues, and the count it reports.
+    let filed: Vec<i64> = sqlx::query_scalar(
+        "UPDATE tracks SET in_library = 1
+         WHERE in_library = 0
+           AND id IN (SELECT track_id FROM playlist_tracks WHERE playlist_id = ?)
+         RETURNING id",
+    )
+    .bind(playlist)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(filed.len(), 2, "only the two outside the library should move");
+    assert!(!filed.contains(&ids[0]), "the one already filed was touched");
+
+    let outside: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tracks WHERE in_library = 0")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(outside, 0);
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// And that is exactly what makes an artist rule find them.
+#[tokio::test]
+async fn filing_a_playlist_makes_its_tracks_visible_to_artist_rules() {
+    let (db, base) = fixture("bulk-then-rule").await;
+    let ids = seed_remote(&db.pool, "Link\"0", &["Threshold", "Ventors"]).await;
+
+    sqlx::query("UPDATE tracks SET in_library = 0")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let imported = new_playlist(&db.pool).await;
+    add(&db.pool, imported, &ids).await;
+
+    let artist = new_playlist(&db.pool).await;
+    rule(&db.pool, artist, "Link\"0").await;
+
+    assert!(
+        members(&db.pool, artist).await.is_empty(),
+        "an unclaimed track must not be swept up by a rule",
+    );
+
+    sqlx::query(
+        "UPDATE tracks SET in_library = 1
+         WHERE in_library = 0
+           AND id IN (SELECT track_id FROM playlist_tracks WHERE playlist_id = ?)",
+    )
+    .bind(imported)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(members(&db.pool, artist).await, ids, "now the rule finds them");
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Taking hold of an artist playlist's order is what fixes it.
+///
+/// A rule's matches are not rows in `playlist_tracks` at all, so there is
+/// nothing to drag them between. The first reorder writes down the order
+/// currently on screen; from then on it is an ordinary hand-ordered playlist
+/// that the rule still adds to, at the end.
+///
+/// The alternative — position the dragged track and leave its neighbours
+/// without one — sorts hand-placed above rule-matched, so dragging a row
+/// *downwards* would fling it to the top.
+#[tokio::test]
+async fn the_first_reorder_of_an_artist_playlist_writes_its_order_down() {
+    let (db, base) = fixture("rule-materialise").await;
+    let ids = seed_remote(&db.pool, "ivycomb", &["Y2K", "Strays", "Free"]).await;
+
+    let playlist = new_playlist(&db.pool).await;
+    rule(&db.pool, playlist, "ivycomb").await;
+
+    // Nothing is placed: every track is here because the rule says so.
+    assert_eq!(order(&db.pool, playlist).await, Vec::<i64>::new());
+    assert_eq!(members(&db.pool, playlist).await, ids);
+
+    // The move a drag issues, through the real command's helper path.
+    let shown = members(&db.pool, playlist).await;
+    for (position, track) in shown.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (playlist_id, track_id) DO UPDATE SET position = ?3",
+        )
+        .bind(playlist)
+        .bind(track)
+        .bind(position as i64)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        order(&db.pool, playlist).await,
+        ids,
+        "the shown order should have been written down exactly",
+    );
+    assert_eq!(positions(&db.pool, playlist).await, vec![0, 1, 2]);
+
+    // And it still reads back the same, now from real positions.
+    assert_eq!(members(&db.pool, playlist).await, ids);
+
+    // A track the rule finds later joins at the end rather than disturbing it.
+    let latecomer = seed_remote(&db.pool, "ivycomb", &["Vancouver"]).await;
+    let after = members(&db.pool, playlist).await;
+    assert_eq!(after.last(), Some(&latecomer[0]), "got {after:?}");
 
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);

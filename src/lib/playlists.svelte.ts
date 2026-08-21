@@ -1,6 +1,39 @@
 import { invoke } from "@tauri-apps/api/core";
 import { toast } from "svelte-sonner";
 import { player } from "$lib/player.svelte";
+import { trackStore } from "$lib/tracks.svelte";
+import { readSetting, writeSetting } from "$lib/settings.svelte";
+import type { Direction, Sort } from "$lib/sorting";
+
+/**
+ * How the playlist grid is ordered.
+ *
+ * A separate vocabulary from the track sort, because the questions differ: a
+ * playlist has no artist, no duration and no upload date.
+ */
+export type PlaylistSort = "lastPlayed" | "mostPlayed" | "name" | "dateCreated";
+
+export const PLAYLIST_GRID_SORTS: {
+  id: PlaylistSort;
+  label: string;
+  asc: string;
+  desc: string;
+}[] = [
+  {
+    id: "lastPlayed",
+    label: "Recently played",
+    asc: "Longest ago first",
+    desc: "Most recent first",
+  },
+  { id: "mostPlayed", label: "Most played", asc: "Least first", desc: "Most first" },
+  {
+    id: "dateCreated",
+    label: "Date added",
+    asc: "Oldest first",
+    desc: "Newest first",
+  },
+  { id: "name", label: "Name", asc: "A – Z", desc: "Z – A" },
+];
 import type { Track } from "$lib/tracks.svelte";
 
 /** One name that counts as a playlist's artist. */
@@ -81,6 +114,73 @@ class PlaylistStore {
   /** Every artist in the library, for the rule picker and the browse list. */
   artists = $state<LibraryArtist[]>([]);
 
+  /**
+   * How the open playlist is ordered.
+   *
+   * `custom` is the playlist's own order and the only mode where dragging
+   * means anything -- every other option is a view, and reordering is turned
+   * off under one for the same reason it is turned off under a filter.
+   */
+  sort = $state<Sort>("custom");
+  direction = $state<Direction>("asc");
+
+  /** How the grid is ordered. Its own small vocabulary; see `PlaylistSort`. */
+  gridSort = $state<PlaylistSort>("lastPlayed");
+  /**
+   * And which way round.
+   *
+   * Descending by default because every option here reads that way first:
+   * most recently played, most played, newest. Name is the exception and
+   * flips itself on selection.
+   */
+  gridDirection = $state<Direction>("desc");
+
+  /** True while anything other than the playlist's own order is showing. */
+  get sorted() {
+    return this.sort !== "custom";
+  }
+
+  setSort(sort: Sort, direction: Direction) {
+    this.sort = sort;
+    this.direction = direction;
+    void writeSetting("playlistSort", sort);
+    void writeSetting("playlistSortDirection", direction);
+    void this.refreshOpen();
+  }
+
+  async setGridSort(sort: PlaylistSort, direction?: Direction) {
+    // Picking a new field resets the direction to the one that field reads
+    // naturally: "Name ▾" meaning Z–A would be a strange thing to land on.
+    const next = direction ?? (sort === "name" ? "asc" : "desc");
+
+    this.gridSort = sort;
+    this.gridDirection = next;
+    await writeSetting("playlistGridSort", sort);
+    await writeSetting("playlistGridDirection", next);
+    await this.load();
+  }
+
+  async toggleGridDirection() {
+    await this.setGridSort(
+      this.gridSort,
+      this.gridDirection === "asc" ? "desc" : "asc",
+    );
+  }
+
+  /** Restores both persisted orders. */
+  async restoreSorts() {
+    this.sort = await readSetting<Sort>("playlistSort", "custom");
+    this.direction = await readSetting<Direction>("playlistSortDirection", "asc");
+    this.gridSort = await readSetting<PlaylistSort>(
+      "playlistGridSort",
+      "lastPlayed",
+    );
+    this.gridDirection = await readSetting<Direction>(
+      "playlistGridDirection",
+      "desc",
+    );
+  }
+
   /** Filter over playlist *names*. Separate from the in-playlist filter. */
   listQuery = $state("");
 
@@ -132,6 +232,38 @@ class PlaylistStore {
     }
   }
 
+  /**
+   * Files everything in a playlist in the library.
+   *
+   * The gesture an imported playlist needs: importing deliberately leaves its
+   * tracks unclaimed, which keeps them out of the library *and* out of every
+   * artist rule, since a rule only collects what you kept.
+   */
+  async addAllToLibrary(playlistId: number) {
+    try {
+      const filed = await invoke<number>("add_playlist_to_library", {
+        playlistId,
+      });
+
+      if (filed === 0) {
+        toast.info("Everything here is already in your library.");
+        return;
+      }
+
+      toast.success(
+        `Added ${filed} ${filed === 1 ? "track" : "tracks"} to your library.`,
+      );
+
+      // The playlist rows now say "in library", the library list has grown,
+      // and any artist rule naming these artists has just gained tracks.
+      await this.refreshOpen();
+      await this.load();
+      await trackStore.load();
+    } catch (e) {
+      toast.error(String(e));
+    }
+  }
+
   async removeArtistRule(playlistId: number, artistKey: string) {
     try {
       await invoke<Playlist>("remove_playlist_artist_rule", {
@@ -169,7 +301,10 @@ class PlaylistStore {
 
   async load() {
     try {
-      this.playlists = await invoke<Playlist[]>("list_playlists");
+      this.playlists = await invoke<Playlist[]>("list_playlists", {
+        sort: this.gridSort,
+        direction: this.gridDirection,
+      });
     } catch (e) {
       toast.error(String(e));
     }
@@ -200,6 +335,8 @@ class PlaylistStore {
         search: this.query.trim() === "" ? null : this.query,
         tagIds: this.selectedTagIds,
         mode: this.mode,
+        sort: this.sort,
+        direction: this.direction,
       });
     } catch (e) {
       toast.error(String(e));
@@ -369,11 +506,27 @@ class PlaylistStore {
   /** Plays the opened playlist, starting at `startIndex`. */
   async play(startIndex = 0) {
     if (!this.open || this.open.tracks.length === 0) return;
+
+    const playlistId = this.open.playlist.id;
     await player.playQueue(
       this.open.tracks.map((t) => t.id),
       startIndex,
       this.open.playlist.name,
     );
+
+    // Counted here rather than inferred from track history: playing a song
+    // from the library that happens to sit in some playlist must not push that
+    // playlist to the top of "recently played". Putting the list on is the
+    // event, and this is where it happens.
+    //
+    // Not awaited before playback, and failure is silent: an ordering hint is
+    // not worth delaying a play or interrupting one.
+    try {
+      await invoke("mark_playlist_played", { playlistId });
+      await this.load();
+    } catch {
+      // The grid keeps the order it had.
+    }
   }
 }
 

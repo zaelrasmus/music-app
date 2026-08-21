@@ -11,7 +11,10 @@ export type Sort =
   | "artist"
   | "dateAdded"
   | "dateUploaded"
-  | "duration";
+  | "duration"
+  | "lastPlayed"
+  | "playCount"
+  | "custom";
 
 export type Direction = "asc" | "desc";
 
@@ -55,10 +58,47 @@ export const SORT_OPTIONS: SortOption[] = [
     asc: "Shortest first",
     desc: "Longest first",
   },
+  {
+    id: "lastPlayed",
+    label: "Last played",
+    asc: "Longest ago first",
+    desc: "Most recent first",
+    // Said once, because the alternative is wondering why a track skipped
+    // past yesterday is not at the top.
+    hint: "Counted only after thirty seconds, so this is what you listened to rather than what you skipped past. Tracks never played sort last.",
+  },
+  {
+    id: "playCount",
+    label: "Most played",
+    asc: "Least first",
+    desc: "Most first",
+  },
+];
+
+/**
+ * The playlist view offers one more: the order the user put them in.
+ *
+ * First, and the default, because it is the only mode in which dragging a row
+ * means anything -- every other option is a view over the same list, and the
+ * panel turns reordering off while one is active.
+ */
+export const PLAYLIST_SORT_OPTIONS: SortOption[] = [
+  {
+    id: "custom",
+    label: "Custom order",
+    asc: "As arranged",
+    desc: "As arranged",
+    hint: "The order you put them in. Drag to rearrange — which only works here, because under any other sort a row's position on screen is not its position in the playlist.",
+  },
+  ...SORT_OPTIONS.filter((option) => option.id !== "auto"),
 ];
 
 export function sortOption(id: Sort): SortOption {
-  return SORT_OPTIONS.find((o) => o.id === id) ?? SORT_OPTIONS[0];
+  return (
+    PLAYLIST_SORT_OPTIONS.find((o) => o.id === id) ??
+    SORT_OPTIONS.find((o) => o.id === id) ??
+    SORT_OPTIONS[0]
+  );
 }
 
 /**

@@ -1,5 +1,6 @@
 <script lang="ts">
     import { Input } from "$components/ui/input";
+    import { writeSetting } from "$lib/settings.svelte";
     import { Button } from "$components/ui/button";
     import TrackMenu from "$components/track-menu.svelte";
     import SourceBadge from "$components/source-badge.svelte";
@@ -83,6 +84,39 @@
     const shownTags = $derived(tags.slice(0, 2));
     const hiddenTags = $derived(tags.slice(2));
 
+    // TEMPORARY, with the window listeners below.
+    let probed: string[] = [];
+    let probeTimer: ReturnType<typeof setTimeout> | null = null;
+
+    function dragProbe(kind: string, event: DragEvent) {
+        const target = event.target as HTMLElement | null;
+        const draggableAncestor = target?.closest?.("[draggable='true']");
+
+        probed.push(
+            [
+                kind,
+                `target=${target?.tagName ?? "?"}`,
+                `role=${target?.getAttribute?.("role") ?? "-"}`,
+                `draggableAncestor=${draggableAncestor ? "yes" : "NO"}`,
+                `defaultPrevented=${event.defaultPrevented}`,
+                `types=${event.dataTransfer?.types?.join("|") || "none"}`,
+                `effect=${event.dataTransfer?.dropEffect ?? "-"}`,
+            ].join(" "),
+        );
+
+        // Batched: `dragover` fires continuously, and one write per event
+        // would hammer the store and drown the interesting lines.
+        if (probeTimer) clearTimeout(probeTimer);
+        probeTimer = setTimeout(() => {
+            const seen = probed.slice(0, 4).concat(probed.slice(-4));
+            probed = [];
+            void writeSetting("__dragProbe", seen);
+        }, 400);
+    }
+
+    /** The row element, used as the drag preview when the handle is grabbed. */
+    let rowElement = $state<HTMLDivElement | null>(null);
+
     let editing = $state(false);
     let editTitle = $state("");
     let editArtist = $state("");
@@ -162,33 +196,97 @@
   decision belongs anyway — this component knows what a track looks like, not
   what it is one of.
 -->
+<!--
+  TEMPORARY: drag diagnostics.
+
+  Two fixes have not landed, and guessing a third is worse than measuring. A
+  `dragstart` that never fires and one that fires and is then refused look
+  identical from outside, so this records which actually happens -- into the
+  settings store, because the webview console is not readable from outside the
+  window. Remove once the cause is known.
+-->
+<svelte:window
+    ondragstart={(e) => dragProbe("dragstart", e)}
+    ondragover={(e) => dragProbe("dragover", e)}
+    ondrop={(e) => dragProbe("drop", e)}
+    ondragend={(e) => dragProbe("dragend", e)}
+/>
+
 <div
+    bind:this={rowElement}
     class="group/row has-[:focus-visible]:ring-ring relative rounded-lg transition-colors has-[:focus-visible]:ring-2
            {reorder?.over ? 'bg-accent ring-foreground/25 ring-1' : ''}
            {isCurrent ? 'bg-foreground/[0.055]' : 'hover:bg-foreground/[0.04]'}"
     class:opacity-50={missing}
     draggable={reorder?.enabled ? "true" : "false"}
-    ondragstart={() => reorder?.onStart()}
-    ondragover={(e) => {
+    ondragstart={(e) => {
         if (!reorder?.enabled) return;
+        // The three lines that make a drag a *move*.
+        //
+        // Without a payload the drag carries nothing, and a drag carrying
+        // nothing is refused by every drop target -- which is the prohibited
+        // cursor, with no `drop` event ever firing. The value is unused; that
+        // there *is* one is the whole point. `effectAllowed` then has to agree
+        // with the `dropEffect` set below, or the browser refuses on the
+        // mismatch instead.
+        e.dataTransfer?.setData("text/plain", "row");
+        if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+        reorder.onStart();
+    }}
+    ondragover={(e) => {
+        if (!reorder) return;
+        // Unconditionally, and *before* any other test. Not calling this is
+        // how a target says "no", so a guarded version made a row that was
+        // merely not reorderable look broken instead of inert.
         e.preventDefault();
+        if (!reorder.enabled) return;
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
         reorder.onOver();
     }}
     ondragleave={() => reorder?.onLeave()}
     ondrop={(e) => {
-        if (!reorder?.enabled) return;
+        if (!reorder) return;
         e.preventDefault();
-        reorder.onDrop();
+        if (reorder.enabled) reorder.onDrop();
     }}
     ondragend={() => reorder?.onEnd()}
 >
     <div class="flex items-center gap-3 pr-2 pl-3">
         {#if reorder}
-            <GripVerticalIcon
-                class="text-muted-foreground -ml-1.5 size-4 shrink-0 {reorder.enabled
-                    ? 'cursor-grab opacity-0 transition-opacity group-hover/row:opacity-60'
+            <!--
+              The drag starts here, not on the row.
+
+              Most of a row is a `<button>` -- the whole title block is the play
+              control -- and a drag gesture beginning inside a form control does
+              not start the draggable ancestor's drag. It is refused instead,
+              which is the prohibited cursor with no `drop` ever firing. Since
+              that is exactly where anyone would grab a song, dragging the row
+              looked broken while nothing was wrong with the handlers.
+
+              A dedicated handle is the conventional answer and the robust one:
+              it is never inside a control, and it says where to grab.
+            -->
+            <span
+                role="application"
+                aria-label="Reorder {track.title}"
+                draggable={reorder.enabled ? "true" : "false"}
+                class="-ml-1.5 shrink-0 {reorder.enabled
+                    ? 'cursor-grab opacity-40 transition-opacity group-hover/row:opacity-80'
                     : 'opacity-20'}"
-            />
+                ondragstart={(e) => {
+                    if (!reorder?.enabled) return;
+                    e.dataTransfer?.setData("text/plain", "row");
+                    if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+                    // The whole row as the preview, rather than a lone grip.
+                    if (e.dataTransfer && rowElement) {
+                        e.dataTransfer.setDragImage(rowElement, 24, 20);
+                    }
+                    reorder.onStart();
+                }}
+                ondragend={() => reorder?.onEnd()}
+            >
+                <GripVerticalIcon class="text-muted-foreground size-4" />
+            </span>
         {/if}
 
         {#if editing}
