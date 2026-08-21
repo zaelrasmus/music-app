@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "svelte-sonner";
 import { player } from "$lib/player.svelte";
 import { trackStore } from "$lib/tracks.svelte";
+import { selection } from "$lib/selection.svelte";
 import { readSetting, writeSetting } from "$lib/settings.svelte";
 import type { Direction, Sort } from "$lib/sorting";
 
@@ -343,6 +344,8 @@ class PlaylistStore {
       this.open = null;
     } finally {
       this.loading = false;
+      // Same rule as the library: a selection may not outlive its rows.
+      selection.retain(this.open?.tracks.map((track) => track.id) ?? []);
     }
   }
 

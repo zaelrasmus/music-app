@@ -187,3 +187,101 @@ pub async fn update_track_metadata(
 
     Ok(())
 }
+
+/// Files many tracks in the library at once, or takes them out.
+///
+/// One statement rather than the single-track command in a loop: three hundred
+/// round trips to answer one gesture is a frozen window, and it was the shape
+/// of the problem the scan already had.
+#[tauri::command]
+pub async fn set_many_in_library(
+    app: AppHandle,
+    db: State<'_, Db>,
+    covers: State<'_, crate::covers::CoverStore>,
+    track_ids: Vec<i64>,
+    in_library: bool,
+) -> Result<usize, String> {
+    if track_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut query = sqlx::QueryBuilder::new("UPDATE tracks SET in_library = ");
+    query.push_bind(i64::from(in_library));
+    query.push(" WHERE in_library <> ");
+    query.push_bind(i64::from(in_library));
+    query.push(" AND id IN (");
+    let mut ids = query.separated(", ");
+    for id in &track_ids {
+        ids.push_bind(id);
+    }
+    query.push(") RETURNING id");
+
+    let changed: Vec<i64> = query
+        .build_query_scalar()
+        .fetch_all(&db.pool)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let count = changed.len();
+
+    // Artwork is bought when a track is kept. Sequentially, on one task: each
+    // fetch is an ffmpeg process, and three hundred starting at once would
+    // stall the machine to decorate rows nobody is looking at yet.
+    if in_library && !changed.is_empty() {
+        let pool = db.pool.clone();
+        let covers = covers.inner().clone();
+        tauri::async_runtime::spawn(async move {
+            for track_id in changed {
+                crate::covers::ensure_for_track(app.clone(), pool.clone(), covers.clone(), track_id)
+                    .await;
+            }
+        });
+    }
+
+    Ok(count)
+}
+
+/// Sets the display artist on many tracks at once.
+///
+/// The gesture this exists for: a library scanned from files with no artist
+/// tag, where the artist is in the folder name. Ninety-eight percent of a real
+/// library was in that state, which made every artist feature in the app apply
+/// to the other two percent. Selecting a folder's worth of tracks and naming
+/// them once is what fixes that.
+///
+/// `title` is deliberately untouched -- that is per-track by nature -- and so
+/// are `remote_uploader` and `remote_title`, which record what a provider said
+/// rather than what the user prefers.
+#[tauri::command]
+pub async fn set_many_artists(
+    db: State<'_, Db>,
+    track_ids: Vec<i64>,
+    artist: Option<String>,
+) -> Result<usize, String> {
+    if track_ids.is_empty() {
+        return Ok(0);
+    }
+
+    // An empty box means "unknown", which is NULL rather than "".
+    let artist = artist
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty());
+
+    let mut query = sqlx::QueryBuilder::new("UPDATE tracks SET artist = ");
+    query.push_bind(artist);
+    query.push(" WHERE id IN (");
+    let mut ids = query.separated(", ");
+    for id in &track_ids {
+        ids.push_bind(id);
+    }
+    query.push(")");
+
+    let affected = query
+        .build()
+        .execute(&db.pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .rows_affected();
+
+    Ok(affected as usize)
+}

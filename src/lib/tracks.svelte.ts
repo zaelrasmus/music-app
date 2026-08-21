@@ -231,4 +231,49 @@ function describeScan(summary: ScanSummary) {
     : `${scanned} — nothing changed.`;
 }
 
+/**
+ * Files many tracks in the library at once, or takes them out.
+ *
+ * One command rather than the single-track one in a loop: three hundred round
+ * trips to answer one gesture is a frozen window.
+ */
+export async function setManyInLibrary(trackIds: number[], inLibrary: boolean) {
+  try {
+    const changed = await invoke<number>("set_many_in_library", {
+      trackIds,
+      inLibrary,
+    });
+    toast.success(
+      changed === 0
+        ? "Nothing changed — they were already filed that way."
+        : `${changed} ${changed === 1 ? "track" : "tracks"} ${
+            inLibrary ? "added to" : "removed from"
+          } your library.`,
+    );
+    return changed;
+  } catch (e) {
+    toast.error(String(e));
+    return 0;
+  }
+}
+
+/**
+ * Sets the display artist on many tracks at once.
+ *
+ * The gesture this exists for: a library scanned from files with no artist
+ * tag, where the artist is in the folder name and nowhere else.
+ */
+export async function setManyArtists(trackIds: number[], artist: string | null) {
+  try {
+    const changed = await invoke<number>("set_many_artists", { trackIds, artist });
+    toast.success(
+      `Set the artist on ${changed} ${changed === 1 ? "track" : "tracks"}.`,
+    );
+    return changed;
+  } catch (e) {
+    toast.error(String(e));
+    return 0;
+  }
+}
+
 export const trackStore = new TrackStore();

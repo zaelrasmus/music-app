@@ -12,6 +12,7 @@
 	import { sidebar } from "$lib/sidebar.svelte";
 	import { queueStore } from "$lib/queue.svelte";
 	import { player } from "$lib/player.svelte";
+	import { selection } from "$lib/selection.svelte";
 
 	const { children } = $props();
 
@@ -39,6 +40,13 @@
 	 * them. Anything typed into a field is left alone.
 	 */
 	function shortcut(event: KeyboardEvent) {
+		// Before the typing guard: Escape is how you get out of a selection, and
+		// it has to work whatever has focus.
+		if (event.key === "Escape" && selection.active) {
+			selection.clear();
+			return;
+		}
+
 		const target = event.target as HTMLElement | null;
 		const typing =
 			target?.tagName === "INPUT" ||

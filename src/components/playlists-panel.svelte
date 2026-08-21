@@ -1,5 +1,6 @@
 <script lang="ts">
     import { onMount } from "svelte";
+    import SelectionBar from "$components/selection-bar.svelte";
     import { Button } from "$components/ui/button";
     import * as DropdownMenu from "$components/ui/dropdown-menu";
     import PageShell from "$components/page-shell.svelte";
@@ -688,6 +689,16 @@
               them by the position they happen to occupy means the row you
               picked up is not the row that lands.
             -->
+            <SelectionBar
+                order={detail.tracks.map((t) => t.id)}
+                removeLabel="Remove from playlist"
+                onRemove={async (trackIds) => {
+                    for (const trackId of trackIds) {
+                        await playlistStore.removeTrack(detail.playlist.id, trackId);
+                    }
+                }}
+            />
+
             <VirtualList
                 rows={detail.tracks}
                 estimateSize={ROW_HEIGHT}
@@ -698,6 +709,7 @@
                         {track}
                         {index}
                         onPlay={() => playlistStore.play(index)}
+                        selectable={detail.tracks.map((t) => t.id)}
                         reorder={{
                             enabled: reorderable,
                             over: dragOver === index,

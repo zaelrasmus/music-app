@@ -1,5 +1,8 @@
 <script lang="ts">
     import { Input } from "$components/ui/input";
+    import { autoScrollTowards, stopAutoScroll } from "$lib/autoscroll.svelte";
+    import { scrollContainer } from "$lib/scroll-container.svelte";
+    import { selection } from "$lib/selection.svelte";
     import { Button } from "$components/ui/button";
     import TrackMenu from "$components/track-menu.svelte";
     import SourceBadge from "$components/source-badge.svelte";
@@ -62,6 +65,14 @@
         reorder?: Reorder;
         /** Extra menu items for this list, e.g. "Remove from playlist". */
         extra?: Snippet;
+        /**
+         * The list as displayed, which turns on multi-select for this row.
+         *
+         * Passed rather than read from a store because a range means what the
+         * eye sees -- the rows between these two -- and only the list knows
+         * what order it is currently showing.
+         */
+        selectable?: number[];
     }
 
     let {
@@ -72,7 +83,36 @@
         onPlay,
         reorder,
         extra,
+        selectable,
     }: Props = $props();
+
+    const selected = $derived(!!selectable && selection.has(track.id));
+
+    /**
+     * Picking without ever taking a click away from playing.
+     *
+     * A plain click plays, as it always has -- changing that to "select", the
+     * way Spotify does, would break the one gesture everyone already knows.
+     * Selection lives on the checkbox and on the modifiers, which is how a
+     * mail client does it and costs nothing to anyone not using it.
+     */
+    function pick(event: MouseEvent) {
+        if (!selectable) return false;
+
+        if (event.shiftKey) {
+            event.preventDefault();
+            selection.extendTo(track.id, selectable);
+            return true;
+        }
+
+        if (event.ctrlKey || event.metaKey) {
+            event.preventDefault();
+            selection.toggle(track.id);
+            return true;
+        }
+
+        return false;
+    }
 
     const isCurrent = $derived(player.isCurrent(track.id));
     const isPlaying = $derived(isCurrent && player.state === "playing");
@@ -85,6 +125,12 @@
 
     /** The row element, used as the drag preview when the handle is grabbed. */
     let rowElement = $state<HTMLDivElement | null>(null);
+
+    /** The list this row scrolls inside, for auto-scrolling during a drag. */
+    const scroller = scrollContainer();
+
+    /** This row's menu, so a right-click anywhere on it can raise it. */
+    let menuOpen = $state(false);
 
     let editing = $state(false);
     let editTitle = $state("");
@@ -169,6 +215,7 @@
     bind:this={rowElement}
     class="group/row has-[:focus-visible]:ring-ring relative rounded-lg transition-colors has-[:focus-visible]:ring-2
            {reorder?.over ? 'bg-accent ring-foreground/25 ring-1' : ''}
+           {selected ? 'bg-primary/10 ring-primary/30 ring-1' : ''}
            {isCurrent ? 'bg-foreground/[0.055]' : 'hover:bg-foreground/[0.04]'}"
     class:opacity-50={missing}
     draggable={reorder?.enabled ? "true" : "false"}
@@ -194,17 +241,65 @@
         e.preventDefault();
         if (!reorder.enabled) return;
         if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+        // The only reliable pointer position during a drag: `dragover` is the
+        // one event that carries one.
+        autoScrollTowards(scroller?.element ?? null, e.clientY);
         reorder.onOver();
     }}
     ondragleave={() => reorder?.onLeave()}
     ondrop={(e) => {
         if (!reorder) return;
         e.preventDefault();
+        stopAutoScroll();
         if (reorder.enabled) reorder.onDrop();
     }}
-    ondragend={() => reorder?.onEnd()}
+    ondragend={() => {
+        stopAutoScroll();
+        reorder?.onEnd();
+    }}
+    oncontextmenu={(e) => {
+        // The row is the target. Reaching for a small button at its end to do
+        // what right-click does everywhere else was the thing worth removing.
+        e.preventDefault();
+        menuOpen = true;
+    }}
 >
-    <div class="flex items-center gap-3 pr-2 pl-3">
+    <div class="flex items-center gap-3 pr-4 pl-3">
+        {#if selectable && selection.active}
+            <!--
+              Only once a selection exists.
+
+              A checkbox waiting on every row is a mail client pretending to be
+              a player, and revealing one on hover puts a second control in the
+              same corner as the drag handle. So the resting list is exactly as
+              it was, and the way in is the ⋯ menu -- or ctrl-click, for anyone
+              who already reaches for it. Selecting *is* entering; there is no
+              mode to remember to leave, only a selection to clear.
+
+              Hand-built rather than an `<input>`: a native checkbox is the one
+              control the platform draws its own way, and it looks like it
+              wandered in from a settings dialog.
+            -->
+            <button
+                type="button"
+                role="checkbox"
+                aria-checked={selected}
+                aria-label="Select {track.title}"
+                class="grid size-4 shrink-0 place-items-center rounded-[5px] border transition-colors {selected
+                    ? 'bg-primary border-primary text-primary-foreground'
+                    : 'border-border hover:border-foreground/40'}"
+                onclick={(e) => {
+                    e.stopPropagation();
+                    if (e.shiftKey) selection.extendTo(track.id, selectable);
+                    else selection.toggle(track.id);
+                }}
+            >
+                {#if selected}
+                    <CheckIcon class="size-3" />
+                {/if}
+            </button>
+        {/if}
+
         {#if reorder}
             <!--
               A note that belongs nowhere else: this list can be reordered at
@@ -249,7 +344,10 @@
                     }
                     reorder.onStart();
                 }}
-                ondragend={() => reorder?.onEnd()}
+                ondragend={() => {
+                    stopAutoScroll();
+                    reorder?.onEnd();
+                }}
             >
                 <GripVerticalIcon class="text-muted-foreground size-4" />
             </span>
@@ -297,7 +395,10 @@
                 type="button"
                 class="flex min-w-0 flex-1 items-center gap-3 py-2 text-left focus-visible:outline-none"
                 aria-label={isPlaying ? `Pause ${track.title}` : `Play ${track.title}`}
-                onclick={play}
+                onclick={(e) => {
+                    // Modifiers select; a plain click still plays.
+                    if (!pick(e)) play();
+                }}
             >
                 <span class="relative shrink-0">
                     <CoverArt
@@ -369,22 +470,51 @@
                 </div>
             {/if}
 
-            <span
-                class="text-muted-foreground w-11 shrink-0 text-right text-xs tabular-nums"
-            >
-                {formatDuration(track.durationSecs)}
-            </span>
+            <!--
+              One slot, two things.
 
-            <TrackMenu
-                resolveTrackId={async () => track.id}
-                label="More actions for {track.title}"
-                {track}
-                {extra}
-                onEdit={startEdit}
-                onTag={startTagging}
-                onLibraryChange={refreshLists}
-                trigger="opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100 data-open:opacity-100"
-            />
+              The duration belongs at the *end* of the row: it is the last
+              thing the eye reads, and a menu button parked to its right left
+              it stranded in the middle of nowhere. So they share a fixed slot
+              -- duration at rest, menu over it on hover -- and nothing moves
+              when the pointer arrives, which is the whole point of pinning the
+              width.
+            -->
+            <span class="grid h-8 w-12 shrink-0 items-center justify-items-end">
+                <!--
+                  Both children share one grid cell, so they sit exactly on top
+                  of each other and neither can push the other around.
+
+                  The duration's right padding is the same 8px as the menu button's
+                  own padding around its 16px glyph, which is what makes the number
+                  at rest and the dots on hover end on the same vertical line
+                  rather than a few pixels apart.
+                -->
+                <span
+                    class="text-muted-foreground col-start-1 row-start-1 pr-2 text-right text-xs tabular-nums transition-opacity group-hover/row:opacity-0 {menuOpen
+                        ? 'opacity-0'
+                        : ''}"
+                >
+                    {formatDuration(track.durationSecs)}
+                </span>
+
+                <span class="col-start-1 row-start-1">
+                    <TrackMenu
+                        bind:open={menuOpen}
+                        resolveTrackId={async () => track.id}
+                        label="More actions for {track.title}"
+                        {track}
+                        {extra}
+                        onSelectTrack={selectable
+                            ? () => selection.toggle(track.id)
+                            : undefined}
+                        onEdit={startEdit}
+                        onTag={startTagging}
+                        onLibraryChange={refreshLists}
+                        trigger="opacity-0 transition-opacity group-hover/row:opacity-100 focus-visible:opacity-100 data-open:opacity-100"
+                    />
+                </span>
+            </span>
         {/if}
     </div>
 

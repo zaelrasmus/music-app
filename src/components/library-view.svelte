@@ -1,5 +1,6 @@
 <script lang="ts">
     import { Button } from "$components/ui/button";
+    import SelectionBar from "$components/selection-bar.svelte";
     import PageShell from "$components/page-shell.svelte";
     import ListHeader from "$components/list-header.svelte";
     import EmptyState from "$components/empty-state.svelte";
@@ -275,13 +276,20 @@
           is why the query behind it no longer stops at five hundred rows.
         -->
         <div class:opacity-60={libraryView.loading}>
+            <SelectionBar order={flatIds} />
+
             <VirtualList
                 rows={libraryView.results}
                 estimateSize={ROW_HEIGHT}
                 key={(track) => track.id}
             >
                 {#snippet row(track, index)}
-                    <TrackRow {track} queueIds={flatIds} {index} />
+                    <TrackRow
+                        {track}
+                        queueIds={flatIds}
+                        {index}
+                        selectable={flatIds}
+                    />
                 {/snippet}
             </VirtualList>
         </div>

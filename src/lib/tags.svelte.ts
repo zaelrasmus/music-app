@@ -70,6 +70,18 @@ class TagStore {
   }
 
   /** Creates the tag if it does not exist, then attaches it. */
+  /**
+   * Puts one tag on many tracks.
+   *
+   * Sequential rather than parallel: the command creates the tag if it does
+   * not exist, and forty at once would race to create forty of it.
+   */
+  async assignMany(trackIds: number[], name: string) {
+    for (const trackId of trackIds) {
+      await this.assign(trackId, name);
+    }
+  }
+
   async assign(trackId: number, name: string) {
     try {
       await invoke("assign_tag", { trackId, name });

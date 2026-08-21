@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { selection } from "$lib/selection.svelte";
 import { toast } from "svelte-sonner";
 import type { Track } from "$lib/tracks.svelte";
 import type { Direction, Sort } from "$lib/sorting";
@@ -118,6 +119,11 @@ class LibraryViewStore {
         });
         if (request !== this.#latestRequest) return;
         this.results = results;
+
+        // Rows that survived the reload keep their selection; the rest cannot
+        // be acted on any more, and "12 selected" must never mean twelve rows
+        // nobody can see.
+        selection.retain(results.map((track) => track.id));
       }
     } catch (e) {
       if (request !== this.#latestRequest) return;

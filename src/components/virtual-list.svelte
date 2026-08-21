@@ -46,6 +46,17 @@
 
     const fromContext = scrollContainer();
 
+    /**
+     * Hoisted so the attachment keeps its identity.
+     *
+     * Written inline, `{@attach (node) => …}` builds a new function on every
+     * render, which Svelte treats as a new attachment: it tears the old one
+     * down and re-registers the row with the `ResizeObserver`. Re-observing
+     * during a render is what produces "ResizeObserver loop completed with
+     * undelivered notifications" once anything makes the rows re-render often.
+     */
+    const measure = (node: HTMLElement) => virtualizer.measure(node);
+
     const virtualizer = virtualRows({
         count: () => rows.length,
         scrollElement: () => scrollElement ?? fromContext?.element,
@@ -69,7 +80,7 @@
             class="absolute top-0 left-0 w-full"
             style="transform: translateY({item.start}px)"
             data-index={item.index}
-            {@attach (node) => virtualizer.measure(node)}
+            {@attach measure}
         >
             {@render row(rows[item.index], item.index)}
         </li>

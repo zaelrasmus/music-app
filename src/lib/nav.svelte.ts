@@ -1,3 +1,5 @@
+import { selection } from "$lib/selection.svelte";
+
 /**
  * Which view is on screen.
  *
@@ -13,6 +15,10 @@ class NavStore {
   view = $state<View>("library");
 
   go(view: View) {
+    // A selection belongs to the list it was made in. Carrying it across
+    // would leave a bulk action pointing at rows nobody can see.
+    selection.clear();
+
     this.view = view;
   }
 }

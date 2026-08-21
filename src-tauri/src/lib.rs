@@ -193,6 +193,8 @@ pub fn run() {
             tracks::rescan_library,
             tracks::update_track_metadata,
             tracks::set_in_library,
+            tracks::set_many_in_library,
+            tracks::set_many_artists,
             playlists::create_playlist,
             playlists::rename_playlist,
             playlists::delete_playlist,

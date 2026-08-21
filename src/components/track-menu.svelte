@@ -1,5 +1,6 @@
 <script lang="ts">
     import * as DropdownMenu from "$components/ui/dropdown-menu";
+    import CheckSquareIcon from "@lucide/svelte/icons/square-check-big";
     import { player } from "$lib/player.svelte";
     import { playlistStore } from "$lib/playlists.svelte";
     import { trackStore, setInLibrary, type Track } from "$lib/tracks.svelte";
@@ -51,6 +52,21 @@
         onLibraryChange?: () => void;
         /** Context-specific items, e.g. "Remove from this playlist". */
         extra?: Snippet;
+        /**
+         * Starts a selection from this row.
+         *
+         * The discoverable way in, so nothing has to sit on every row waiting
+         * to be noticed. Absent in lists that cannot be selected.
+         */
+        onSelectTrack?: () => void;
+        /**
+         * Bindable, so a row can open this from a right-click.
+         *
+         * The menu still anchors to its own trigger rather than to the cursor.
+         * That is not a compromise here: the trigger sits at the end of the
+         * row the click was on, which is where the menu belongs anyway.
+         */
+        open?: boolean;
         align?: "start" | "end";
         /** Rows reveal the trigger on hover; standalone callers do not. */
         trigger?: string;
@@ -64,6 +80,8 @@
         onTag,
         onLibraryChange,
         extra,
+        onSelectTrack,
+        open = $bindable(false),
         align = "end",
         trigger = "",
     }: Props = $props();
@@ -118,7 +136,7 @@
     }
 </script>
 
-<DropdownMenu.Root>
+<DropdownMenu.Root bind:open>
     <DropdownMenu.Trigger>
         {#snippet child({ props })}
             <button
@@ -139,6 +157,14 @@
     </DropdownMenu.Trigger>
 
     <DropdownMenu.Content {align} class="w-56">
+        {#if onSelectTrack}
+            <DropdownMenu.Item onSelect={onSelectTrack}>
+                <CheckSquareIcon />
+                Select
+            </DropdownMenu.Item>
+            <DropdownMenu.Separator />
+        {/if}
+
         <DropdownMenu.Item onSelect={() => run((id) => player.playNext(id))}>
             <CornerUpRightIcon />
             Play next
