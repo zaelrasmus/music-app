@@ -65,6 +65,24 @@ pub struct FfmpegSource {
     /// A cache copy being written alongside playback, committed on `Drop`
     /// only if ffmpeg got all the way to the end.
     pending_cache: Option<PendingCache>,
+    /// Whatever ffmpeg has written to stderr, still filling.
+    ///
+    /// Read at `Drop` rather than only on a failed start: ffmpeg can
+    /// complain *and* keep producing audio, and that combination is
+    /// exactly what leaves a damaged copy on disk.
+    errors: Option<Arc<Mutex<String>>>,
+    /// The thread filling `errors`.
+    ///
+    /// Joined before that text is read. ffmpeg exiting does not mean the
+    /// last of its output has been collected yet, and reading a moment too
+    /// early would make 'did ffmpeg complain' a race -- which, on the one
+    /// run where it complained, is the answer that matters.
+    stderr_drain: Option<std::thread::JoinHandle<()>>,
+    /// A copy of ours being read, deleted if ffmpeg complains about it.
+    ///
+    /// Only ever set for [`FfmpegInput::Disposable`], so only ever a file
+    /// in this app's own audio cache.
+    disposable: Option<std::path::PathBuf>,
 }
 
 /// What ffmpeg should read.
@@ -74,6 +92,13 @@ pub struct FfmpegSource {
 #[derive(Debug, Clone, Copy)]
 pub enum FfmpegInput<'a> {
     File(&'a Path),
+    /// A file the *app* wrote: a cache copy of a stream it already played.
+    ///
+    /// Decoded exactly like [`Self::File`]. The difference is that it is
+    /// worth nothing and may be deleted -- which is why the distinction is
+    /// in the type rather than in a flag someone could pass by accident.
+    /// Nothing the user owns is ever named this way.
+    Disposable(&'a Path),
     Url(&'a str),
 }
 
@@ -84,7 +109,7 @@ impl FfmpegInput<'_> {
     /// exactly what a stall has to outlast before it becomes silence.
     fn buffer_samples(self) -> usize {
         let seconds = match self {
-            FfmpegInput::File(_) => BUFFER_SECONDS_FILE,
+            FfmpegInput::File(_) | FfmpegInput::Disposable(_) => BUFFER_SECONDS_FILE,
             FfmpegInput::Url(_) => BUFFER_SECONDS_NETWORK,
         };
         SAMPLES_PER_SECOND * seconds
@@ -133,7 +158,7 @@ impl FfmpegSource {
 
         command.arg("-i");
         match input {
-            FfmpegInput::File(path) => command.arg(path),
+            FfmpegInput::File(path) | FfmpegInput::Disposable(path) => command.arg(path),
             FfmpegInput::Url(url) => command.arg(url),
         };
 
@@ -172,7 +197,10 @@ impl FfmpegSource {
         let starved = Arc::new(AtomicBool::new(false));
 
         spawn_reader(stdout, producer, finished.clone());
-        let errors = stderr.map(spawn_stderr_drain);
+        let (errors, stderr_drain) = match stderr.map(spawn_stderr_drain) {
+            Some((collected, handle)) => (Some(collected), handle),
+            None => (None, None),
+        };
 
         let source = Self {
             consumer,
@@ -180,6 +208,15 @@ impl FfmpegSource {
             starved,
             child,
             pending_cache: cache,
+            // Kept rather than dropped after the checks below: whether ffmpeg
+            // complained is the difference between a cache copy worth keeping
+            // and one that will break the track later.
+            errors: errors.clone(),
+            stderr_drain,
+            disposable: match input {
+                FfmpegInput::Disposable(path) => Some(path.to_path_buf()),
+                _ => None,
+            },
         };
 
         source.wait_for_prefill()?;
@@ -293,11 +330,13 @@ fn push_blocking(producer: &mut Producer<Sample>, sample: Sample) -> Result<(), 
 }
 
 /// Keeps ffmpeg's stderr drained so it can never fill its pipe and block.
-fn spawn_stderr_drain(mut stderr: ChildStderr) -> Arc<Mutex<String>> {
+fn spawn_stderr_drain(
+    mut stderr: ChildStderr,
+) -> (Arc<Mutex<String>>, Option<std::thread::JoinHandle<()>>) {
     let collected = Arc::new(Mutex::new(String::new()));
     let sink = collected.clone();
 
-    let _ = std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("ffmpeg-stderr".to_string())
         .spawn(move || {
             let mut buffer = [0u8; 1024];
@@ -313,7 +352,7 @@ fn spawn_stderr_drain(mut stderr: ChildStderr) -> Arc<Mutex<String>> {
             }
         });
 
-    collected
+    (collected, handle.ok())
 }
 
 impl Iterator for FfmpegSource {
@@ -382,19 +421,63 @@ impl Drop for FfmpegSource {
         }
         let status = self.child.wait().ok();
 
+        // ffmpeg has exited, so its stderr pipe is closed and this returns
+        // at once -- but it is what makes the check below a fact.
+        if let Some(drain) = self.stderr_drain.take() {
+            let _ = drain.join();
+        }
+
+        let complained = self
+            .errors
+            .as_ref()
+            .and_then(|e| e.lock().ok().map(|s| !s.trim().is_empty()))
+            .unwrap_or(false);
+        // The same question the write side asks, asked about a copy being
+        // *read*. A truncated one decodes happily until it reaches the
+        // damage -- ffmpeg exits 0 and says only `File ended prematurely` --
+        // so without this the song quietly ends early on every play, forever,
+        // and nothing ever reconsiders the file.
+        //
+        // Deleting costs one re-fetch; the provider still has the track. It
+        // is only ever reached for a copy this app wrote itself.
+        if let Some(path) = self.disposable.take() {
+            if complained {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+
         let Some(pending) = self.pending_cache.take() else {
             return;
         };
 
-        // Only a clean, complete run produces a usable cache entry. Anything
-        // else leaves a truncated song, which would be worse than no cache at
-        // all -- it would play and then stop early for no visible reason.
-        if ended && status.is_some_and(|s| s.success()) {
+
+        if worth_caching(ended, status.is_some_and(|s| s.success()), complained) {
             pending.commit();
         } else {
             pending.discard();
         }
     }
+}
+
+/// Whether a decode produced a cache copy worth keeping.
+///
+/// All three conditions, because each covers a different way of ending up
+/// with a file that decodes for two minutes and then turns to noise:
+///
+/// - `ended`: ffmpeg closed its own output. Anything else is a skip or a
+///   seek, and the copy stops wherever the listener did.
+/// - `exited_cleanly`: it was not killed, and did not fail.
+/// - `complained`: **the one that was missing.** ffmpeg can lose part of an
+///   HLS stream, say so on stderr, and still exit 0 having written most of
+///   the track -- the copy is short and its last seconds are garbage. That
+///   was ignored while audio was arriving, so the damaged copy was committed
+///   and every later play of that track found it. At `-loglevel error`
+///   ffmpeg is silent on a healthy run, so anything at all is a reason not
+///   to keep what it produced.
+///
+/// A copy not kept costs one re-fetch. A bad one kept costs the track.
+fn worth_caching(ended: bool, exited_cleanly: bool, complained: bool) -> bool {
+    ended && exited_cleanly && !complained
 }
 
 /// Turns ffmpeg's stderr into something a person can act on.
@@ -431,6 +514,20 @@ pub fn explain_ffmpeg(stderr: &str) -> String {
         return "That file is missing from disk.".to_string();
     }
 
+    // A decoder that read the stream and refused it.
+    //
+    // Worth naming separately from the catch-all because it is the one failure
+    // the app can *do* something about: the same audio in another encoding
+    // usually plays, and `is_undecodable` is what routes it there.
+    if lowered.contains("invalid data found")
+        || lowered.contains("error while decoding")
+        || lowered.contains("decoding for stream")
+        || lowered.contains("exceeds limit")
+        || lowered.contains("decoder not found")
+    {
+        return format!("{UNDECODABLE} ({})", codec_detail(stderr));
+    }
+
     // Something unanticipated: keep the first line only, and keep it short.
     let first = stderr
         .lines()
@@ -444,6 +541,42 @@ pub fn explain_ffmpeg(stderr: &str) -> String {
     }
 
     format!("Could not decode this audio: {summary}")
+}
+
+/// Said whenever a decoder read the audio and would not accept it.
+pub const UNDECODABLE: &str = "That track's audio could not be decoded";
+
+/// Whether the audio arrived and could not be turned into sound.
+///
+/// Distinct from every network case: the bytes are here, so resolving the same
+/// link again is pointless and the useful retry is a *different encoding* of
+/// the same track. The catch-all message counts too — an unrecognised ffmpeg
+/// failure at this point is still ffmpeg failing to produce audio.
+pub fn is_undecodable(message: &str) -> bool {
+    message.starts_with(UNDECODABLE) || message.starts_with("Could not decode this audio")
+}
+
+/// Strips ffmpeg's `[codec @ 0x...]` prefix, keeping the codec name.
+///
+/// The pointer is a heap address inside a process that has already exited. It
+/// is pure noise in a toast, and it is most of what makes ffmpeg's output look
+/// like something went catastrophically wrong rather than "this file is odd".
+fn codec_detail(stderr: &str) -> String {
+    let first = stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("no detail");
+
+    let cleaned = match first.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
+        Some((tag, rest)) => {
+            let codec = tag.split_whitespace().next().unwrap_or(tag);
+            format!("{codec}: {}", rest.trim())
+        }
+        None => first.to_string(),
+    };
+
+    cleaned.chars().take(120).collect()
 }
 
 /// Whether a failure is worth retrying with a freshly resolved URL.
@@ -624,6 +757,76 @@ mod ffmpeg_error_tests {
 #[cfg(test)]
 mod transient_tests {
     use super::*;
+
+    /// The bug this whole fallback exists for, as the tester saw it.
+    /// A healthy run is the only one worth keeping.
+    #[test]
+    fn a_clean_complete_silent_run_is_cached() {
+        assert!(worth_caching(true, true, false));
+    }
+
+    /// The case that poisoned a track for good: ffmpeg lost part of an HLS
+    /// stream, said so, and still exited 0 having written most of it. The
+    /// copy decoded for two minutes and then turned to noise, and every
+    /// later play found it again.
+    #[test]
+    fn a_run_ffmpeg_complained_about_is_not_cached() {
+        assert!(
+            !worth_caching(true, true, true),
+            "a copy ffmpeg complained about must not outlive the play",
+        );
+    }
+
+    /// Skips and seeks stop the copy wherever the listener stopped.
+    #[test]
+    fn an_interrupted_run_is_not_cached() {
+        assert!(!worth_caching(false, true, false), "killed part-way");
+        assert!(!worth_caching(true, false, false), "exited badly");
+        assert!(!worth_caching(false, false, true), "all three wrong");
+    }
+
+    #[test]
+    fn a_decoder_refusing_a_stream_is_named_and_routed_to_a_retry() {
+        let raw = "[aac @ 000001dda6bf5800] Number of bands (49) exceeds limit (32).";
+        let message = explain_ffmpeg(raw);
+
+        assert!(
+            is_undecodable(&message),
+            "a decoder failure must retry a different encoding: {message:?}",
+        );
+        assert!(
+            !message.contains("000001dda6bf5800"),
+            "the heap pointer is noise and must not reach a toast: {message:?}",
+        );
+        assert!(
+            message.contains("aac"),
+            "the codec is worth keeping: {message:?}",
+        );
+    }
+
+    /// Network failures must *not* be routed to the encoding retry: the same
+    /// encoding over a working connection is exactly what is wanted.
+    #[test]
+    fn a_network_failure_is_not_treated_as_undecodable() {
+        for raw in [
+            "HTTP error 403 Forbidden",
+            "Server returned 404 Not Found",
+            "Failed to resolve hostname",
+        ] {
+            let message = explain_ffmpeg(raw);
+            assert!(
+                !is_undecodable(&message),
+                "{raw:?} became {message:?}, which would retry the wrong thing",
+            );
+        }
+    }
+
+    /// An unrecognised ffmpeg failure at this point is still ffmpeg failing
+    /// to produce audio, so it earns the same retry.
+    #[test]
+    fn an_unrecognised_failure_still_earns_the_encoding_retry() {
+        assert!(is_undecodable(&explain_ffmpeg("something nobody has seen")));
+    }
 
     #[test]
     fn a_refused_fetch_is_worth_retrying() {

@@ -30,17 +30,57 @@ const SAFETY_MARGIN: Duration = Duration::from_secs(300);
 /// still cover the replays and skip-backs that motivate the cache at all.
 const DEFAULT_TTL: Duration = Duration::from_secs(600);
 
+/// Which encoding of a track to ask the provider for.
+///
+/// Both services publish the same audio several times over, and the choice is
+/// not purely about quality: ffmpeg's native AAC decoder rejects some streams
+/// outright -- a SoundCloud track reported `Number of bands (49) exceeds limit
+/// (32)` mid-listen and could not be decoded at all. Nothing about that track
+/// is broken; the other encoding of it plays.
+///
+/// So the encoding is a *choice the caller can revise* rather than a constant.
+/// One that will not decode stops being a dead track and becomes one retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Encoding {
+    /// AAC in mp4 where it exists.
+    ///
+    /// Cheap to decode, widely available, and the highest bitrate SoundCloud
+    /// offers (160k, against 128k for its mp3). The bare fallback is Opus on
+    /// YouTube and mp3 on SoundCloud.
+    Preferred,
+    /// Anything except that.
+    ///
+    /// Deliberately expressed as an exclusion rather than a second list of
+    /// preferences: the only thing known at this point is which encoding just
+    /// failed, and every remaining option is better than none.
+    Alternate,
+}
+
+impl Encoding {
+    /// The yt-dlp format selector this asks for.
+    pub fn selector(self) -> &'static str {
+        match self {
+            Encoding::Preferred => "bestaudio[ext=m4a]/bestaudio",
+            Encoding::Alternate => "bestaudio[ext!=m4a]/bestaudio",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     url: String,
     good_until: SystemTime,
 }
 
-/// Keyed by the provider's page URL, which is what identifies a track across
-/// both services and is what the caller already holds.
+/// Keyed by the provider's page URL and the encoding asked for.
+///
+/// The page URL is what identifies a track across both services and is what
+/// the caller already holds; the encoding is part of the key because the two
+/// resolve to different streams and a fallback must not be handed the link
+/// that just failed to decode.
 #[derive(Default)]
 pub struct StreamUrlCache {
-    entries: Mutex<HashMap<String, Entry>>,
+    entries: Mutex<HashMap<(String, Encoding), Entry>>,
     /// Absent in tests, which exercise the expiry logic and nothing else.
     pool: Option<SqlitePool>,
 }
@@ -61,13 +101,18 @@ impl StreamUrlCache {
     }
 
     /// Returns a playable stream URL, resolving only when necessary.
-    pub async fn resolve(&self, yt_dlp: &Path, page_url: &str) -> Result<String, String> {
-        if let Some(url) = self.lookup(page_url, SystemTime::now()) {
+    pub async fn resolve(
+        &self,
+        yt_dlp: &Path,
+        page_url: &str,
+        encoding: Encoding,
+    ) -> Result<String, String> {
+        if let Some(url) = self.lookup(page_url, encoding, SystemTime::now()) {
             return Ok(url);
         }
 
-        let resolved = crate::youtube::resolve_stream_url(yt_dlp, page_url).await?;
-        self.store(page_url, resolved.url.clone(), SystemTime::now());
+        let resolved = crate::youtube::resolve_stream_url(yt_dlp, page_url, encoding).await?;
+        self.store(page_url, encoding, resolved.url.clone(), SystemTime::now());
 
         if let Some(uploaded_at) = resolved.uploaded_at {
             self.remember_upload_date(page_url, uploaded_at);
@@ -100,31 +145,39 @@ impl StreamUrlCache {
         });
     }
 
-    /// Forgets any cached URL for `page_url`.
+    /// Forgets every cached URL for `page_url`, whatever encoding it was for.
     ///
     /// Returns whether there was one. The caller uses that to decide whether
     /// retrying is worthwhile: a failure with nothing cached was not our
     /// staleness, so retrying would just fail again more slowly.
+    ///
+    /// All encodings, not just the one that failed: staleness is a property of
+    /// the moment rather than of the encoding, so links resolved alongside the
+    /// dead one are no more trustworthy than it was.
     pub fn invalidate(&self, page_url: &str) -> bool {
         self.entries
             .lock()
-            .map(|mut entries| entries.remove(page_url).is_some())
+            .map(|mut entries| {
+                let before = entries.len();
+                entries.retain(|(url, _), _| url != page_url);
+                entries.len() != before
+            })
             .unwrap_or(false)
     }
 
     /// `now` is a parameter so the expiry logic is testable without waiting.
-    fn lookup(&self, page_url: &str, now: SystemTime) -> Option<String> {
+    fn lookup(&self, page_url: &str, encoding: Encoding, now: SystemTime) -> Option<String> {
         let entries = self.entries.lock().ok()?;
-        let entry = entries.get(page_url)?;
+        let entry = entries.get(&(page_url.to_string(), encoding))?;
         (entry.good_until > now).then(|| entry.url.clone())
     }
 
-    fn store(&self, page_url: &str, url: String, now: SystemTime) {
+    fn store(&self, page_url: &str, encoding: Encoding, url: String, now: SystemTime) {
         let good_until = usable_until(&url, now);
 
         if let Ok(mut entries) = self.entries.lock() {
             entries.insert(
-                page_url.to_string(),
+                (page_url.to_string(), encoding),
                 Entry {
                     url,
                     good_until,
@@ -192,13 +245,61 @@ mod tests {
         assert_eq!(parse_expiry("https://example.test/a?expire=soon"), None);
     }
 
+    /// The fallback must not be handed the link that just failed.
+    ///
+    /// Both encodings of a track share a page URL, so keying on that alone
+    /// would return the AAC link when the alternate was asked for -- and the
+    /// retry would fail exactly as the first attempt did.
+    #[test]
+    fn the_two_encodings_are_cached_apart() {
+        let cache = StreamUrlCache::default();
+        cache.store("page", Encoding::Preferred, YT.to_string(), at(1_000_000_000));
+
+        assert_eq!(
+            cache.lookup("page", Encoding::Alternate, at(1_000_000_100)),
+            None,
+            "asking for the other encoding must not return this one",
+        );
+        assert_eq!(
+            cache.lookup("page", Encoding::Preferred, at(1_000_000_100)),
+            Some(YT.to_string()),
+        );
+    }
+
+    /// Staleness is a property of the moment, not of the encoding.
+    #[test]
+    fn invalidating_a_page_forgets_every_encoding_of_it() {
+        let cache = StreamUrlCache::default();
+        cache.store("page", Encoding::Preferred, YT.to_string(), at(1_000_000_000));
+        cache.store("page", Encoding::Alternate, SC.to_string(), at(1_000_000_000));
+        cache.store("other", Encoding::Preferred, YT.to_string(), at(1_000_000_000));
+
+        assert!(cache.invalidate("page"));
+
+        assert_eq!(cache.lookup("page", Encoding::Preferred, at(1_000_000_100)), None);
+        assert_eq!(cache.lookup("page", Encoding::Alternate, at(1_000_000_100)), None);
+        assert!(
+            cache.lookup("other", Encoding::Preferred, at(1_000_000_100)).is_some(),
+            "a different track must be left alone",
+        );
+    }
+
+    /// The alternate has to actually exclude what the preferred asks for, or
+    /// the retry resolves the same stream and fails identically.
+    #[test]
+    fn the_alternate_encoding_excludes_the_preferred_one() {
+        assert!(Encoding::Preferred.selector().contains("ext=m4a"));
+        assert!(Encoding::Alternate.selector().contains("ext!=m4a"));
+        assert_ne!(Encoding::Preferred.selector(), Encoding::Alternate.selector());
+    }
+
     #[test]
     fn a_cached_url_is_returned_without_resolving() {
         let cache = StreamUrlCache::default();
-        cache.store("page", YT.to_string(), at(1_000_000_000));
+        cache.store("page", Encoding::Preferred, YT.to_string(), at(1_000_000_000));
 
         assert_eq!(
-            cache.lookup("page", at(1_000_000_100)),
+            cache.lookup("page", Encoding::Preferred, at(1_000_000_100)),
             Some(YT.to_string())
         );
     }
@@ -208,26 +309,26 @@ mod tests {
     #[test]
     fn an_entry_stops_being_used_before_its_link_expires() {
         let cache = StreamUrlCache::default();
-        cache.store("page", YT.to_string(), at(1_000_000_000));
+        cache.store("page", Encoding::Preferred, YT.to_string(), at(1_000_000_000));
 
         // Inside the margin, so already treated as unusable.
         let just_before = at(2_000_000_000 - SAFETY_MARGIN.as_secs() + 1);
-        assert_eq!(cache.lookup("page", just_before), None);
+        assert_eq!(cache.lookup("page", Encoding::Preferred, just_before), None);
 
         // And comfortably before it, still fine.
         let well_before = at(2_000_000_000 - SAFETY_MARGIN.as_secs() - 60);
-        assert_eq!(cache.lookup("page", well_before), Some(YT.to_string()));
+        assert_eq!(cache.lookup("page", Encoding::Preferred, well_before), Some(YT.to_string()));
     }
 
     #[test]
     fn a_url_without_an_expiry_gets_the_default_lifetime() {
         let cache = StreamUrlCache::default();
         let plain = "https://example.test/audio.m4a";
-        cache.store("page", plain.to_string(), at(1_000));
+        cache.store("page", Encoding::Preferred, plain.to_string(), at(1_000));
 
-        assert!(cache.lookup("page", at(1_000 + 60)).is_some());
+        assert!(cache.lookup("page", Encoding::Preferred, at(1_000 + 60)).is_some());
         assert_eq!(
-            cache.lookup("page", at(1_000 + DEFAULT_TTL.as_secs() + 1)),
+            cache.lookup("page", Encoding::Preferred, at(1_000 + DEFAULT_TTL.as_secs() + 1)),
             None,
             "an unknown policy must not be trusted indefinitely"
         );
@@ -239,29 +340,29 @@ mod tests {
     fn an_almost_dead_link_is_not_treated_as_fresh() {
         let cache = StreamUrlCache::default();
         let now = at(2_000_000_000 - 10);
-        cache.store("page", YT.to_string(), now);
+        cache.store("page", Encoding::Preferred, YT.to_string(), now);
 
-        assert_eq!(cache.lookup("page", now), None);
+        assert_eq!(cache.lookup("page", Encoding::Preferred, now), None);
     }
 
     #[test]
     fn invalidating_reports_whether_anything_was_cached() {
         let cache = StreamUrlCache::default();
-        cache.store("page", YT.to_string(), at(1_000_000_000));
+        cache.store("page", Encoding::Preferred, YT.to_string(), at(1_000_000_000));
 
         assert!(cache.invalidate("page"), "there was an entry");
         assert!(!cache.invalidate("page"), "and now there is not");
-        assert_eq!(cache.lookup("page", at(1_000_000_100)), None);
+        assert_eq!(cache.lookup("page", Encoding::Preferred, at(1_000_000_100)), None);
     }
 
     /// Two tracks must not share a cached URL.
     #[test]
     fn entries_are_keyed_per_track() {
         let cache = StreamUrlCache::default();
-        cache.store("one", YT.to_string(), at(1_000_000_000));
-        cache.store("two", SC.to_string(), at(1_000_000_000));
+        cache.store("one", Encoding::Preferred, YT.to_string(), at(1_000_000_000));
+        cache.store("two", Encoding::Preferred, SC.to_string(), at(1_000_000_000));
 
-        assert_eq!(cache.lookup("one", at(1_000_000_100)), Some(YT.to_string()));
-        assert_eq!(cache.lookup("two", at(1_000_000_100)), Some(SC.to_string()));
+        assert_eq!(cache.lookup("one", Encoding::Preferred, at(1_000_000_100)), Some(YT.to_string()));
+        assert_eq!(cache.lookup("two", Encoding::Preferred, at(1_000_000_100)), Some(SC.to_string()));
     }
 }

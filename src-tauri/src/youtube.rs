@@ -517,12 +517,13 @@ pub async fn search_provider(
 /// would produce a track that plays today and fails tomorrow for no visible
 /// reason.
 ///
-/// `bestaudio[ext=m4a]` first because AAC is cheap to decode and widely
-/// available; the bare `bestaudio` fallback is usually Opus for YouTube and an
-/// HLS playlist for SoundCloud, both of which ffmpeg handles.
+/// Which encoding to ask for is the caller's decision -- see
+/// [`crate::stream_urls::Encoding`]. It is not a fixed preference because a
+/// stream that will not decode has to be retried as a different one.
 pub async fn resolve_stream_url(
     yt_dlp: &std::path::Path,
     page_url: &str,
+    encoding: crate::stream_urls::Encoding,
 ) -> Result<ResolvedStream, String> {
     // Belt and braces: the caller validates against the provider, but this is
     // the function that actually hands a string to a subprocess.
@@ -534,7 +535,7 @@ pub async fn resolve_stream_url(
         yt_dlp.to_path_buf(),
         vec![
             "-f".to_string(),
-            "bestaudio[ext=m4a]/bestaudio".to_string(),
+            encoding.selector().to_string(),
             // Print the URL instead of downloading.
             "-g".to_string(),
             // Free. yt-dlp has already done the full extraction to produce the

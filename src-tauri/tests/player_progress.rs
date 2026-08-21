@@ -1895,3 +1895,182 @@ async fn changing_track_leaves_nothing_of_the_previous_one_in_the_bar() {
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A cache copy this app cannot read back must not outlive one play.
+///
+/// The cache is written *alongside* playback by stream-copying what arrives.
+/// Interrupt that and what lands decodes cleanly right up to the damage — so
+/// nothing notices until someone seeks past it, and from then on the track is
+/// unplayable forever, because every later play finds the same file. Deleting
+/// it is the only thing that ends that; the provider still has the track.
+///
+/// Observed for real: a SoundCloud copy held 2:10 of a 2:29 song, clean to
+/// 2:00 and noise after it.
+#[tokio::test]
+async fn a_cache_copy_that_will_not_decode_is_thrown_away() {
+    let _guard = NETWORK.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-poisoned-cache");
+    let _ = std::fs::remove_dir_all(&base);
+    let cache_dir = base.join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    // Named exactly as the cache names its own files, and full of nothing
+    // ffmpeg can make sense of.
+    let poisoned = cache_dir.join("youtube-abcdefghijk.mka");
+    std::fs::write(&poisoned, vec![0x7fu8; 64 * 1024]).unwrap();
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    let track_id: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks \
+         (source, title, duration_secs, state, remote_id, remote_url) \
+         VALUES ('youtube', 'Poisoned', 149, 'saved', 'abcdefghijk', \
+                 'https://www.youtube.com/watch?v=abcdefghijk') \
+         RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        // Resolved through PATH. Without it there is no decoder, and "no
+        // ffmpeg" is a different failure that must not evict anything.
+        Some(std::path::PathBuf::from("ffmpeg")),
+        // Deliberately absent, so the retry after eviction fails immediately
+        // instead of going to the network. Eviction is what is under test.
+        Some(base.join("no-such-yt-dlp.exe")),
+        Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
+    );
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    eprintln!("errors: {errors:?}");
+
+    if errors.iter().any(|e| e.contains("Could not start ffmpeg")) {
+        eprintln!("SKIP: no ffmpeg on PATH");
+        return;
+    }
+
+    assert!(
+        !poisoned.exists(),
+        "the unreadable copy is still there, so every later play finds it too",
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A copy of ours that plays but is damaged must not survive the play.
+///
+/// This is the half a decode failure never catches. Truncate a cache copy and
+/// it decodes perfectly right up to the damage — ffmpeg exits 0 and says only
+/// `File ended prematurely` — so the song just ends early, every play, forever,
+/// and nothing ever reconsiders the file. Observed for real: a SoundCloud copy
+/// holding 2:10 of a 2:29 track.
+///
+/// The rule is the same one the write side uses. Not a comparison against the
+/// stored duration: "ended early" and "the duration metadata was wrong" are
+/// indistinguishable, and acting on that would re-download some tracks on
+/// every play forever. "ffmpeg complained" is a fact.
+#[tokio::test]
+async fn a_cache_copy_ffmpeg_complains_about_does_not_survive_the_play() {
+    let _guard = NETWORK.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-truncated-cache");
+    let _ = std::fs::remove_dir_all(&base);
+    let cache_dir = base.join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let ffmpeg = std::path::PathBuf::from("ffmpeg");
+    let whole = base.join("whole.mka");
+
+    // A real tone in the same container the cache uses.
+    let built = std::process::Command::new(&ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=4"])
+        .args(["-c:a", "aac", "-f", "matroska", "-y"])
+        .arg(&whole)
+        .status();
+
+    if !built.map(|s| s.success()).unwrap_or(false) {
+        eprintln!("SKIP: no ffmpeg on PATH");
+        return;
+    }
+
+    // Cut short exactly the way an interrupted copy is.
+    let full = std::fs::read(&whole).unwrap();
+    let cut = &full[..full.len() * 87 / 100];
+    let poisoned = cache_dir.join("youtube-abcdefghijk.mka");
+    std::fs::write(&poisoned, cut).unwrap();
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    let track_id: i64 = sqlx::query_scalar(
+        "INSERT INTO tracks \
+         (source, title, duration_secs, state, remote_id, remote_url) \
+         VALUES ('youtube', 'Cut Short', 4, 'saved', 'abcdefghijk', \
+                 'https://www.youtube.com/watch?v=abcdefghijk') \
+         RETURNING id",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        Some(ffmpeg),
+        Some(base.join("no-such-yt-dlp.exe")),
+        Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
+    );
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Long enough for the copy to play out, hit its truncated end, and be
+    // dropped. The fixture is deliberately shorter than the read-ahead so
+    // ffmpeg meets the damage while playing rather than long afterwards.
+    tokio::time::sleep(Duration::from_millis(5000)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    if errors.iter().any(|e| e.contains("No audio output device")) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    let progress = recorder.0.progress.lock().unwrap().clone();
+    eprintln!("progress: {progress:?}");
+    assert!(
+        progress.iter().any(|p| *p > 0.5),
+        "the damaged copy should still have played -- this is the case a \
+         decode failure never catches (got {progress:?})",
+    );
+
+    handle.send(PlayerCommand::Stop).unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    assert!(
+        !poisoned.exists(),
+        "the damaged copy outlived the play, so the song ends early forever",
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}

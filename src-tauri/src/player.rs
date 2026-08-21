@@ -17,7 +17,7 @@ use crate::queue::PlayerQueue;
 /// `PlayerCommand::SetRepeat` takes one and `PlayerStatus` returns one -- and
 /// a type you can be handed but cannot name is no use to a caller.
 pub use crate::queue::RepeatMode;
-use crate::stream_urls::StreamUrlCache;
+use crate::stream_urls::{Encoding, StreamUrlCache};
 
 pub const PLAYER_STATE_EVENT: &str = "player-state";
 pub const PLAYER_ERROR_EVENT: &str = "player-error";
@@ -639,6 +639,23 @@ impl<E: PlayerEvents> Coordinator<E> {
                             self.last_position = position;
                             self.emit_progress(position);
                         }
+                        // The decode could not be rebuilt from here, which is
+                        // how the AAC failure shows up mid-listen: the track
+                        // has been playing happily, and seeking asks ffmpeg to
+                        // start again at a point it will not decode.
+                        //
+                        // The engine cannot recover from that on its own -- it
+                        // holds a resolved URL and has no way to ask for
+                        // another -- so this reloads the track at the seek
+                        // target instead. The load path tries the preferred
+                        // encoding, fails the same way, and falls back. That
+                        // costs one wasted decode and turns a dead seek plus a
+                        // baffling toast into a seek that works.
+                        Err(e) if crate::transcode::is_undecodable(&e) => {
+                            self.resume_at = Some(position);
+                            let current = self.queue.current();
+                            self.start(current);
+                        }
                         Err(e) => {
                             // Some sources genuinely cannot be restarted --
                             // say so and carry on playing from where we were.
@@ -1201,8 +1218,18 @@ impl<E: PlayerEvents> Coordinator<E> {
         let prepares = self.prepares.clone();
 
         tauri::async_runtime::spawn(async move {
-            let Ok(source) =
-                resolve_track(&pool, &urls, cache.as_ref(), yt_dlp.as_deref(), track_id).await
+            // Preferred only. If it turns out not to decode, the real load
+            // discovers that and falls back; building a second decoder here to
+            // find out early would spend an ffmpeg process on a rare case.
+            let Ok(source) = resolve_track(
+                &pool,
+                &urls,
+                cache.as_ref(),
+                yt_dlp.as_deref(),
+                track_id,
+                Encoding::Preferred,
+            )
+            .await
             else {
                 return;
             };
@@ -1422,12 +1449,24 @@ async fn load_track(
     start_at: Duration,
     epoch: u64,
 ) -> Result<(), String> {
-    const ATTEMPTS: usize = 2;
+    // Enough for the whole recovery chain and no more: a poisoned cache copy
+    // is thrown away, the provider is asked again, and a stream that will not
+    // decode is asked for in another encoding. Three attempts covers all of
+    // it; a fourth would only be more seconds of silence before the same
+    // answer.
+    const MAX_ATTEMPTS: usize = 3;
 
-    let mut last_error = String::new();
+    let mut encoding = Encoding::Preferred;
 
-    for attempt in 0..ATTEMPTS {
-        let source = resolve_track(pool, urls, cache, yt_dlp, track_id).await?;
+    for attempt in 0..MAX_ATTEMPTS {
+        let source = resolve_track(pool, urls, cache, yt_dlp, track_id, encoding).await?;
+
+        // Remembered before the source is handed over, because a copy the app
+        // made itself is the one failure it can clear up rather than report.
+        let disposable = match &source {
+            PlayableSource::Cached(path) => Some(path.clone()),
+            _ => None,
+        };
 
         match engine.play(source, None, start_at, epoch).await {
             Ok(()) => return Ok(()),
@@ -1435,18 +1474,41 @@ async fn load_track(
             // only lose again, and the caller must not treat it as a fault.
             Err(e) if e == SUPERSEDED => return Err(e),
             Err(e) => {
-                last_error = e;
-
-                let stale =
-                    attempt + 1 < ATTEMPTS && forget_stream_url(pool, urls, track_id).await;
-                if !stale {
-                    break;
+                if attempt + 1 == MAX_ATTEMPTS {
+                    return Err(e);
                 }
+
+                let undecodable = crate::transcode::is_undecodable(&e);
+
+                if let Some(path) = disposable.filter(|_| undecodable) {
+                    // A copy this app wrote and cannot read back. Interrupt a
+                    // stream mid-copy and what lands decodes cleanly right up
+                    // to the damage, so nothing notices until someone seeks
+                    // past it -- and then the track is unplayable *forever*,
+                    // because every later play finds the same file.
+                    //
+                    // Deleting it costs one re-download and is the only thing
+                    // that ends that. The provider still has the track.
+                    let _ = std::fs::remove_file(&path);
+                } else if undecodable {
+                    // The stream arrived and ffmpeg would not decode it. That
+                    // is a fact about this *encoding*, not about the track --
+                    // ffmpeg's AAC decoder rejects some provider streams
+                    // outright -- so the same URL resolved again would fail
+                    // identically. Ask for a different one instead.
+                    encoding = Encoding::Alternate;
+                } else if !forget_stream_url(pool, urls, track_id).await {
+                    // Nothing cached, so staleness was not the cause and a
+                    // different encoding would not have helped either.
+                    return Err(e);
+                }
+                // Otherwise: a cached link that has since been revoked. Worth
+                // exactly one fresh resolve of the same encoding.
             }
         }
     }
 
-    Err(last_error)
+    Err("That track could not be played.".to_string())
 }
 
 async fn resolve_track(
@@ -1455,6 +1517,7 @@ async fn resolve_track(
     cache: Option<&AudioCache>,
     yt_dlp: Option<&std::path::Path>,
     track_id: i64,
+    encoding: Encoding,
 ) -> Result<crate::playable::PlayableSource, String> {
     let row = sqlx::query(
         "SELECT source, state, remote_id, local_path, remote_url FROM tracks WHERE id = ?",
@@ -1476,6 +1539,7 @@ async fn resolve_track(
         yt_dlp,
         urls,
         cache,
+        encoding,
     )
     .await
 }
@@ -1533,7 +1597,11 @@ async fn prefetch(
 
     // Already cached and still fresh costs nothing -- `resolve` returns
     // without spawning anything.
-    let _ = urls.resolve(yt_dlp, &url).await;
+    //
+    // Only the preferred encoding is warmed. A fallback is by definition the
+    // unusual case, and resolving both ahead of time would double the cost of
+    // prefetching every track to save a few seconds on the rare one.
+    let _ = urls.resolve(yt_dlp, &url, Encoding::Preferred).await;
 }
 
 struct TrackDetail {

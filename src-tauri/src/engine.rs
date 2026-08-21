@@ -583,6 +583,23 @@ pub fn build_source(
             })
         }
 
+        PlayableSource::Cached(path) => {
+            let ffmpeg = ffmpeg.ok_or(
+                "This file needs ffmpeg to play, and ffmpeg was not found. \
+                 See src-tauri/binaries/README.md.",
+            )?;
+            // Disposable: a copy this app made of a stream it already
+            // played. If ffmpeg complains while reading it back, it is
+            // thrown away rather than quietly ending the song early on
+            // every future play.
+            let source =
+                FfmpegSource::open_at(ffmpeg, FfmpegInput::Disposable(path), start_at, None)?;
+            Ok(BuiltSource {
+                starved: Some(source.starvation_flag()),
+                decoded: Box::new(source),
+            })
+        }
+
         PlayableSource::Transcoded(path) => {
             let ffmpeg = ffmpeg.ok_or(
                 "This file needs ffmpeg to play, and ffmpeg was not found. \
