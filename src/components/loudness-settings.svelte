@@ -18,7 +18,92 @@
     ];
 
     const current = $derived(player.volumeCeilingDb);
+    const on = $derived(player.normalize);
+    const gain = $derived(player.trackGainDb);
+
+    /** Signed, because the direction is the interesting half. */
+    function formatGain(db: number) {
+        const rounded = Math.round(db * 10) / 10;
+        return `${rounded > 0 ? "+" : ""}${rounded.toFixed(1)} dB`;
+    }
 </script>
+
+<SettingsSection
+    icon={AudioLinesIcon}
+    title="Even out track volume"
+    description="Measures each track and corrects it towards a common loudness."
+>
+    <div class="flex flex-col gap-3">
+        <div class="flex items-center justify-between gap-4">
+            <p class="text-muted-foreground text-[13px] leading-relaxed">
+                Tracks here come from files, YouTube and SoundCloud, mastered by
+                different people to different levels — across this library they span
+                about <span class="text-foreground font-medium">10 dB</span>, so one
+                track can arrive roughly twice as loud as the one before it.
+            </p>
+            <!--
+              Hand-built rather than a component: this is the only switch in the
+              app, and the one thing it must do is be obvious at a glance which
+              way it is set while an A/B is going on.
+            -->
+            <button
+                type="button"
+                role="switch"
+                aria-checked={on}
+                aria-label="Even out track volume"
+                class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full transition-colors {on
+                    ? 'bg-primary'
+                    : 'bg-muted-foreground/30'}"
+                onclick={() => player.setNormalize(!on)}
+            >
+                <span
+                    class="bg-background inline-block size-5 rounded-full shadow-sm transition-transform {on
+                        ? 'translate-x-[22px]'
+                        : 'translate-x-0.5'}"
+                ></span>
+            </button>
+        </div>
+
+        <p class="text-muted-foreground text-[13px] leading-relaxed">
+            Each track is measured once, in the background, and played back at a gain
+            that brings it towards
+            <span class="text-foreground font-medium">−14 LUFS</span> — the level
+            YouTube and Spotify use. The gain is decided when the track starts and
+            never moves while it plays, so this is a volume correction and not a
+            compressor. Nothing is filtered.
+        </p>
+
+        <p class="text-muted-foreground text-[13px] leading-relaxed">
+            One case cannot be corrected: measuring means decoding a whole track, so a
+            stream you play for the very first time is heard before it can be
+            measured. It plays as mastered, gets measured from the copy kept
+            afterwards, and is corrected from the next play on. Files on disk are
+            measured in the background and are corrected from the start.
+        </p>
+
+        {#if on}
+            <!-- The readout is the point of the toggle: switching it while a
+                 track plays is how you check whether it is doing anything, and
+                 a number makes "did that change?" answerable. -->
+            <p class="text-xs">
+                {#if gain === null}
+                    <span class="text-muted-foreground">
+                        This track has not been measured yet — playing as mastered.
+                    </span>
+                {:else if Math.abs(gain) < 0.05}
+                    <span class="text-muted-foreground">
+                        This track is already at the target — no correction.
+                    </span>
+                {:else}
+                    <span class="text-muted-foreground">This track:</span>
+                    <span class="text-foreground font-medium tabular-nums"
+                        >{formatGain(gain)}</span
+                    >
+                {/if}
+            </p>
+        {/if}
+    </div>
+</SettingsSection>
 
 <SettingsSection
     icon={AudioLinesIcon}
@@ -26,33 +111,10 @@
     description="How loud this app is allowed to get with the slider all the way up."
 >
     <div class="flex flex-col gap-3">
-        <!--
-          The explanation is the feature.
-
-          This app cannot level tracks the way a streaming service does, and
-          pretending otherwise with a vague setting would be worse than saying
-          nothing. So the panel says what is actually happening, with the
-          numbers, and offers the one control that honestly follows from it.
-        -->
         <p class="text-muted-foreground text-[13px] leading-relaxed">
-            Your tracks come from files, YouTube and SoundCloud, mastered by different
-            people to different levels — across this library they span about
-            <span class="text-foreground font-medium">10 dB</span>, which means one
-            track can arrive roughly twice as loud as the one before it. Spotify and
-            YouTube measure every track and even them out before you hear a note. This
-            app plays what it is given.
-        </p>
-        <p class="text-muted-foreground text-[13px] leading-relaxed">
-            It cannot do the same, and the reason is worth knowing: measuring a track
-            means decoding all of it, so a song streamed for the first time would have
-            to be heard before it could be measured — which is exactly the moment a
-            loud one catches you out. YouTube publishes its own measurement, but
-            <code class="text-[12px]">yt-dlp</code> does not pass it on, and patching
-            that would be undone by its next update.
-        </p>
-        <p class="text-muted-foreground text-[13px] leading-relaxed">
-            So instead of guessing, this lets you set the worst case yourself. Nothing
-            is compressed or filtered — the whole slider simply stops lower.
+            Independent of the setting above: this is the ceiling the slider reaches,
+            whether or not tracks are being evened out. Nothing is compressed or
+            filtered — the whole slider simply stops lower.
         </p>
 
         <div class="flex flex-wrap items-center gap-2 pt-1">

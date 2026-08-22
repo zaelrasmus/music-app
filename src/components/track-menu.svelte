@@ -16,6 +16,8 @@
     import LibraryBigIcon from "@lucide/svelte/icons/library-big";
     import BookmarkPlusIcon from "@lucide/svelte/icons/bookmark-plus";
     import LoaderIcon from "@lucide/svelte/icons/loader-circle";
+    import AudioLinesIcon from "@lucide/svelte/icons/audio-lines";
+    import { loudnessStore } from "$lib/loudness.svelte";
     import type { Snippet } from "svelte";
 
     /**
@@ -91,6 +93,9 @@
     const downloading = $derived(
         track !== null && trackStore.isDownloading(track.id),
     );
+
+    /** A search result has no track yet, so it cannot have been measured. */
+    const measured = $derived(!!track && loudnessStore.isMeasured(track.id));
 
     async function run(action: (trackId: number) => Promise<unknown>) {
         busy = true;
@@ -172,6 +177,16 @@
         <DropdownMenu.Item onSelect={() => run((id) => player.addToQueue(id))}>
             <ListPlusIcon />
             Add to queue
+        </DropdownMenu.Item>
+
+        <!--
+          Offered whether or not levelling is switched on: measuring is what
+          makes the switch worth trying, and the background pass takes minutes
+          to reach any particular track.
+        -->
+        <DropdownMenu.Item onSelect={() => run((id) => loudnessStore.measure(id))}>
+            <AudioLinesIcon />
+            {measured ? "Measure loudness again" : "Measure loudness"}
         </DropdownMenu.Item>
 
         <DropdownMenu.Separator />

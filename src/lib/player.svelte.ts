@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { toast } from "svelte-sonner";
 import { readSetting, writeSetting } from "$lib/settings.svelte";
 import { cacheStore } from "$lib/cache.svelte";
+import { loudnessStore } from "$lib/loudness.svelte";
 import { historyStore } from "$lib/history.svelte";
 
 export type PlaybackState = "loading" | "playing" | "paused" | "stopped";
@@ -29,6 +30,14 @@ export type PlayerStatus = {
   volumeCeilingDb: number;
   /** The stream has run dry without ending: the connection is not keeping up. */
   stalled: boolean;
+  /** Whether per-track loudness correction is on. */
+  normalize: boolean;
+  /**
+   * What the current track is being corrected by, in dB. `null` means it has
+   * not been measured yet — the honest state for a stream nobody has finished
+   * playing once — and is distinct from a measured correction of zero.
+   */
+  trackGainDb: number | null;
 };
 
 export type PlayerProgress = {
@@ -59,6 +68,8 @@ class PlayerStore {
   manualLength = $state(0);
   loopQueue = $state(false);
   volumeCeilingDb = $state(0);
+  normalize = $state(false);
+  trackGainDb = $state<number | null>(null);
   stalled = $state(false);
 
   /** Authoritative position from the backend, in seconds. */
@@ -102,6 +113,8 @@ class PlayerStore {
       this.manualLength = s.manualLength;
       this.loopQueue = s.loopQueue;
       this.volumeCeilingDb = s.volumeCeilingDb;
+      this.normalize = s.normalize;
+      this.trackGainDb = s.trackGainDb;
       this.stalled = s.stalled;
 
       // Leaving a track is when one most often becomes cached, so this is the
@@ -120,6 +133,8 @@ class PlayerStore {
         // longer playing, and leaving the flag set would freeze the bar.
         this.scrubbing = false;
         void cacheStore.refreshCached();
+        // The background pass may have measured things since the last track.
+        void loudnessStore.refresh();
         // The track just left may have become a history entry; the backend
         // decides whether it counted, so ask rather than guess.
         void historyStore.load();
@@ -202,7 +217,7 @@ class PlayerStore {
 
   /** Restores persisted preferences and pushes them to the backend. */
   async restorePreferences() {
-    const [volume, muted, repeat, shuffle, ceiling] = await Promise.all([
+    const [volume, muted, repeat, shuffle, ceiling, normalize] = await Promise.all([
       readSetting("volume", 1),
       readSetting("muted", false),
       readSetting<RepeatMode>("repeat", "off"),
@@ -211,6 +226,9 @@ class PlayerStore {
       // Choosing a quieter default for everyone is the mistake this
       // setting exists to undo.
       readSetting("volumeCeilingDb", 0),
+      // Off by default: it changes how every track sounds, so it should be a
+      // thing someone turned on rather than something that happened to them.
+      readSetting("normalizeLoudness", false),
     ]);
 
     await Promise.all([
@@ -219,6 +237,7 @@ class PlayerStore {
       invoke("set_repeat", { mode: repeat }),
       invoke("set_shuffle", { shuffle }),
       invoke("set_volume_ceiling", { db: ceiling }),
+      invoke("set_normalize", { on: normalize }),
     ]);
   }
 
@@ -275,6 +294,30 @@ class PlayerStore {
 
   async stop() {
     await this.run("stop");
+  }
+
+  /**
+   * Live while the volume slider is being dragged.
+   *
+   * Moves the audio and nothing else. `setVolume` persists, and persisting
+   * means `store.save()`, which is a synchronous flush to settings.json --
+   * fine once on release, wrong on every pointermove. `ScrubBar` says as much
+   * in its own docs: `onScrub` is for cheap operations, `onCommit` is "the one
+   * that costs something".
+   */
+  async previewVolume(volume: number) {
+    await this.run("set_volume", { volume });
+  }
+
+  /**
+   * Turns per-track loudness correction on or off.
+   *
+   * Applies to the track already playing, which is deliberate: judging this by
+   * ear needs the same passage both ways, not a restart.
+   */
+  async setNormalize(on: boolean) {
+    await this.run("set_normalize", { on });
+    await writeSetting("normalizeLoudness", on);
   }
 
   async setVolume(volume: number) {

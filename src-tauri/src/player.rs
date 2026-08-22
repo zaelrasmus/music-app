@@ -84,9 +84,14 @@ const PREVIEW_LIMIT: usize = 50;
 /// across the same travel is 0.56 dB per percent against forty's 0.36. Wider
 /// range, coarser control, and every correction between songs overshoots.
 ///
-/// Forty puts -29 dB at slider 0.3 and -22 dB at slider 0.5, which is within
+/// Forty puts -28 dB at slider 0.3 and -20 dB at slider 0.5, which is within
 /// three decibels of the curve this shipped with and was not complained
 /// about.
+///
+/// Those two numbers read -29 and -22 until 2026-08-22; they were measured when
+/// the ceiling was -4 dB and went stale when it returned to unity. The whole
+/// curve is printed by `volume_curve_report::print_the_volume_curve`, which is
+/// where to check rather than trusting this paragraph.
 const MIN_DB: f32 = -40.0;
 
 /// Where the top of the slider sits by default, in decibels.
@@ -208,6 +213,12 @@ pub struct PlayerStatus {
     pub loop_queue: bool,
     /// The chosen ceiling in decibels; 0.0 means the audio is passed through.
     pub volume_ceiling_db: f32,
+    /// Whether per-track loudness correction is on.
+    pub normalize: bool,
+    /// What the current track is being corrected by, in dB. `null` means it has
+    /// not been measured yet, which is distinct from a measured correction of
+    /// zero.
+    pub track_gain_db: Option<f32>,
     /// The stream has run dry without ending -- the connection has stopped
     /// keeping up. Distinct from loading, which is a track that has not
     /// started yet.
@@ -306,6 +317,8 @@ pub enum PlayerCommand {
     SetKeepAbandoned(bool),
     /// Lower the top of the slider, in decibels below unity.
     SetVolumeCeiling(f32),
+    /// Whether to correct each track towards a common loudness.
+    SetNormalize(bool),
     Seek(f64),
 }
 
@@ -400,6 +413,20 @@ struct Coordinator<E: PlayerEvents> {
     muted: bool,
     /// The top of the slider, in decibels. Chosen by the listener.
     ceiling_db: f32,
+    /// Whether per-track loudness correction is applied.
+    ///
+    /// Off by default and switchable while playing, because the only honest way
+    /// to judge it is to hear the same track both ways without restarting.
+    normalize: bool,
+    /// The correction for the track currently loaded, in decibels.
+    ///
+    /// Decided once, when the track starts, and never moved while it plays --
+    /// a gain that drifts mid-song is a compressor, not a volume control.
+    /// `None` when nothing is known about the track yet, which is the first
+    /// play of a stream nobody has heard. Deliberately distinct from
+    /// `Some(0.0)`, which is a track measured and found to already sit at the
+    /// target -- the UI needs to tell "not measured" from "no correction".
+    track_gain_db: Option<f32>,
     /// Incremented on every start. The engine echoes it back so a `Finished`
     /// for a track we already moved past can be discarded.
     epoch: u64,
@@ -483,6 +510,10 @@ pub fn spawn<E: PlayerEvents>(
             loaded: None,
             volume: 1.0,
             ceiling_db: DEFAULT_CEILING_DB,
+            // Off until asked for. The frontend restores the saved choice at
+            // startup the same way it restores volume.
+            normalize: false,
+            track_gain_db: None,
             muted: false,
             epoch: 0,
             engine: Arc::new(engine),
@@ -669,6 +700,16 @@ impl<E: PlayerEvents> Coordinator<E> {
 
             PlayerCommand::SetMuted(muted) => {
                 self.muted = muted;
+                self.apply_volume();
+            }
+            PlayerCommand::SetNormalize(on) => {
+                self.normalize = on;
+                // Re-read rather than trusting a stale figure: switching this on
+                // mid-track is the whole point, and the reading may have landed
+                // since the track started.
+                if let Some(track_id) = self.loaded {
+                    self.track_gain_db = self.track_gain_for(track_id).await;
+                }
                 self.apply_volume();
             }
 
@@ -992,6 +1033,9 @@ impl<E: PlayerEvents> Coordinator<E> {
                 self.state = PlaybackState::Playing;
                 self.stalled = false;
                 self.stalled_since = None;
+                // Before `apply_volume`, so the track starts at its own level
+                // rather than at the previous track's for a poll interval.
+                self.track_gain_db = self.track_gain_for(outcome.track_id).await;
                 self.apply_volume();
                 // Set the bar immediately; the first tick is up to a poll
                 // interval away, and for a resume starting from zero would
@@ -1344,9 +1388,35 @@ impl<E: PlayerEvents> Coordinator<E> {
         self.report(self.engine.stop(self.epoch));
     }
 
+    /// The slider, times the track's own correction.
+    ///
+    /// Two independent decisions multiplied, rather than one blended number:
+    /// the slider is where the listener put it and must keep meaning that, and
+    /// the correction belongs to the track. Anything that would clip is caught
+    /// by the look-ahead limiter in `engine.rs`, which is what makes a *boost*
+    /// safe to apply at all.
     fn apply_volume(&self) {
-        let linear = slider_to_linear(self.volume, self.muted, self.ceiling_db);
-        self.report(self.engine.set_volume(linear));
+        let slider = slider_to_linear(self.volume, self.muted, self.ceiling_db);
+        let correction = if self.normalize {
+            rodio::math::db_to_linear(self.track_gain_db.unwrap_or(0.0))
+        } else {
+            1.0
+        };
+        self.report(self.engine.set_volume(slider * correction));
+    }
+
+    /// Looks up what the track currently loading should be played at.
+    ///
+    /// Zero when there is no reading yet -- a stream nobody has finished once,
+    /// or a local file the analyser has not reached. Unnormalised is the right
+    /// fallback: it is what the app did before this existed.
+    ///
+    /// `&mut self` for the same reason as [`Self::emit_queue`]: a shared
+    /// reference held across an await makes the whole future require `Sync`,
+    /// and the prepared decoder is `Send` but not `Sync`.
+    async fn track_gain_for(&mut self, track_id: i64) -> Option<f32> {
+        let measured = crate::loudness::stored(&self.pool, track_id).await?;
+        Some(crate::loudness::gain_db(measured, crate::loudness::TARGET_LUFS))
     }
 
     /// Surfaces an engine failure to the UI. Returns whether it succeeded.
@@ -1380,6 +1450,8 @@ impl<E: PlayerEvents> Coordinator<E> {
             manual_length: self.queue.manual_len(),
             loop_queue: self.queue.loops_manual(),
             volume_ceiling_db: self.ceiling_db,
+            normalize: self.normalize,
+            track_gain_db: self.track_gain_db,
             stalled: self.stalled,
         });
     }
@@ -1891,6 +1963,15 @@ pub async fn set_volume_ceiling(
     player.send(PlayerCommand::SetVolumeCeiling(db))
 }
 
+/// Turns per-track loudness correction on or off.
+///
+/// Takes effect on the track already playing, not just the next one -- the only
+/// way to judge whether it helps is to hear the same passage both ways.
+#[tauri::command]
+pub async fn set_normalize(on: bool, player: State<'_, PlayerHandle>) -> Result<(), String> {
+    player.send(PlayerCommand::SetNormalize(on))
+}
+
 #[tauri::command]
 pub async fn set_shuffle(shuffle: bool, player: State<'_, PlayerHandle>) -> Result<(), String> {
     player.send(PlayerCommand::SetShuffle(shuffle))
@@ -2083,5 +2164,50 @@ mod tests {
         assert!(PlayerCommand::SetShuffle(true).affects_queue());
         assert!(PlayerCommand::SetRepeat(RepeatMode::All).affects_queue());
         assert!(PlayerCommand::AddToQueue(1).affects_queue());
+    }
+}
+
+#[cfg(test)]
+mod volume_curve_report {
+    use super::*;
+
+    /// Prints what every position of the volume slider actually does.
+    ///
+    /// The slider has 20 stops (`step={0.05}` in `player-bar.svelte`), so this
+    /// is the whole control, not a sample of it. Kept as a test rather than a
+    /// comment because the numbers move whenever `MIN_DB` or the ceiling does,
+    /// and a stale table is worse than none -- the doc on `MIN_DB` still quotes
+    /// "-29 dB at slider 0.3", which was true when the ceiling was -4 dB.
+    #[test]
+    #[ignore = "diagnostic, prints a table"]
+    fn print_the_volume_curve() {
+        for ceiling in [DEFAULT_CEILING_DB, -6.0, MIN_CEILING_DB] {
+            println!("\n--- ceiling {ceiling:.0} dB ---");
+            println!("{:>8} {:>10} {:>12} {:>14}", "slider", "dB", "amplitude", "step from last");
+            let mut previous: Option<f32> = None;
+            for step in 0..=20 {
+                let slider = step as f32 / 20.0;
+                let linear = slider_to_linear(slider, false, ceiling);
+                let db = if linear > 0.0 {
+                    rodio::math::linear_to_db(linear)
+                } else {
+                    f32::NEG_INFINITY
+                };
+                let delta = match (previous, linear > 0.0) {
+                    (Some(p), true) => format!("{:+.2} dB", db - p),
+                    _ => "-".to_string(),
+                };
+                println!(
+                    "{:>7.0}% {:>10.1} {:>12.5} {:>14}",
+                    slider * 100.0,
+                    db,
+                    linear,
+                    delta
+                );
+                if linear > 0.0 {
+                    previous = Some(db);
+                }
+            }
+        }
     }
 }

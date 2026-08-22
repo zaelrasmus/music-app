@@ -11,6 +11,8 @@
     import PlayingBars from "$components/playing-bars.svelte";
     import { coverSeed } from "$lib/cover";
     import { cacheStore } from "$lib/cache.svelte";
+    import { loudnessStore } from "$lib/loudness.svelte";
+    import LoaderIcon from "@lucide/svelte/icons/loader-circle";
     import { player } from "$lib/player.svelte";
     import { trackStore, type Track } from "$lib/tracks.svelte";
     import { tagStore } from "$lib/tags.svelte";
@@ -450,6 +452,32 @@
                             durationSecs={track.durationSecs}
                             cached={cacheStore.isCached(track.id)}
                         />
+                        <!--
+                          Only while levelling is on. Measured-or-not is a fact
+                          about every row, but it only *means* anything when
+                          something is using it, and a badge on a thousand rows
+                          that changes nothing is noise.
+                        -->
+                        {#if player.normalize}
+                            {#if loudnessStore.isMeasuring(track.id)}
+                                <LoaderIcon
+                                    class="size-3 shrink-0 animate-spin"
+                                    aria-label="Measuring loudness"
+                                />
+                            {:else if loudnessStore.isMeasured(track.id)}
+                                <CheckIcon
+                                    class="size-3 shrink-0 text-emerald-500"
+                                    aria-label="Loudness measured"
+                                />
+                            {:else}
+                                <span
+                                    class="text-muted-foreground/50 shrink-0 text-[10px]"
+                                    title="Not measured yet — plays as mastered"
+                                >
+                                    ·
+                                </span>
+                            {/if}
+                        {/if}
                     </span>
                 </span>
             </button>

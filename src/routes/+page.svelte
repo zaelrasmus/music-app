@@ -6,6 +6,7 @@
     import { player } from "$lib/player.svelte";
     import { providerSearch } from "$lib/provider-search.svelte";
     import { cacheStore } from "$lib/cache.svelte";
+    import { loudnessStore } from "$lib/loudness.svelte";
     import { historyStore } from "$lib/history.svelte";
     import { playlistStore } from "$lib/playlists.svelte";
     import { tagStore } from "$lib/tags.svelte";
@@ -36,6 +37,7 @@
         libraryView.restore();
         providerSearch.loadProviders();
         cacheStore.restore();
+        loudnessStore.refresh();
         historyStore.load();
         covers.load();
         ytDlp.refresh();

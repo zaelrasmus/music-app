@@ -6,6 +6,7 @@ mod download;
 mod downloads;
 mod engine;
 mod library;
+mod loudness;
 mod playable;
 pub mod playlists;
 pub mod player;
@@ -145,6 +146,23 @@ pub fn run() {
                 });
             }
 
+            // Measures per-track loudness in the background, so playback can
+            // level one track against another.
+            //
+            // A slow poll rather than a hook on the scanner, because work
+            // arrives from two unrelated places -- a library scan, and a stream
+            // finishing and leaving a copy in the audio cache -- and neither is
+            // urgent: by the time a stream is measurable it has already played
+            // once.
+            {
+                let pool = pool.clone();
+                let ffmpeg = ffmpeg.clone();
+                let cache = audio_cache.clone();
+                tauri::async_runtime::spawn(async move {
+                    loudness::run(pool, ffmpeg, Some(cache)).await;
+                });
+            }
+
             app.manage(player::spawn(
                 app.handle().clone(),
                 pool,
@@ -248,6 +266,9 @@ pub fn run() {
             player::set_shuffle,
             player::set_loop_queue,
             player::set_volume_ceiling,
+            player::set_normalize,
+            loudness::measure_track,
+            loudness::measured_track_ids,
             player::seek,
             audio_cache::audio_cache_stats,
             audio_cache::set_audio_cache_limit,

@@ -347,7 +347,8 @@
             step={0.05}
             label="Volume"
             valueText="{Math.round((player.muted ? 0 : player.volume) * 100)}%"
-            onScrub={(v) => player.setVolume(v)}
+            onScrub={(v) => player.previewVolume(v)}
+            onCommit={(v) => player.setVolume(v)}
         />
 
         <div class="ml-2 flex shrink-0 items-center gap-1">
