@@ -89,26 +89,30 @@ const PREVIEW_LIMIT: usize = 50;
 /// about.
 const MIN_DB: f32 = -40.0;
 
-/// Headroom at the top of the slider, in decibels.
+/// Where the top of the slider sits by default, in decibels.
 ///
-/// The top used to be unity, on the reasoning that a player which quietly
-/// attenuates at maximum has no answer left for a quietly mastered track.
-/// That reasoning assumed the samples fit in the box. Measured against this
-/// library, they do not: a lossy decode to f32 is not clamped, and brick-walled
-/// masters routinely reconstruct above full scale. 23 of the 26 cached streams
-/// and 10 of 12 sampled local files peak *over* 0 dBFS, the worst at +3.18 dB
-/// -- a sample value of 1.44.
+/// Unity, after a detour. It was briefly -4 dB, because a lossy decode to f32
+/// is not clamped and brick-walled masters reconstruct above full scale, where
+/// the device hard-clips them. The headroom did fix that, but it was the wrong
+/// instrument: counted over this library, the worst track exceeds full scale on
+/// 169 samples out of 13 million and a well-mastered one on none at all, so
+/// every track was being attenuated to round off a handful of samples in a few.
+/// Clipping is now caught by the limiter in `engine.rs`, which touches only what
+/// would have been chopped off.
 ///
-/// At unity those samples are handed to the device untouched and hard-clipped
-/// there, which is harmonic distortion on exactly the loudest transients. That
-/// is what makes the top of the slider hurt rather than merely being loud, and
-/// it is why it only hurts near the top: below slider 0.95 the attenuation
-/// already pulls the peaks back under full scale.
+/// The number stays adjustable because the *other* reason to want headroom is
+/// real and cannot be solved here: this library spans about ten decibels of
+/// mastered loudness, and no single curve makes a -6 LUFS master and a -13 LUFS
+/// master both comfortable. That is arithmetic, not tuning. What a ceiling can
+/// honestly offer is a worst case the listener chooses for themselves --
+/// see `MIN_CEILING_DB`.
+const DEFAULT_CEILING_DB: f32 = 0.0;
+
+/// The quietest the ceiling may be set to.
 ///
-/// Four decibels covers the worst peak measured with room to spare. The cost
-/// is that maximum is a little quieter than it was; the alternative is a player
-/// that distorts on most of its own library.
-const MAX_DB: f32 = -4.0;
+/// Twelve decibels is already a quarter of the amplitude, and past it the
+/// slider stops being a volume control and starts being a fault.
+const MIN_CEILING_DB: f32 = -12.0;
 
 /// How far into a track it must have been left for the position to survive a
 /// restart.
@@ -151,7 +155,13 @@ fn resume_position(saved: f64, duration: Option<f64>) -> f64 {
     }
 }
 
-fn slider_to_linear(slider: f32, muted: bool) -> f32 {
+/// Maps the slider onto a gain, with `ceiling_db` as the top of the range.
+///
+/// The ceiling compresses the range rather than attenuating on top of it, so
+/// lowering it keeps the whole travel usable instead of pushing everything
+/// towards the bottom stop -- which is the mistake that made a -60 dB range
+/// unusable in the first place.
+fn slider_to_linear(slider: f32, muted: bool, ceiling_db: f32) -> f32 {
     if muted {
         return 0.0;
     }
@@ -161,7 +171,8 @@ fn slider_to_linear(slider: f32, muted: bool) -> f32 {
         // slider must be silent.
         return 0.0;
     }
-    rodio::math::db_to_linear(MAX_DB - (MAX_DB - MIN_DB) * (1.0 - slider))
+    let ceiling = ceiling_db.clamp(MIN_CEILING_DB, 0.0);
+    rodio::math::db_to_linear(ceiling - (ceiling - MIN_DB) * (1.0 - slider))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -195,6 +206,8 @@ pub struct PlayerStatus {
     pub manual_length: usize,
     /// Whether the queue recycles instead of draining.
     pub loop_queue: bool,
+    /// The chosen ceiling in decibels; 0.0 means the audio is passed through.
+    pub volume_ceiling_db: f32,
     /// The stream has run dry without ending -- the connection has stopped
     /// keeping up. Distinct from loading, which is a track that has not
     /// started yet.
@@ -291,6 +304,8 @@ pub enum PlayerCommand {
     /// Play the queued tracks round and round instead of consuming them.
     SetLoopQueue(bool),
     SetKeepAbandoned(bool),
+    /// Lower the top of the slider, in decibels below unity.
+    SetVolumeCeiling(f32),
     Seek(f64),
 }
 
@@ -303,7 +318,10 @@ impl PlayerCommand {
     fn affects_queue(&self) -> bool {
         !matches!(
             self,
-            PlayerCommand::SetVolume(_) | PlayerCommand::SetMuted(_) | PlayerCommand::Seek(_)
+            PlayerCommand::SetVolume(_)
+                | PlayerCommand::SetMuted(_)
+                | PlayerCommand::SetVolumeCeiling(_)
+                | PlayerCommand::Seek(_)
         )
     }
 }
@@ -380,6 +398,8 @@ struct Coordinator<E: PlayerEvents> {
     loaded: Option<i64>,
     volume: f32,
     muted: bool,
+    /// The top of the slider, in decibels. Chosen by the listener.
+    ceiling_db: f32,
     /// Incremented on every start. The engine echoes it back so a `Finished`
     /// for a track we already moved past can be discarded.
     epoch: u64,
@@ -462,6 +482,7 @@ pub fn spawn<E: PlayerEvents>(
             state: PlaybackState::Stopped,
             loaded: None,
             volume: 1.0,
+            ceiling_db: DEFAULT_CEILING_DB,
             muted: false,
             epoch: 0,
             engine: Arc::new(engine),
@@ -656,6 +677,12 @@ impl<E: PlayerEvents> Coordinator<E> {
             PlayerCommand::SetShuffle(on) => self.queue.set_shuffle(on),
 
             PlayerCommand::SetLoopQueue(on) => self.queue.set_loop_manual(on),
+            PlayerCommand::SetVolumeCeiling(db) => {
+                self.ceiling_db = db.clamp(MIN_CEILING_DB, 0.0);
+                // Heard immediately: a ceiling that only took effect on the
+                // next track would look like it had done nothing.
+                self.apply_volume();
+            }
 
             PlayerCommand::SetKeepAbandoned(enabled) => self.keep_abandoned = enabled,
 
@@ -1318,7 +1345,7 @@ impl<E: PlayerEvents> Coordinator<E> {
     }
 
     fn apply_volume(&self) {
-        let linear = slider_to_linear(self.volume, self.muted);
+        let linear = slider_to_linear(self.volume, self.muted, self.ceiling_db);
         self.report(self.engine.set_volume(linear));
     }
 
@@ -1352,6 +1379,7 @@ impl<E: PlayerEvents> Coordinator<E> {
             context_position: self.queue.context_position(),
             manual_length: self.queue.manual_len(),
             loop_queue: self.queue.loops_manual(),
+            volume_ceiling_db: self.ceiling_db,
             stalled: self.stalled,
         });
     }
@@ -1846,6 +1874,23 @@ pub async fn set_loop_queue(on: bool, player: State<'_, PlayerHandle>) -> Result
     player.send(PlayerCommand::SetLoopQueue(on))
 }
 
+/// Lowers the top of the volume slider, in decibels below unity.
+///
+/// Offered because the app cannot solve the problem it exists for. Tracks come
+/// from files, YouTube and SoundCloud, mastered by different people to
+/// different levels: measured across this library, integrated loudness spans
+/// about ten decibels. Streaming services level every track before you hear it;
+/// this app plays what it is given. So a track can arrive far louder than the
+/// one before it, and the honest answer is to let the listener decide what the
+/// loudest possible moment is allowed to be.
+#[tauri::command]
+pub async fn set_volume_ceiling(
+    db: f32,
+    player: State<'_, PlayerHandle>,
+) -> Result<(), String> {
+    player.send(PlayerCommand::SetVolumeCeiling(db))
+}
+
 #[tauri::command]
 pub async fn set_shuffle(shuffle: bool, player: State<'_, PlayerHandle>) -> Result<(), String> {
     player.send(PlayerCommand::SetShuffle(shuffle))
@@ -1917,32 +1962,32 @@ mod tests {
         assert_eq!(resume_position(1200.0, None), 0.0);
     }
 
-    /// The top of the slider is the headroom, not unity.
+    /// The top of the slider passes the audio through untouched.
     ///
-    /// Deliberately pinned: this is the number that decides whether the loudest
-    /// moment of a track survives or is clipped by the device, so it should not
-    /// drift without someone reading why it is what it is.
+    /// Deliberately pinned. Attenuating here is the tempting fix for anything
+    /// that sounds too loud, and it is nearly always the wrong one: it makes
+    /// every well-mastered track quieter than other players to solve a problem
+    /// belonging to a handful of samples in a few tracks. Clipping is the
+    /// limiter's job, not the slider's.
     #[test]
-    fn the_top_of_the_slider_leaves_headroom() {
-        let expected = rodio::math::db_to_linear(MAX_DB);
-        assert!((slider_to_linear(1.0, false) - expected).abs() < 1e-4);
-        assert!(slider_to_linear(1.0, false) < 1.0);
+    fn the_top_of_the_slider_is_unity() {
+        assert!((slider_to_linear(1.0, false, DEFAULT_CEILING_DB) - 1.0).abs() < 1e-4);
     }
 
     #[test]
     fn the_bottom_of_the_slider_is_truly_silent() {
         // -40 dB is quiet but audible, so zero must be special-cased.
-        assert_eq!(slider_to_linear(0.0, false), 0.0);
+        assert_eq!(slider_to_linear(0.0, false, DEFAULT_CEILING_DB), 0.0);
     }
 
     #[test]
     fn muting_silences_regardless_of_the_slider() {
-        assert_eq!(slider_to_linear(1.0, true), 0.0);
+        assert_eq!(slider_to_linear(1.0, true, DEFAULT_CEILING_DB), 0.0);
     }
 
     #[test]
     fn the_curve_is_perceptual_not_linear() {
-        let half = slider_to_linear(0.5, false);
+        let half = slider_to_linear(0.5, false, DEFAULT_CEILING_DB);
         // A linear mapping would give 0.5 here, which sounds barely quieter.
         assert!(half < 0.2, "midpoint should be well below half amplitude");
         assert!(half > 0.01, "but still clearly audible");
@@ -1952,14 +1997,14 @@ mod tests {
     /// somewhere you can adjust, not pinned against the bottom stop.
     #[test]
     fn a_comfortable_level_sits_in_the_middle_of_the_travel() {
-        // Not a guess this time. At -32 dB -- what the sixty-decibel range put
+        // Not a guess. At -32 dB -- what the sixty-decibel range put
         // at slider 0.5 -- tracks were reported as too quiet to listen to, and
         // the curve this shipped with put -20 dB there and was not. So a real
         // listening level is around -20, and that is what has to sit mid-travel.
         let comfortable = rodio::math::db_to_linear(-20.0);
 
         let mut slider = 0.0f32;
-        while slider < 1.0 && slider_to_linear(slider, false) < comfortable {
+        while slider < 1.0 && slider_to_linear(slider, false, DEFAULT_CEILING_DB) < comfortable {
             slider += 0.01;
         }
 
@@ -1969,29 +2014,55 @@ mod tests {
         );
     }
 
-    /// The reason the top is no longer unity.
-    ///
-    /// A lossy decode to f32 is not clamped, so a brick-walled master
-    /// reconstructs above full scale. Measured with the bundled ffmpeg over
-    /// every cached stream and a sample of local files, the worst peak in this
-    /// library is +3.18 dBFS. Anything the slider can reach must leave that
-    /// much room, or the device clips it.
+    /// A ceiling has to actually cap the loudest the app can be, or it is
+    /// decoration on a settings page.
     #[test]
-    fn the_loudest_measured_track_does_not_clip_at_full_slider() {
-        let worst_peak = rodio::math::db_to_linear(3.18);
-        let output = worst_peak * slider_to_linear(1.0, false);
+    fn the_ceiling_decides_the_loudest_the_app_can_get() {
+        for ceiling in [0.0f32, -3.0, -6.0, -12.0] {
+            let top = slider_to_linear(1.0, false, ceiling);
+            let expected = rodio::math::db_to_linear(ceiling);
 
+            assert!(
+                (top - expected).abs() < 1e-4,
+                "a ceiling of {ceiling} dB produced {top}, not {expected}",
+            );
+        }
+    }
+
+    /// The mistake this is designed around.
+    ///
+    /// Lowering the ceiling must compress the range, not shift it down. A -60 dB
+    /// range once put -43 dB at slider 0.3 and made half the travel inaudible;
+    /// attenuating on top of the existing curve would recreate exactly that,
+    /// one setting at a time.
+    #[test]
+    fn lowering_the_ceiling_does_not_strand_the_bottom_of_the_slider() {
+        let full = rodio::math::linear_to_db(slider_to_linear(0.3, false, 0.0));
+        let capped = rodio::math::linear_to_db(slider_to_linear(0.3, false, -12.0));
+
+        // Twelve decibels off the top should cost far less than twelve at 30%.
+        let lost = full - capped;
         assert!(
-            output <= 1.0,
-            "full slider sends {output} to the device, which clips above 1.0",
+            lost < 6.0,
+            "a 12 dB ceiling cost {lost} dB at slider 0.3, which is a shift, not a cap",
         );
+        assert!(lost > 0.0, "the ceiling did nothing at slider 0.3");
+    }
+
+    /// A setting that arrives from the frontend as anything at all.
+    #[test]
+    fn an_out_of_range_ceiling_cannot_silence_or_amplify() {
+        // Above unity would mean amplifying, which is where clipping lives.
+        assert!(slider_to_linear(1.0, false, 40.0) <= 1.0 + 1e-4);
+        // Far below the floor would leave nothing audible at any position.
+        assert!(slider_to_linear(1.0, false, -400.0) > 0.0);
     }
 
     #[test]
     fn the_curve_rises_monotonically() {
         let mut previous = -1.0;
         for step in 0..=20 {
-            let value = slider_to_linear(step as f32 / 20.0, false);
+            let value = slider_to_linear(step as f32 / 20.0, false, DEFAULT_CEILING_DB);
             assert!(value > previous, "volume must never dip as the slider rises");
             previous = value;
         }

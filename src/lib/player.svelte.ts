@@ -25,6 +25,8 @@ export type PlayerStatus = {
   manualLength: number;
   /** Whether the queue recycles instead of draining. */
   loopQueue: boolean;
+  /** The chosen top of the slider, in dB below unity. 0 passes audio through. */
+  volumeCeilingDb: number;
   /** The stream has run dry without ending: the connection is not keeping up. */
   stalled: boolean;
 };
@@ -56,6 +58,7 @@ class PlayerStore {
   contextPosition = $state(0);
   manualLength = $state(0);
   loopQueue = $state(false);
+  volumeCeilingDb = $state(0);
   stalled = $state(false);
 
   /** Authoritative position from the backend, in seconds. */
@@ -98,6 +101,7 @@ class PlayerStore {
       this.contextPosition = s.contextPosition;
       this.manualLength = s.manualLength;
       this.loopQueue = s.loopQueue;
+      this.volumeCeilingDb = s.volumeCeilingDb;
       this.stalled = s.stalled;
 
       // Leaving a track is when one most often becomes cached, so this is the
@@ -198,11 +202,15 @@ class PlayerStore {
 
   /** Restores persisted preferences and pushes them to the backend. */
   async restorePreferences() {
-    const [volume, muted, repeat, shuffle] = await Promise.all([
+    const [volume, muted, repeat, shuffle, ceiling] = await Promise.all([
       readSetting("volume", 1),
       readSetting("muted", false),
       readSetting<RepeatMode>("repeat", "off"),
       readSetting("shuffle", false),
+      // Defaults to passing the audio through, like every other player.
+      // Choosing a quieter default for everyone is the mistake this
+      // setting exists to undo.
+      readSetting("volumeCeilingDb", 0),
     ]);
 
     await Promise.all([
@@ -210,6 +218,7 @@ class PlayerStore {
       invoke("set_muted", { muted }),
       invoke("set_repeat", { mode: repeat }),
       invoke("set_shuffle", { shuffle }),
+      invoke("set_volume_ceiling", { db: ceiling }),
     ]);
   }
 
@@ -303,6 +312,17 @@ class PlayerStore {
    */
   async toggleLoopQueue() {
     await this.run("set_loop_queue", { on: !this.loopQueue });
+  }
+
+  /**
+   * Sets the loudest the app may get, in dB below unity.
+   *
+   * Applied to what is already playing, not the next track — a control
+   * whose effect you cannot hear is one you cannot judge.
+   */
+  async setVolumeCeiling(db: number) {
+    await this.run("set_volume_ceiling", { db });
+    await writeSetting("volumeCeilingDb", db);
   }
 
   /** Called continuously while dragging — updates the handle, does not seek. */

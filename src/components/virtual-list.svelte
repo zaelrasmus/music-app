@@ -74,7 +74,26 @@
   rather than by `top`, which keeps them off the layout path and lets the
   browser move them on the compositor.
 -->
-<ul class={cn("relative", className)} style="height: {virtualizer.totalSize}px">
+<!--
+  `data-scrolling` turns off transitions inside the list while it moves.
+
+  Chromium recomputes `:hover` on every frame of a scroll, so with the pointer
+  resting anywhere over the list a fast flick drags hover across dozens of rows
+  in a second. Every one of them then spends 150ms fading its highlight back
+  out, its duration back in and its menu button back out -- so at any instant
+  roughly nine rows behind the cursor are caught mid-fade, and the list reads
+  as smeared and half-transparent rather than as a list.
+
+  Only the *animation* is suppressed, not the hover itself: making the rows
+  `pointer-events: none` would be the usual trick and would also skip
+  hit-testing, but a row being dragged to reorder auto-scrolls the list, and a
+  row that cannot be hit is a row that cannot be dropped on.
+-->
+<ul
+    class={cn("relative", className)}
+    style="height: {virtualizer.totalSize}px"
+    data-scrolling={virtualizer.scrolling ? "true" : undefined}
+>
     {#each virtualizer.items as item (item.key)}
         <li
             class="absolute top-0 left-0 w-full"

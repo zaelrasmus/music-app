@@ -314,6 +314,22 @@
 }
 
 /*
+ * Nothing animates inside a list while it is being scrolled.
+ *
+ * Set by `VirtualList` for as long as the scroll lasts; see the comment there
+ * for what it is for. Written here rather than as a utility because it has to
+ * reach every descendant of the list, which is not something a class on the
+ * rows can do.
+ */
+[data-scrolling="true"],
+[data-scrolling="true"] *,
+[data-scrolling="true"] *::before,
+[data-scrolling="true"] *::after {
+	transition-duration: 0s !important;
+	transition-delay: 0s !important;
+}
+
+/*
  * Respect the OS "reduce motion" setting.
  *
  * The playing-track equaliser and the sidebar slide are the only motion that

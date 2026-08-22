@@ -38,6 +38,14 @@ export type RowVirtualizer = {
   /** The height the spacer must have for the scrollbar to be honest. */
   readonly totalSize: number;
   /**
+   * Whether the list is being scrolled right now.
+   *
+   * Goes false 150ms after the last scroll event. Exposed because hover
+   * effects have to be told to stop animating while rows are flying past --
+   * see the note on `data-scrolling` in `virtual-list.svelte`.
+   */
+  readonly scrolling: boolean;
+  /**
    * Attach to each rendered row to measure its real height.
    *
    * Rows here are not a fixed height — a search result's title wraps to two
@@ -83,6 +91,7 @@ export function virtualRows(config: {
 }): RowVirtualizer {
   let items = $state<VirtualItem[]>([]);
   let totalSize = $state(0);
+  let scrolling = $state(false);
 
   // Deliberately not `$state`: nothing renders the instance, and making it
   // reactive is what creates the feedback loop described above.
@@ -91,6 +100,9 @@ export function virtualRows(config: {
   const publish = (virtualizer: Virtualizer<HTMLElement, HTMLElement>) => {
     items = virtualizer.getVirtualItems();
     totalSize = virtualizer.getTotalSize();
+    // The core already notifies on this changing -- it is one of the three
+    // things its `maybeNotify` watches -- so reading it here costs nothing.
+    scrolling = virtualizer.isScrolling;
   };
 
   $effect(() => {
@@ -146,6 +158,9 @@ export function virtualRows(config: {
     },
     get totalSize() {
       return totalSize;
+    },
+    get scrolling() {
+      return scrolling;
     },
     measure: (node: HTMLElement) => instance?.measureElement(node),
     scrollToIndex: (index, options) => instance?.scrollToIndex(index, options),

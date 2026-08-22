@@ -247,6 +247,7 @@ pub fn run() {
             player::set_repeat,
             player::set_shuffle,
             player::set_loop_queue,
+            player::set_volume_ceiling,
             player::seek,
             audio_cache::audio_cache_stats,
             audio_cache::set_audio_cache_limit,
