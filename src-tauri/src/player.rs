@@ -215,6 +215,8 @@ pub struct PlayerStatus {
     pub volume_ceiling_db: f32,
     /// Whether per-track loudness correction is on.
     pub normalize: bool,
+    /// Whether an unmeasured stream is measured before it starts playing.
+    pub wait_to_measure: bool,
     /// What the current track is being corrected by, in dB. `null` means it has
     /// not been measured yet, which is distinct from a measured correction of
     /// zero.
@@ -319,6 +321,8 @@ pub enum PlayerCommand {
     SetVolumeCeiling(f32),
     /// Whether to correct each track towards a common loudness.
     SetNormalize(bool),
+    /// Whether to measure an unheard stream before playing it.
+    SetWaitToMeasure(bool),
     Seek(f64),
 }
 
@@ -418,6 +422,12 @@ struct Coordinator<E: PlayerEvents> {
     /// Off by default and switchable while playing, because the only honest way
     /// to judge it is to hear the same track both ways without restarting.
     normalize: bool,
+    /// Whether an unmeasured stream is measured *before* it starts playing.
+    ///
+    /// Off by default. It is the only way to level the very first play of a
+    /// track nobody has heard, and it costs about twelve seconds of waiting to
+    /// do it -- a trade worth offering and not worth imposing.
+    wait_to_measure: bool,
     /// The correction for the track currently loaded, in decibels.
     ///
     /// Decided once, when the track starts, and never moved while it plays --
@@ -513,6 +523,7 @@ pub fn spawn<E: PlayerEvents>(
             // Off until asked for. The frontend restores the saved choice at
             // startup the same way it restores volume.
             normalize: false,
+            wait_to_measure: false,
             track_gain_db: None,
             muted: false,
             epoch: 0,
@@ -662,7 +673,13 @@ impl<E: PlayerEvents> Coordinator<E> {
                 self.consider_offline_copy();
                 // The same call the natural end uses, so pressing Next and
                 // letting a track run out cannot disagree about what is next.
-                match self.queue.on_next() {
+                // `promote_loop_to_repeat` only fires where this would otherwise
+                // stop, and only when Loop is on -- see its docs.
+                match self
+                    .queue
+                    .on_next()
+                    .or_else(|| self.queue.promote_loop_to_repeat())
+                {
                     Some(track_id) => self.start(Some(track_id)),
                     None => self.halt(),
                 }
@@ -701,6 +718,10 @@ impl<E: PlayerEvents> Coordinator<E> {
             PlayerCommand::SetMuted(muted) => {
                 self.muted = muted;
                 self.apply_volume();
+            }
+            PlayerCommand::SetWaitToMeasure(on) => {
+                self.wait_to_measure = on;
+                self.emit_state();
             }
             PlayerCommand::SetNormalize(on) => {
                 self.normalize = on;
@@ -810,7 +831,13 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // more; a rewind is not available even for repeat-one.
                 self.loaded = None;
 
-                match self.queue.on_finished() {
+                // The same promotion Next gets: pressing Next and letting a track
+                // run out must not disagree about what happens at the end.
+                match self
+                    .queue
+                    .on_finished()
+                    .or_else(|| self.queue.promote_loop_to_repeat())
+                {
                     Some(track_id) => self.start(Some(track_id)),
                     None => self.halt(),
                 }
@@ -995,8 +1022,31 @@ impl<E: PlayerEvents> Coordinator<E> {
         let cache = self.audio_cache.clone();
         let yt_dlp = self.yt_dlp.clone();
         let loads = self.loads.clone();
+        // Only when both are on: measuring a track changes nothing audible
+        // unless the correction is actually being applied.
+        let measure_first = self.normalize && self.wait_to_measure;
+        let ffmpeg = self.ffmpeg.clone();
 
         tauri::async_runtime::spawn(async move {
+            if measure_first {
+                // Before the decode, not after: the gain is chosen when the
+                // track starts and never moves while it plays, so a reading
+                // that lands a second late is a reading that does not count.
+                //
+                // The UI is already showing "loading", which is the honest
+                // description -- this is the cost the setting exists to buy.
+                // Costs about twelve seconds for a six-minute stream, and
+                // nothing at all for anything already measured or on disk.
+                crate::loudness::ensure_measured(
+                    &pool,
+                    ffmpeg.as_deref(),
+                    yt_dlp.as_deref(),
+                    cache.as_ref(),
+                    track_id,
+                )
+                .await;
+            }
+
             let result = load_track(
                 &pool,
                 &engine,
@@ -1042,6 +1092,20 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // show the wrong place until it arrived.
                 self.emit_progress(outcome.start_at);
                 self.emit_state();
+                // With the state, not instead of it.
+                //
+                // `emit_state` carries the track's *id*; the queue payload
+                // carries everything that describes it. The player bar needs
+                // both, and it can only fall back to the library list when the
+                // track is in it -- an audition is `in_library = 0`, so for a
+                // streamed track played for the first time the queue payload is
+                // the only source of a title or a cover. Emitting one without
+                // the other leaves the bar on "Loading track details…".
+                //
+                // The failure branch below already did this. The success branch
+                // -- the one that runs on every track that actually plays --
+                // did not.
+                self.emit_queue().await;
             }
 
             // Lost the race, and already knows it. Not a failure, and above
@@ -1098,6 +1162,9 @@ impl<E: PlayerEvents> Coordinator<E> {
         }
 
         self.prepare_next(track_id);
+        // Same moment, same track: the decode is warmed and the level is
+        // learned while there is still time for both.
+        self.premeasure_next(track_id);
 
         let Some(yt_dlp) = self.yt_dlp.clone() else {
             return;
@@ -1318,6 +1385,39 @@ impl<E: PlayerEvents> Coordinator<E> {
     ///
     /// Best effort: if it fails or arrives late the ordinary load path runs
     /// exactly as before.
+    /// Measures the track that is about to play, while the current one still is.
+    ///
+    /// This is what makes levelling work for ordinary sequential listening. A
+    /// stream cannot be measured before it has been fetched, and fetching it
+    /// takes about twelve seconds against the several minutes the current track
+    /// has left -- so the next track is measured, cached and ready long before
+    /// anyone hears it. Only a cold click on something never played is left
+    /// uncorrected, and `wait_to_measure` covers that for whoever wants it.
+    ///
+    /// Best effort and silent. The copy it leaves behind is the same one the
+    /// cache would have kept anyway, so the traffic is not wasted even when the
+    /// listener skips.
+    fn premeasure_next(&mut self, track_id: i64) {
+        if !self.normalize {
+            return;
+        }
+        let pool = self.pool.clone();
+        let ffmpeg = self.ffmpeg.clone();
+        let yt_dlp = self.yt_dlp.clone();
+        let cache = self.audio_cache.clone();
+
+        tauri::async_runtime::spawn(async move {
+            crate::loudness::ensure_measured(
+                &pool,
+                ffmpeg.as_deref(),
+                yt_dlp.as_deref(),
+                cache.as_ref(),
+                track_id,
+            )
+            .await;
+        });
+    }
+
     fn prepare_next(&mut self, track_id: i64) {
         // Already held, or already building for this track.
         if self.prepared.as_ref().is_some_and(|r| r.track_id == track_id) {
@@ -1451,6 +1551,7 @@ impl<E: PlayerEvents> Coordinator<E> {
             loop_queue: self.queue.loops_manual(),
             volume_ceiling_db: self.ceiling_db,
             normalize: self.normalize,
+            wait_to_measure: self.wait_to_measure,
             track_gain_db: self.track_gain_db,
             stalled: self.stalled,
         });
@@ -1970,6 +2071,16 @@ pub async fn set_volume_ceiling(
 #[tauri::command]
 pub async fn set_normalize(on: bool, player: State<'_, PlayerHandle>) -> Result<(), String> {
     player.send(PlayerCommand::SetNormalize(on))
+}
+
+/// Whether an unheard stream is measured before it starts, rather than played
+/// as mastered and corrected from the next time.
+#[tauri::command]
+pub async fn set_wait_to_measure(
+    on: bool,
+    player: State<'_, PlayerHandle>,
+) -> Result<(), String> {
+    player.send(PlayerCommand::SetWaitToMeasure(on))
 }
 
 #[tauri::command]

@@ -311,6 +311,128 @@ pub async fn analyse_batch(
     done
 }
 
+/// The longest track worth fetching purely so it can be measured.
+///
+/// The cost here is a whole extra download of something the listener may skip
+/// in ten seconds. An hour-long mix is not worth fifty megabytes of traffic to
+/// find out how loud it is -- and a track that long is being listened to for
+/// its own sake, not as one of a sequence that needs matching.
+const MEASURE_FETCH_MAX_SECS: f64 = 20.0 * 60.0;
+
+/// Whether a track already has a settled answer, and what it is.
+///
+/// `loudness_at` is stamped even when measurement failed, so "tried and could
+/// not" is distinguishable from "never tried" -- without that, an unmeasurable
+/// file would be fetched and re-measured on every pass forever.
+async fn settled(pool: &SqlitePool, track_id: i64) -> Option<bool> {
+    let row = sqlx::query("SELECT loudness_at, loudness_lufs FROM tracks WHERE id = ?")
+        .bind(track_id)
+        .fetch_optional(pool)
+        .await
+        .ok()??;
+    let at: Option<String> = row.try_get("loudness_at").ok().flatten();
+    at?;
+    let lufs: Option<f64> = row.try_get("loudness_lufs").ok().flatten();
+    Some(lufs.is_some())
+}
+
+async fn measure_and_record(
+    pool: &SqlitePool,
+    ffmpeg: &Path,
+    path: PathBuf,
+    track_id: i64,
+) -> bool {
+    let ffmpeg = ffmpeg.to_path_buf();
+    let measured = tokio::task::spawn_blocking(move || measure(&ffmpeg, &path))
+        .await
+        .unwrap_or_else(|e| Err(format!("measurement panicked: {e}")));
+    let ok = measured.is_ok();
+    record(pool, track_id, measured.ok()).await;
+    ok
+}
+
+/// Makes sure a track has a reading, fetching a copy of it first if that is
+/// what it takes.
+///
+/// This is the piece that closes the cold-stream gap. Measuring needs the whole
+/// track, and a stream has no whole track until it has been fetched -- so for
+/// anything not already on disk this downloads it into the audio cache (which
+/// is where it would have ended up after a complete play anyway) and measures
+/// that. Measured, the round trip costs about 12 seconds for a six-minute
+/// track: 4 s of yt-dlp resolve and 8 s of fetch-and-measure, roughly 50x
+/// realtime.
+///
+/// Returns whether a usable reading exists afterwards.
+pub async fn ensure_measured(
+    pool: &SqlitePool,
+    ffmpeg: Option<&Path>,
+    yt_dlp: Option<&Path>,
+    cache: Option<&AudioCache>,
+    track_id: i64,
+) -> bool {
+    if let Some(answered) = settled(pool, track_id).await {
+        return answered;
+    }
+    let Some(ffmpeg) = ffmpeg else {
+        return false;
+    };
+
+    let Ok(Some(row)) = sqlx::query(
+        "SELECT source, local_path, remote_id, remote_url, duration_secs \
+         FROM tracks WHERE id = ?",
+    )
+    .bind(track_id)
+    .fetch_optional(pool)
+    .await
+    else {
+        return false;
+    };
+
+    let source: String = row.try_get("source").unwrap_or_default();
+    let local: Option<String> = row.try_get("local_path").ok().flatten();
+    let remote_id: Option<String> = row.try_get("remote_id").ok().flatten();
+
+    // Already something to read: a local file, or a cache copy from an earlier
+    // play. No network needed.
+    if let Some(path) = file_for(&source, local, remote_id.clone(), cache) {
+        return measure_and_record(pool, ffmpeg, path, track_id).await;
+    }
+
+    // Otherwise it has to be fetched, which is only worth doing for a remote
+    // track of reasonable length.
+    let (Some(yt_dlp), Some(cache), Some(remote_id)) = (yt_dlp, cache, remote_id) else {
+        return false;
+    };
+    let Some(remote_url): Option<String> = row.try_get("remote_url").ok().flatten() else {
+        return false;
+    };
+    // No duration is a live stream, which has no whole track to fetch.
+    let Some(duration) = row.try_get::<Option<i64>, _>("duration_secs").ok().flatten() else {
+        return false;
+    };
+    let duration = duration as f64;
+    if duration <= 0.0 || duration > MEASURE_FETCH_MAX_SECS {
+        return false;
+    }
+
+    // `reserve_fetch` is also the lock: it hands back nothing when a copy
+    // already exists or another task is already fetching this one.
+    let Some(pending) = cache.reserve_fetch(&source, &remote_id) else {
+        return false;
+    };
+    if crate::download::fetch_into_cache(yt_dlp, ffmpeg, &remote_url, pending)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    let Some(path) = cache.lookup(&source, &remote_id) else {
+        return false;
+    };
+    measure_and_record(pool, ffmpeg, path, track_id).await
+}
+
 /// Measures one track now, on the user's say-so.
 ///
 /// Exists because the background pass is deliberately unhurried, and waiting
@@ -532,6 +654,69 @@ mod tests {
             true_peak_db: 0.0,
         };
         assert_eq!(gain_db(nonsense, TARGET_LUFS), 0.0);
+    }
+
+    async fn track_with(pool: &SqlitePool, lufs: Option<f64>, stamped: bool) -> i64 {
+        sqlx::query(
+            "INSERT INTO tracks (source, title, state, remote_id, remote_url, duration_secs, \
+             loudness_lufs, loudness_at) \
+             VALUES ('youtube', 'A Track', 'saved', 'abcdefghijk', \
+                     'https://www.youtube.com/watch?v=abcdefghijk', 200, ?, ?)",
+        )
+        .bind(lufs)
+        .bind(if stamped { Some("2026-08-22") } else { None })
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query_scalar("SELECT id FROM tracks ORDER BY id DESC LIMIT 1")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn scratch(name: &str) -> crate::db::Db {
+        let dir = std::env::temp_dir().join(format!("music-app-loudness-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::db::init(&dir).await.unwrap()
+    }
+
+    /// The guard that stops a track being fetched over and over.
+    ///
+    /// A file that cannot be measured stamps `loudness_at` with a NULL reading,
+    /// and that has to read as "asked and answered". Without this, every pass --
+    /// and every queue advance -- would re-download a track to fail on it again.
+    #[tokio::test]
+    async fn a_track_that_could_not_be_measured_is_not_fetched_again() {
+        let db = scratch("failed").await;
+        let id = track_with(&db.pool, None, true).await;
+
+        assert_eq!(settled(&db.pool, id).await, Some(false));
+        // No ffmpeg, no yt-dlp, no cache: if the guard failed this would still
+        // have to return without touching the network.
+        assert!(!ensure_measured(&db.pool, None, None, None, id).await);
+    }
+
+    #[tokio::test]
+    async fn a_track_already_measured_is_reported_without_work() {
+        let db = scratch("done").await;
+        let id = track_with(&db.pool, Some(-9.5), true).await;
+
+        assert_eq!(settled(&db.pool, id).await, Some(true));
+        // Returns true despite having no tools at all, because it never needed
+        // them -- the answer was already stored.
+        assert!(ensure_measured(&db.pool, None, None, None, id).await);
+    }
+
+    /// Never measured is the one state that should still do work.
+    #[tokio::test]
+    async fn a_track_never_measured_is_not_treated_as_settled() {
+        let db = scratch("fresh").await;
+        let id = track_with(&db.pool, None, false).await;
+
+        assert_eq!(settled(&db.pool, id).await, None);
+        // Still false here only because there is no ffmpeg to measure with.
+        assert!(!ensure_measured(&db.pool, None, None, None, id).await);
     }
 
     #[test]

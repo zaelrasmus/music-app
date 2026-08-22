@@ -4,7 +4,7 @@
     import VirtualList from "$components/virtual-list.svelte";
     import { player } from "$lib/player.svelte";
     import XIcon from "@lucide/svelte/icons/x";
-    import RepeatIcon from "@lucide/svelte/icons/repeat";
+    import ListRestartIcon from "@lucide/svelte/icons/list-restart";
     import GripVerticalIcon from "@lucide/svelte/icons/grip-vertical";
     import ListMusicIcon from "@lucide/svelte/icons/list-music";
 
@@ -194,21 +194,30 @@
                   an empty list is a question nobody asked.
                 -->
                 {#if queueStore.manual.length > 0}
+                    <!--
+                      Its own icon, not the transport's repeat glyph.
+                      
+                      The two controls used the same one, which is most of why
+                      they were confusing: they look like the same promise and
+                      act on different things. This loops the handful of tracks
+                      listed below it; Repeat in the player bar loops the
+                      playlist they were queued from.
+                    -->
                     <button
                         type="button"
                         class="grid size-7 place-items-center rounded-md transition-colors {player.loopQueue
                             ? 'text-primary bg-accent'
                             : 'text-muted-foreground hover:bg-accent hover:text-foreground'}"
                         aria-label={player.loopQueue
-                            ? "Stop looping the queue"
-                            : "Loop the queue"}
+                            ? "Stop looping the queued tracks"
+                            : "Loop the queued tracks"}
                         title={player.loopQueue
-                            ? "Looping these tracks"
-                            : "Play these tracks on a loop"}
+                            ? "Looping these queued tracks — the playlist is paused behind them"
+                            : "Loop these queued tracks only. To repeat the playlist, use Repeat in the player bar."}
                         aria-pressed={player.loopQueue}
                         onclick={() => player.toggleLoopQueue()}
                     >
-                        <RepeatIcon class="size-4" />
+                        <ListRestartIcon class="size-4" />
                     </button>
                 {/if}
 

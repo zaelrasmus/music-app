@@ -31,6 +31,16 @@ struct Captured {
     states: Mutex<Vec<PlayerStatus>>,
     errors: Mutex<Vec<String>>,
     queues: Mutex<Vec<QueueState>>,
+    /// Emission order across event *types*, which the per-type vectors lose.
+    ///
+    /// Only ordering matters, so this is a plain counter rather than a clock:
+    /// the question it answers is "did a queue payload follow this state", and
+    /// a timestamp would make that flaky on a loaded machine.
+    seq: std::sync::atomic::AtomicU64,
+    /// (sequence, track_id, is_playing) for every state emitted.
+    state_seq: Mutex<Vec<(u64, Option<i64>, bool)>>,
+    /// (sequence, current track_id) for every queue payload.
+    queue_seq: Mutex<Vec<(u64, Option<i64>)>>,
 }
 
 /// Newtype so the impl is local (orphan rule).
@@ -39,6 +49,15 @@ struct Recorder(Arc<Captured>);
 
 impl PlayerEvents for Recorder {
     fn state(&self, status: PlayerStatus) {
+        let seq = self
+            .0
+            .seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .state_seq
+            .lock()
+            .unwrap()
+            .push((seq, status.track_id, status.state == music_app_lib::player::PlaybackState::Playing));
         self.0.states.lock().unwrap().push(status);
     }
 
@@ -60,6 +79,15 @@ impl PlayerEvents for Recorder {
     }
 
     fn queue(&self, queue: QueueState) {
+        let seq = self
+            .0
+            .seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .queue_seq
+            .lock()
+            .unwrap()
+            .push((seq, queue.current.as_ref().map(|c| c.track_id)));
         self.0.queues.lock().unwrap().push(queue);
     }
 }
@@ -2069,6 +2097,91 @@ async fn a_cache_copy_ffmpeg_complains_about_does_not_survive_the_play() {
     assert!(
         !poisoned.exists(),
         "the damaged copy outlived the play, so the song ends early forever",
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A track reported as playing must also have been *described*.
+///
+/// The player bar resolves what to show in two steps: the queue payload if it
+/// names the same id, otherwise the library list. A streamed audition is
+/// `in_library = 0` and so is not in that list at all -- for those the queue
+/// payload is the only source of a title or a cover, and without it the bar
+/// sits on "Loading track details…" with a grey tile where the artwork goes.
+///
+/// The gap was that `handle_load` emitted state on success without emitting the
+/// queue beside it, so the last thing the frontend heard about the track was
+/// its id. The failure branch three lines below already did both.
+///
+/// Asserted as an *ordering* property rather than "a queue payload exists",
+/// because one is emitted at command time regardless. What matters is that one
+/// follows the state that announced the track as playing.
+#[tokio::test]
+async fn a_track_that_starts_playing_is_also_described() {
+    let base = std::env::temp_dir().join("music-app-coordinator-described");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let wav = base.join("tone.wav");
+    write_wav(&wav);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state) \
+         VALUES ('local', 'Tone', ?, 'present')",
+    )
+    .bind(wav.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let track_id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    if errors.iter().any(|e| e.contains("No audio output device")) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    let states = recorder.0.state_seq.lock().unwrap().clone();
+    let queues = recorder.0.queue_seq.lock().unwrap().clone();
+    eprintln!("states: {states:?}");
+    eprintln!("queues: {queues:?}");
+
+    // The moment the coordinator first said this track was the one playing.
+    // The state that said this track is *playing* -- not the earlier "loading"
+    // one, which a command-time queue emit already sits after.
+    let announced = states
+        .iter()
+        .find(|(_, id, playing)| *id == Some(track_id) && *playing)
+        .map(|(seq, _, _)| *seq)
+        .expect("the coordinator never reported the track as playing");
+
+    assert!(
+        queues
+            .iter()
+            .any(|(seq, id)| *seq > announced && *id == Some(track_id)),
+        "the track was announced at sequence {announced} and no queue payload \
+         describing it followed (queues: {queues:?}) -- the bar has an id and \
+         nothing to draw with",
     );
 
     db.pool.close().await;

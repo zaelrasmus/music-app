@@ -818,10 +818,27 @@ fn start(
     decoded: Box<dyn Source + Send>,
     gain: Arc<AtomicU32>,
 ) -> Player {
-    let player = Player::connect_new(sink.mixer());
+    // Appended *before* the queue reaches the mixer, which is not fussiness.
+    //
+    // `Mixer::add` wraps whatever it is handed in a `UniformSourceIterator`,
+    // and that reads the source's channel count and sample rate **once, at
+    // that moment**. `Player::connect_new` adds the queue while it is still
+    // empty, and an empty queue reports its placeholder `Empty` source: 48 kHz,
+    // but **one channel**. So the mixer builds a mono-to-stereo converter and
+    // then runs real stereo audio through it for the whole track.
+    //
+    // Measured on a 48 kHz file against the same audio tapped before the mixer:
+    // wrapping first costs a 256-sample delay, a flat -60 dB error across every
+    // audible band, and +43 dB in the 22-24 kHz band. Appending first is
+    // bit-exact -- -223 dB, the measurement floor.
+    //
+    // `connect_new` is exactly `new()` followed by `mixer.add()`, so doing the
+    // halves in the other order costs nothing.
+    let (player, queue) = Player::new();
     // Left at unity deliberately: `Levelled` owns the gain, because the
     // limiter has to see the sample the device will actually receive.
     player.append(Levelled::new(decoded, gain));
+    sink.mixer().add(queue);
     player
 }
 
@@ -1167,6 +1184,55 @@ mod limiter_tests {
                 input.len(),
                 "{frames} frames in produced {} samples out",
                 output.len(),
+            );
+        }
+    }
+
+    /// What reaches the mixer must be what the limiter produced, bit for bit.
+    ///
+    /// `Mixer::add` wraps its input in a `UniformSourceIterator`, which reads
+    /// the channel count and sample rate **once, at that moment**. Add an empty
+    /// queue and it reads the placeholder `Empty` source, which reports **one
+    /// channel** -- so the mixer builds a mono-to-stereo converter and runs real
+    /// stereo audio through it for the rest of the track. Measured, that costs a
+    /// 256-sample delay, a flat -60 dB error across every audible band, and
+    /// +43 dB in the 22-24 kHz band.
+    ///
+    /// Appending before adding is the only thing that prevents it, and nothing
+    /// about `start()` makes that ordering look load-bearing. Hence this test.
+    #[test]
+    fn the_mixer_receives_the_samples_unaltered() {
+        let input = stereo_tone(1000.0, 0.5, 40_000);
+        let buffer = rodio::buffer::SamplesBuffer::new(
+            rodio::ChannelCount::new(2).unwrap(),
+            rodio::SampleRate::new(RATE).unwrap(),
+            input.clone(),
+        );
+        let levelled = Levelled::new(buffer, Arc::new(AtomicU32::new(1.0f32.to_bits())));
+
+        let (mixer, mut out) = rodio::mixer::mixer(
+            rodio::ChannelCount::new(2).unwrap(),
+            rodio::SampleRate::new(RATE).unwrap(),
+        );
+        // The order under test.
+        let (player, queue) = rodio::Player::new();
+        player.append(levelled);
+        mixer.add(queue);
+
+        let mut got = Vec::with_capacity(input.len());
+        while got.len() < input.len() {
+            match out.next() {
+                Some(s) => got.push(s),
+                None => break,
+            }
+        }
+
+        assert_eq!(got.len(), input.len(), "the mixer dropped or invented samples");
+        for (i, (produced, expected)) in got.iter().zip(&input).enumerate() {
+            assert_eq!(
+                produced, expected,
+                "sample {i} reached the mixer as {produced} instead of {expected} -- \
+                 something between the limiter and the device is altering the audio",
             );
         }
     }
@@ -1702,30 +1768,100 @@ mod mixer_tap {
             Arc::new(AtomicU32::new(gain.to_bits())),
         );
 
-        if std::env::var("MUSIC_APP_PROBE_RAW").is_ok() {
-            // This app's own stage only: decoder plus gain plus limiter, with
-            // none of rodio's `Player`/`Mixer` adapters after it. The difference
-            // between this and the full chain is what those adapters cost.
-            eprintln!("tapping Levelled directly (no Player, no Mixer)");
-            while samples.len() < wanted {
-                match levelled.next() {
-                    Some(s) => samples.push(s),
-                    None => break,
+        // Which slice of the chain to tap, so the cost of each stage can be
+        // attributed instead of guessed at. `raw` is this app's own code;
+        // everything past it is rodio's.
+        let stage = std::env::var("MUSIC_APP_PROBE_STAGE").unwrap_or_else(|_| "mixer".into());
+        eprintln!("tapping stage: {stage}");
+        match stage.as_str() {
+            // Decoder plus gain plus limiter. No rodio adapters at all.
+            "raw" => {
+                while samples.len() < wanted {
+                    match levelled.next() {
+                        Some(s) => samples.push(s),
+                        None => break,
+                    }
                 }
             }
-        } else {
-            // Exactly what `start()` builds, against a plain mixer rather than a device.
-            eprintln!("tapping the full Player -> Mixer chain");
-            let (mixer, mut mixer_out) = rodio::mixer::mixer(
-                rodio::ChannelCount::new(2).unwrap(),
-                rodio::SampleRate::new(rate).unwrap(),
-            );
-            let player = rodio::Player::connect_new(&mixer);
-            player.append(levelled);
-            while samples.len() < wanted {
-                match mixer_out.next() {
-                    Some(s) => samples.push(s),
-                    None => break,
+            // What `Mixer::add` wraps every source in, and nothing else. At a
+            // matching rate and channel count this should be a pass-through.
+            "uniform" => {
+                let mut uniform = rodio::source::UniformSourceIterator::new(
+                    levelled,
+                    rodio::ChannelCount::new(2).unwrap(),
+                    rodio::SampleRate::new(rate).unwrap(),
+                );
+                while samples.len() < wanted {
+                    match uniform.next() {
+                        Some(s) => samples.push(s),
+                        None => break,
+                    }
+                }
+            }
+            // The adapter stack `Player::append` builds, plus the queue it
+            // feeds -- but not the mixer. `Player::new` hands back the queue
+            // output directly, which is what makes the split possible.
+            "player" => {
+                let (player, mut queue_out) = rodio::Player::new();
+                player.append(levelled);
+                while samples.len() < wanted {
+                    match queue_out.next() {
+                        Some(s) => samples.push(s),
+                        None => break,
+                    }
+                }
+            }
+            // What `Mixer::add` actually wraps: the *queue*, not the source.
+            // The distinction matters because `Player::connect_new` adds the
+            // queue to the mixer while it is still empty, and an empty queue's
+            // `current` is `Empty`, which reports 1 channel and a span of 0.
+            "uniform_queue" => {
+                let (player, queue_out) = rodio::Player::new();
+                player.append(levelled);
+                let mut uniform = rodio::source::UniformSourceIterator::new(
+                    queue_out,
+                    rodio::ChannelCount::new(2).unwrap(),
+                    rodio::SampleRate::new(rate).unwrap(),
+                );
+                while samples.len() < wanted {
+                    match uniform.next() {
+                        Some(s) => samples.push(s),
+                        None => break,
+                    }
+                }
+            }
+            // The same, but wrapped *before* anything is appended -- which is
+            // the order `Player::connect_new` uses.
+            "uniform_queue_empty" => {
+                let (player, queue_out) = rodio::Player::new();
+                let mut uniform = rodio::source::UniformSourceIterator::new(
+                    queue_out,
+                    rodio::ChannelCount::new(2).unwrap(),
+                    rodio::SampleRate::new(rate).unwrap(),
+                );
+                player.append(levelled);
+                while samples.len() < wanted {
+                    match uniform.next() {
+                        Some(s) => samples.push(s),
+                        None => break,
+                    }
+                }
+            }
+            // Exactly what `start()` builds, against a plain mixer rather than
+            // a device -- including the append-before-add order.
+            _ => {
+                let (mixer, mut mixer_out) = rodio::mixer::mixer(
+                    rodio::ChannelCount::new(2).unwrap(),
+                    rodio::SampleRate::new(rate).unwrap(),
+                );
+                let (player, queue) = rodio::Player::new();
+                player.append(levelled);
+                mixer.add(queue);
+                while samples.len() < wanted {
+                    match mixer_out.next() {
+                        Some(s) => samples.push(s),
+                        None => break,
+                    }
                 }
             }
         }

@@ -513,12 +513,84 @@ impl PlayerQueue {
     /// Same priority rule as [`Self::on_finished`], minus repeat-one: that
     /// governs natural end only, or Next would look broken in that mode.
     pub fn on_next(&mut self) -> Option<i64> {
+        // Next has to move you forward, and a loop of one track cannot.
+        //
+        // That state is easier to reach than it looks: turning Loop on while a
+        // playlist track is playing adds *that track* to the loop, by design --
+        // "loop these" plainly includes the one you are hearing. With nothing
+        // else queued, the loop is then a single song, and pressing Next hands
+        // back the same song forever. The control said "loop"; what it did was
+        // "repeat one", and the playlist stopped advancing.
+        //
+        // So Next converts it into the control that can actually do what was
+        // asked. Not silent: `loop_queue` and `repeat` both ride on every state
+        // event, so the two buttons change in front of the listener.
+        if self.loop_would_only_repeat_the_current_track() {
+            self.loop_manual = false;
+            self.manual.clear();
+            if self.context.repeat == RepeatMode::Off {
+                self.context.repeat = RepeatMode::All;
+            }
+        }
+
         self.push_history();
 
         if let Some(track_id) = self.take_from_manual() {
             return Some(track_id);
         }
 
+        let track_id = self.context.next()?;
+        self.set_context_current(track_id);
+        Some(track_id)
+    }
+
+    /// Whether the loop consists of nothing but the track already playing.
+    ///
+    /// The degenerate case: a "loop" that can only ever hand back what is
+    /// already audible. Distinguished from a real loop of several tracks, which
+    /// advances perfectly well and must be left alone.
+    fn loop_would_only_repeat_the_current_track(&self) -> bool {
+        if !self.loop_manual || self.manual.len() != 1 {
+            return false;
+        }
+        let Some(playing) = self.current else {
+            return false;
+        };
+        // Only worth converting if there is a context to advance into.
+        self.manual[0].track_id == playing.track_id && self.context.len() > 1
+    }
+
+    /// Turns a queue loop into a context repeat, when the context has just run
+    /// out and the loop had nothing to say about it.
+    ///
+    /// `loop_manual` promises "these tracks keep playing", but the tracks it
+    /// governs are the manual queue only -- a playlist is the *context*, and is
+    /// untouched by it. So a listener with Loop on, playing a playlist, reaches
+    /// the end and stops: precisely the thing the setting said would not
+    /// happen. The letter of the setting was honoured and its meaning was not.
+    ///
+    /// Rather than stop, this honours the intent. It is deliberately not
+    /// silent: `repeat` rides on every state event, so the transport's repeat
+    /// control changes in front of the listener rather than behind them.
+    ///
+    /// Only ever promotes from `Off`. Someone who chose repeat-one chose it,
+    /// and a setting that overrides an explicit choice is a worse bug than the
+    /// one this fixes.
+    ///
+    /// Returns the track to play, or `None` when there was nothing to promote.
+    pub fn promote_loop_to_repeat(&mut self) -> Option<i64> {
+        if !self.loop_manual || self.context.repeat != RepeatMode::Off {
+            return None;
+        }
+        // Nothing to wrap around.
+        if self.context.len() == 0 {
+            return None;
+        }
+
+        self.context.repeat = RepeatMode::All;
+        // Deliberately the context directly rather than `on_next`: the caller
+        // has already pushed history and drained the manual queue, and doing
+        // either twice would put this track in the history list twice over.
         let track_id = self.context.next()?;
         self.set_context_current(track_id);
         Some(track_id)
@@ -1291,5 +1363,113 @@ mod tests {
         assert_eq!(q.current(), Some(5));
 
         assert_eq!(q.on_previous(), Some(1));
+    }
+
+    /// The case that started this: Loop turned on during a playlist.
+    ///
+    /// Turning Loop on adds the playing track to the loop, so with nothing else
+    /// queued the loop *is* that one song. Next then handed it back forever and
+    /// the playlist never advanced — a control labelled "loop" behaving as
+    /// "repeat one".
+    #[test]
+    fn next_converts_a_one_track_loop_into_repeat() {
+        let mut q = queue_of(3);
+        q.set_loop_manual(true);
+
+        // Turning Loop on captured the playing track. This is existing,
+        // deliberate behaviour -- "loop these" includes the one you can hear.
+        assert_eq!(q.manual_len(), 1);
+        assert!(q.loops_manual());
+
+        // Next must move forward, so the loop becomes the control that can.
+        assert_eq!(q.on_next(), Some(2), "the playlist should have advanced");
+        assert!(!q.loops_manual(), "the one-track loop should be gone");
+        assert_eq!(q.manual_len(), 0);
+        assert_eq!(
+            q.repeat(),
+            RepeatMode::All,
+            "and the intent should show up as repeat, where it is visible",
+        );
+    }
+
+    /// A real loop of several tracks is doing its job and must be left alone.
+    #[test]
+    fn a_loop_of_several_tracks_is_not_converted() {
+        let mut q = queue_of(3);
+        for id in [101, 102] {
+            q.enqueue_last(id);
+        }
+        q.set_loop_manual(true);
+
+        assert_eq!(q.on_next(), Some(101));
+        assert_eq!(q.on_next(), Some(102));
+        assert!(q.loops_manual(), "a working loop must survive Next");
+        assert_eq!(q.repeat(), RepeatMode::Off, "and must not touch repeat");
+    }
+
+    /// An explicit choice outranks an inferred one: someone on repeat-one chose
+    /// it, and converting the loop must not overwrite that.
+    #[test]
+    fn converting_a_loop_never_overrides_repeat_one() {
+        let mut q = queue_of(3);
+        q.set_repeat(RepeatMode::One);
+        q.set_loop_manual(true);
+
+        q.on_next();
+        assert_eq!(q.repeat(), RepeatMode::One);
+    }
+
+    /// Nothing to advance into, so there is nothing better to convert to and
+    /// the loop keeps doing the only thing it can.
+    #[test]
+    fn a_one_track_loop_with_no_playlist_behind_it_is_left_alone() {
+        let mut q = PlayerQueue::default();
+        q.enqueue_last(99);
+        assert_eq!(q.on_next(), Some(99));
+        q.set_loop_manual(true);
+
+        assert_eq!(q.on_next(), Some(99), "there is nowhere else to go");
+        assert!(q.loops_manual());
+    }
+
+    /// The other half: the playlist runs out while Loop is on.
+    ///
+    /// Reachable once the loop has been converted away, or when Loop was on
+    /// with a queue that has since emptied. Stopping would be the one thing a
+    /// loop said would not happen.
+    #[test]
+    fn a_playlist_that_runs_out_under_loop_wraps_instead_of_stopping() {
+        let mut q = queue_of(3);
+        // Loop on, but with the manual queue empty -- the state after a
+        // conversion, or after the queued tracks were removed by hand.
+        q.set_loop_manual(true);
+        q.clear_manual();
+
+        assert_eq!(q.on_next(), Some(2));
+        assert_eq!(q.on_next(), Some(3));
+
+        let next = q.on_next().or_else(|| q.promote_loop_to_repeat());
+        assert_eq!(next, Some(1), "the playlist should have come round again");
+        assert_eq!(q.repeat(), RepeatMode::All);
+    }
+
+    /// Without Loop there is no promise to keep, so the end is still the end.
+    #[test]
+    fn a_playlist_without_loop_still_stops_at_the_end() {
+        let mut q = queue_of(2);
+        assert_eq!(q.on_next(), Some(2));
+
+        let next = q.on_next().or_else(|| q.promote_loop_to_repeat());
+        assert_eq!(next, None, "nothing asked for this to keep going");
+        assert_eq!(q.repeat(), RepeatMode::Off, "and nothing should have changed");
+    }
+
+    #[test]
+    fn an_empty_context_is_not_promoted() {
+        let mut q = PlayerQueue::default();
+        q.set_loop_manual(true);
+
+        assert_eq!(q.promote_loop_to_repeat(), None);
+        assert_eq!(q.repeat(), RepeatMode::Off);
     }
 }

@@ -38,6 +38,8 @@ export type PlayerStatus = {
    * playing once — and is distinct from a measured correction of zero.
    */
   trackGainDb: number | null;
+  /** Whether an unheard stream is measured before it starts playing. */
+  waitToMeasure: boolean;
 };
 
 export type PlayerProgress = {
@@ -70,6 +72,7 @@ class PlayerStore {
   volumeCeilingDb = $state(0);
   normalize = $state(false);
   trackGainDb = $state<number | null>(null);
+  waitToMeasure = $state(false);
   stalled = $state(false);
 
   /** Authoritative position from the backend, in seconds. */
@@ -115,6 +118,7 @@ class PlayerStore {
       this.volumeCeilingDb = s.volumeCeilingDb;
       this.normalize = s.normalize;
       this.trackGainDb = s.trackGainDb;
+      this.waitToMeasure = s.waitToMeasure;
       this.stalled = s.stalled;
 
       // Leaving a track is when one most often becomes cached, so this is the
@@ -217,7 +221,8 @@ class PlayerStore {
 
   /** Restores persisted preferences and pushes them to the backend. */
   async restorePreferences() {
-    const [volume, muted, repeat, shuffle, ceiling, normalize] = await Promise.all([
+    const [volume, muted, repeat, shuffle, ceiling, normalize, waitToMeasure] =
+      await Promise.all([
       readSetting("volume", 1),
       readSetting("muted", false),
       readSetting<RepeatMode>("repeat", "off"),
@@ -229,6 +234,9 @@ class PlayerStore {
       // Off by default: it changes how every track sounds, so it should be a
       // thing someone turned on rather than something that happened to them.
       readSetting("normalizeLoudness", false),
+      // Also off: it trades about twelve seconds of waiting on a track nobody
+      // has heard, which nobody should discover by accident.
+      readSetting("waitToMeasure", false),
     ]);
 
     await Promise.all([
@@ -238,6 +246,7 @@ class PlayerStore {
       invoke("set_shuffle", { shuffle }),
       invoke("set_volume_ceiling", { db: ceiling }),
       invoke("set_normalize", { on: normalize }),
+      invoke("set_wait_to_measure", { on: waitToMeasure }),
     ]);
   }
 
@@ -318,6 +327,17 @@ class PlayerStore {
   async setNormalize(on: boolean) {
     await this.run("set_normalize", { on });
     await writeSetting("normalizeLoudness", on);
+  }
+
+  /**
+   * Whether an unheard stream waits to be measured before it starts.
+   *
+   * Only does anything while levelling is on — measuring a track changes
+   * nothing audible unless the correction is being applied.
+   */
+  async setWaitToMeasure(on: boolean) {
+    await this.run("set_wait_to_measure", { on });
+    await writeSetting("waitToMeasure", on);
   }
 
   async setVolume(volume: number) {

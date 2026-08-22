@@ -20,6 +20,7 @@
     const current = $derived(player.volumeCeilingDb);
     const on = $derived(player.normalize);
     const gain = $derived(player.trackGainDb);
+    const waiting = $derived(player.waitToMeasure);
 
     /** Signed, because the direction is the interesting half. */
     function formatGain(db: number) {
@@ -74,14 +75,49 @@
         </p>
 
         <p class="text-muted-foreground text-[13px] leading-relaxed">
-            One case cannot be corrected: measuring means decoding a whole track, so a
-            stream you play for the very first time is heard before it can be
-            measured. It plays as mastered, gets measured from the copy kept
-            afterwards, and is corrected from the next play on. Files on disk are
-            measured in the background and are corrected from the start.
+            The next track in the queue is measured while the current one is still
+            playing, so ordinary listening is levelled all the way through. Files on
+            disk are measured in the background. Only a track you pick and play
+            immediately, that nobody has heard before, arrives unmeasured — it plays
+            as mastered and is corrected from the next time.
         </p>
 
         {#if on}
+            <!--
+              Nested under the switch above because it does nothing on its own:
+              measuring a track changes nothing audible unless the correction is
+              being applied.
+            -->
+            <div
+                class="border-border/60 flex items-start justify-between gap-4 rounded-lg border p-3"
+            >
+                <div class="flex flex-col gap-1">
+                    <span class="text-[13px] font-medium">Wait for unheard tracks</span>
+                    <span class="text-muted-foreground text-xs leading-relaxed">
+                        Measure a brand-new stream before playing it instead of after.
+                        Levels it from the very first listen, at the cost of roughly
+                        ten seconds before the sound starts. Nothing already measured,
+                        queued, or on disk is affected.
+                    </span>
+                </div>
+                <button
+                    type="button"
+                    role="switch"
+                    aria-checked={waiting}
+                    aria-label="Wait for unheard tracks"
+                    class="relative mt-0.5 inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors {waiting
+                        ? 'bg-primary'
+                        : 'bg-muted-foreground/30'}"
+                    onclick={() => player.setWaitToMeasure(!waiting)}
+                >
+                    <span
+                        class="bg-background inline-block size-4 rounded-full shadow-sm transition-transform {waiting
+                            ? 'translate-x-[18px]'
+                            : 'translate-x-0.5'}"
+                    ></span>
+                </button>
+            </div>
+
             <!-- The readout is the point of the toggle: switching it while a
                  track plays is how you check whether it is doing anything, and
                  a number makes "did that change?" answerable. -->

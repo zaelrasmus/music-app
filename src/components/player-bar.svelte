@@ -55,23 +55,38 @@
     const undescribed = $derived(player.trackId !== null && nowPlaying === null);
 
     /**
-     * Ask again, once.
+     * Ask again when the queue moves under us.
      *
      * The queue payload is pushed, so a lost or late one leaves the bar blank
      * with no way back — the coordinator only emits on change, and the change
-     * has already happened. Asking costs one round trip and is bounded to a
-     * single attempt per track, because a refresh that did not help will not
-     * help the second time either and this must never become a loop.
+     * has already happened. Asking costs one round trip.
+     *
+     * Latched on the track id *and* on the payload the last attempt saw, not on
+     * the id alone. One attempt per track was the old rule, and it had a hole:
+     * if that single refresh answered with a payload still describing the
+     * previous track, nothing ever asked again and the bar stayed on "Loading
+     * track details…" for the rest of the song. A track not in the library —
+     * any streamed audition, since those are `in_library = 0` — has no other
+     * source to fall back to, so being stuck there is permanent.
+     *
+     * Re-arming on a *changed* payload is what keeps this bounded: each attempt
+     * needs new information to justify itself, so a queue that never changes
+     * cannot make this loop.
      */
-    // Deliberately not `$state`: the effect reads it as a latch, and making it
-    // reactive would have the effect depend on its own write.
+    // Deliberately not `$state`: the effect reads these as latches, and making
+    // them reactive would have the effect depend on its own writes.
     let asked: number | null = null;
+    let askedAgainst: unknown = undefined;
 
     $effect(() => {
         const id = player.trackId;
-        if (id === null || !undescribed || asked === id) return;
+        // Read so the effect re-runs when a new payload arrives.
+        const payload = queueStore.current;
+        if (id === null || !undescribed) return;
+        if (asked === id && askedAgainst === payload) return;
 
         asked = id;
+        askedAgainst = payload;
         void queueStore.refresh();
     });
 
@@ -114,12 +129,20 @@
         Math.min(Math.max(player.displaySecs, 0), sliderMax),
     );
 
+    /**
+     * Named by what it acts on, not just by its mode.
+     *
+     * "Repeat all" and the queue panel's loop button were both a circular arrow
+     * saying "again", and the difference between them — playlist versus the
+     * handful of tracks queued by hand — was invisible until you had been
+     * caught by it. Saying which list each one means is the cheapest fix.
+     */
     const repeatLabel = $derived(
         player.repeat === "one"
-            ? "Repeat one"
+            ? "Repeat this track"
             : player.repeat === "all"
-              ? "Repeat all"
-              : "Repeat off",
+              ? "Repeat the playlist"
+              : "Repeat off — the playlist stops at the end",
     );
 
     function formatTime(secs: number) {
