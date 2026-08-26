@@ -213,10 +213,11 @@ pub struct PlayerStatus {
     pub loop_queue: bool,
     /// The chosen ceiling in decibels; 0.0 means the audio is passed through.
     pub volume_ceiling_db: f32,
+    /// The loudness every track is corrected towards, in LUFS.
+    pub target_lufs: f32,
     /// Whether per-track loudness correction is on.
     pub normalize: bool,
     /// Whether an unmeasured stream is measured before it starts playing.
-    pub wait_to_measure: bool,
     /// What the current track is being corrected by, in dB. `null` means it has
     /// not been measured yet, which is distinct from a measured correction of
     /// zero.
@@ -328,10 +329,10 @@ pub enum PlayerCommand {
     SetKeepAbandoned(bool),
     /// Lower the top of the slider, in decibels below unity.
     SetVolumeCeiling(f32),
+    /// The loudness tracks are corrected towards, in LUFS.
+    SetTargetLufs(f32),
     /// Whether to correct each track towards a common loudness.
     SetNormalize(bool),
-    /// Whether to measure an unheard stream before playing it.
-    SetWaitToMeasure(bool),
     /// Whether the equaliser is in circuit at all.
     SetEqualizerEnabled(bool),
     /// Every band at once, in dB, low to high.
@@ -354,6 +355,7 @@ impl PlayerCommand {
             PlayerCommand::SetVolume(_)
                 | PlayerCommand::SetMuted(_)
                 | PlayerCommand::SetVolumeCeiling(_)
+                | PlayerCommand::SetTargetLufs(_)
                 | PlayerCommand::Seek(_)
         )
     }
@@ -433,6 +435,8 @@ struct Coordinator<E: PlayerEvents> {
     muted: bool,
     /// The top of the slider, in decibels. Chosen by the listener.
     ceiling_db: f32,
+    /// What every track is corrected towards. See `loudness::TARGET_LUFS`.
+    target_lufs: f32,
     /// Whether per-track loudness correction is applied.
     ///
     /// Off by default and switchable while playing, because the only honest way
@@ -443,7 +447,6 @@ struct Coordinator<E: PlayerEvents> {
     /// Off by default. It is the only way to level the very first play of a
     /// track nobody has heard, and it costs about twelve seconds of waiting to
     /// do it -- a trade worth offering and not worth imposing.
-    wait_to_measure: bool,
     /// The correction for the track currently loaded, in decibels.
     ///
     /// Decided once, when the track starts, and never moved while it plays --
@@ -460,10 +463,18 @@ struct Coordinator<E: PlayerEvents> {
     engine: Arc<AudioEngine>,
     /// Where those tasks report back.
     loads: UnboundedSender<LoadOutcome>,
+    /// Where a background loudness measurement reports back.
+    levels: UnboundedSender<LevelOutcome>,
     pool: SqlitePool,
     /// Handed in at startup: the coordinator has no `AppHandle` to resolve it
     /// from, and doing so per play would repeat the lookup needlessly.
     yt_dlp: Option<std::path::PathBuf>,
+    /// Tracks a background loudness sample has been started for.
+    ///
+    /// Once each, per session. Without it a track that cannot be measured
+    /// would be re-sampled every time it played, and one already in flight
+    /// would be sampled twice.
+    sampling: std::collections::HashSet<i64>,
     /// Resolved stream URLs, reused for their stated lifetime.
     ///
     /// Shared because prefetching writes into it from a spawned task.
@@ -527,6 +538,7 @@ pub fn spawn<E: PlayerEvents>(
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (loads_tx, loads_rx) = mpsc::unbounded_channel();
+    let (levels_tx, levels_rx) = mpsc::unbounded_channel();
     let (prepares_tx, prepares_rx) = mpsc::unbounded_channel();
 
     tauri::async_runtime::spawn(async move {
@@ -536,15 +548,17 @@ pub fn spawn<E: PlayerEvents>(
             loaded: None,
             volume: 1.0,
             ceiling_db: DEFAULT_CEILING_DB,
+            target_lufs: crate::loudness::TARGET_LUFS,
             // Off until asked for. The frontend restores the saved choice at
             // startup the same way it restores volume.
             normalize: false,
-            wait_to_measure: false,
             track_gain_db: None,
             muted: false,
             epoch: 0,
             engine: Arc::new(engine),
             loads: loads_tx,
+            levels: levels_tx,
+            sampling: std::collections::HashSet::new(),
             // With the pool, so a resolve can file the upload date it learned.
             stream_urls: Arc::new(StreamUrlCache::with_pool(pool.clone())),
             pool,
@@ -564,7 +578,7 @@ pub fn spawn<E: PlayerEvents>(
             resume_at: None,
             events,
         }
-        .run(command_rx, engine_rx, loads_rx, prepares_rx)
+        .run(command_rx, engine_rx, loads_rx, prepares_rx, levels_rx)
         .await;
     });
 
@@ -578,6 +592,7 @@ impl<E: PlayerEvents> Coordinator<E> {
         mut engine_events: UnboundedReceiver<EngineEvent>,
         mut loads: UnboundedReceiver<LoadOutcome>,
         mut prepares: UnboundedReceiver<Prepared>,
+        mut levels: UnboundedReceiver<LevelOutcome>,
     ) {
         loop {
             tokio::select! {
@@ -585,6 +600,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                 Some(event) = engine_events.recv() => self.handle_engine_event(event).await,
                 Some(outcome) = loads.recv() => self.handle_load(outcome).await,
                 Some(ready) = prepares.recv() => self.keep_prepared(ready),
+                Some(level) = levels.recv() => self.apply_measured_level(level).await,
                 else => break,
             }
         }
@@ -750,10 +766,6 @@ impl<E: PlayerEvents> Coordinator<E> {
                 self.muted = muted;
                 self.apply_volume();
             }
-            PlayerCommand::SetWaitToMeasure(on) => {
-                self.wait_to_measure = on;
-                self.emit_state();
-            }
             PlayerCommand::SetNormalize(on) => {
                 self.normalize = on;
                 // Re-read rather than trusting a stale figure: switching this on
@@ -783,6 +795,21 @@ impl<E: PlayerEvents> Coordinator<E> {
                 self.ceiling_db = db.clamp(MIN_CEILING_DB, 0.0);
                 // Heard immediately: a ceiling that only took effect on the
                 // next track would look like it had done nothing.
+                self.apply_volume();
+            }
+
+            PlayerCommand::SetTargetLufs(lufs) => {
+                self.target_lufs = lufs.clamp(
+                    crate::loudness::MIN_TARGET_LUFS,
+                    crate::loudness::MAX_TARGET_LUFS,
+                );
+                // The gain is derived from the target, so the track playing
+                // right now has to be re-derived -- and heard, because moving
+                // this and hearing nothing is how a setting gets called broken.
+                // The volume stage glides, so it is a level change, not a click.
+                if let Some(track_id) = self.loaded {
+                    self.track_gain_db = self.track_gain_for(track_id).await;
+                }
                 self.apply_volume();
             }
 
@@ -1062,31 +1089,7 @@ impl<E: PlayerEvents> Coordinator<E> {
         let cache = self.audio_cache.clone();
         let yt_dlp = self.yt_dlp.clone();
         let loads = self.loads.clone();
-        // Only when both are on: measuring a track changes nothing audible
-        // unless the correction is actually being applied.
-        let measure_first = self.normalize && self.wait_to_measure;
-        let ffmpeg = self.ffmpeg.clone();
-
         tauri::async_runtime::spawn(async move {
-            if measure_first {
-                // Before the decode, not after: the gain is chosen when the
-                // track starts and never moves while it plays, so a reading
-                // that lands a second late is a reading that does not count.
-                //
-                // The UI is already showing "loading", which is the honest
-                // description -- this is the cost the setting exists to buy.
-                // Costs about twelve seconds for a six-minute stream, and
-                // nothing at all for anything already measured or on disk.
-                crate::loudness::ensure_measured(
-                    &pool,
-                    ffmpeg.as_deref(),
-                    yt_dlp.as_deref(),
-                    cache.as_ref(),
-                    track_id,
-                )
-                .await;
-            }
-
             let result = load_track(
                 &pool,
                 &engine,
@@ -1127,6 +1130,10 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // rather than at the previous track's for a poll interval.
                 self.track_gain_db = self.track_gain_for(outcome.track_id).await;
                 self.apply_volume();
+                // Only after the gain is known, so a track that already has a
+                // reading is never sampled. This is the cold-stream case and
+                // nothing else.
+                self.measure_while_playing(outcome.track_id);
                 // Set the bar immediately; the first tick is up to a poll
                 // interval away, and for a resume starting from zero would
                 // show the wrong place until it arrived.
@@ -1425,26 +1432,28 @@ impl<E: PlayerEvents> Coordinator<E> {
         });
     }
 
-    /// Starts decoding the next track before it is needed.
-    ///
-    /// The remaining gap between tracks was ffmpeg's own start -- spawning the
-    /// process and waiting for it to buffer. Doing that while the current
-    /// track still plays turns the handover into an append.
-    ///
-    /// Best effort: if it fails or arrives late the ordinary load path runs
-    /// exactly as before.
     /// Measures the track that is about to play, while the current one still is.
     ///
-    /// This is what makes levelling work for ordinary sequential listening. A
-    /// stream cannot be measured before it has been fetched, and fetching it
-    /// takes about twelve seconds against the several minutes the current track
-    /// has left -- so the next track is measured, cached and ready long before
-    /// anyone hears it. Only a cold click on something never played is left
-    /// uncorrected, and `wait_to_measure` covers that for whoever wants it.
+    /// This is what levels ordinary sequential listening from the first sample.
+    /// A stream has nothing to measure until some of it has arrived, so the
+    /// work is done against the minutes the current track has left rather than
+    /// against the listener's patience.
     ///
-    /// Best effort and silent. The copy it leaves behind is the same one the
-    /// cache would have kept anyway, so the traffic is not wasted even when the
-    /// listener skips.
+    /// Sampling four tenths of it, rather than fetching the whole thing, is a
+    /// recent change and the reason this is now worth relying on: the old path
+    /// downloaded the entire track and took about twelve seconds, which on a
+    /// modest connection could easily lose the race against a three-minute
+    /// song. Sampling takes a second or two and roughly 40% of the traffic --
+    /// for something the listener may well skip before it plays.
+    ///
+    /// What it produces is an approximation, within 1 LU of the truth on every
+    /// track measured here, and recorded as sampled so the background pass
+    /// still replaces it with the exact figure once playback has left a copy
+    /// on disk.
+    ///
+    /// Best effort and silent. If it fails, or loses the race, the track is
+    /// levelled a second or two in by [`Self::measure_while_playing`] instead
+    /// -- so the failure mode is a slightly later correction, never a wrong one.
     fn premeasure_next(&mut self, track_id: i64) {
         if !self.normalize {
             return;
@@ -1453,8 +1462,43 @@ impl<E: PlayerEvents> Coordinator<E> {
         let ffmpeg = self.ffmpeg.clone();
         let yt_dlp = self.yt_dlp.clone();
         let cache = self.audio_cache.clone();
+        let stream_urls = Arc::clone(&self.stream_urls);
 
         tauri::async_runtime::spawn(async move {
+            // Nothing to do if this track already has a reading.
+            if crate::loudness::stored(&pool, track_id).await.is_some() {
+                return;
+            }
+
+            // Sampled first. Against a whole extra download this is roughly
+            // 40% of the traffic and a couple of seconds rather than twelve --
+            // and being quick is most of the point, because this is racing the
+            // rest of the current track. A sample that lands is a track
+            // levelled from its first sample; one that does not is a track
+            // levelled a second or two in by `measure_while_playing`.
+            //
+            // The reading is marked sampled, so the background pass still
+            // replaces it with the exact figure once playback has left a copy
+            // on disk.
+            if let Some(ffmpeg) = ffmpeg.as_deref() {
+                if let Some(measured) = sample_playing_track(
+                    &pool,
+                    ffmpeg,
+                    yt_dlp.as_deref(),
+                    &stream_urls,
+                    cache.as_ref(),
+                    track_id,
+                )
+                .await
+                {
+                    crate::loudness::record_sampled(&pool, track_id, measured).await;
+                    return;
+                }
+            }
+
+            // Sampling declines short tracks and fails on anything it cannot
+            // read. The full path handles both, and for a short track costs
+            // about what sampling would have.
             crate::loudness::ensure_measured(
                 &pool,
                 ffmpeg.as_deref(),
@@ -1466,6 +1510,14 @@ impl<E: PlayerEvents> Coordinator<E> {
         });
     }
 
+    /// Starts decoding the next track before it is needed.
+    ///
+    /// The remaining gap between tracks was ffmpeg's own start -- spawning the
+    /// process and waiting for it to buffer. Doing that while the current
+    /// track still plays turns the handover into an append.
+    ///
+    /// Best effort: if it fails or arrives late the ordinary load path runs
+    /// exactly as before.
     fn prepare_next(&mut self, track_id: i64) {
         // Already held, or already building for this track.
         if self.prepared.as_ref().is_some_and(|r| r.track_id == track_id) {
@@ -1553,6 +1605,90 @@ impl<E: PlayerEvents> Coordinator<E> {
         self.report(self.engine.set_volume(slider * correction));
     }
 
+    /// Starts measuring a track that is already playing, if it needs it.
+    ///
+    /// The gap this closes: a stream nobody has played has no reading, so it
+    /// used to play at whatever level it was mastered at and be corrected from
+    /// the *next* time. Measuring needs the whole track, and the whole track is
+    /// not there yet -- which was read as "impossible", and was not. Sampling
+    /// four tenths of it spread across its length lands within 1 LU of the
+    /// truth on every track in this library, and the slices fetch in parallel
+    /// while the song plays, so nothing waits.
+    ///
+    /// Deliberately does nothing when:
+    ///
+    /// - there is already a reading, which is every play after the first;
+    /// - the track is short enough that the background analyser will measure it
+    ///   outright for the same cost, so an approximation buys nothing;
+    /// - levelling is switched off, because the reading would not be used and
+    ///   the traffic would be spent for nothing.
+    fn measure_while_playing(&mut self, track_id: i64) {
+        if !self.normalize || self.track_gain_db.is_some() {
+            return;
+        }
+        let Some(ffmpeg) = self.ffmpeg.clone() else {
+            return;
+        };
+
+        // Only sampled once per track per session. A track that fails -- no
+        // network, an expired URL -- must not be retried on every poll, and a
+        // track already being sampled must not be sampled twice.
+        if !self.sampling.insert(track_id) {
+            return;
+        }
+
+        let pool = self.pool.clone();
+        let levels = self.levels.clone();
+        let yt_dlp = self.yt_dlp.clone();
+        let stream_urls = Arc::clone(&self.stream_urls);
+        let audio_cache = self.audio_cache.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let measured = sample_playing_track(
+                &pool,
+                &ffmpeg,
+                yt_dlp.as_deref(),
+                &stream_urls,
+                audio_cache.as_ref(),
+                track_id,
+            )
+            .await;
+            let _ = levels.send(LevelOutcome { track_id, measured });
+        });
+    }
+    /// Applies a reading that arrived mid-track.
+    ///
+    /// Three ways this can be stale by the time it lands, all of them ordinary:
+    /// the listener skipped to another song, they stopped, or they switched
+    /// levelling off while the slices were in flight. In every case the reading
+    /// is still worth *recording* -- it was paid for, and the next play wants
+    /// it -- but must not touch the gain.
+    ///
+    /// When it does apply, `apply_volume` moves the gain and the volume stage
+    /// glides rather than steps. That is what makes a correction arriving a
+    /// second or two into a song inaudible instead of a click.
+    async fn apply_measured_level(&mut self, outcome: LevelOutcome) {
+        let Some(measured) = outcome.measured else {
+            // Recorded as attempted-and-failed so the background analyser does
+            // not immediately try the same thing again.
+            crate::loudness::record(&self.pool, outcome.track_id, None).await;
+            return;
+        };
+
+        // As an approximation, deliberately. The background pass will replace it
+        // with the exact figure once the cache copy is complete; recording it as
+        // final would end that search and leave the estimate standing forever.
+        crate::loudness::record_sampled(&self.pool, outcome.track_id, measured).await;
+
+        if !reading_applies_now(self.loaded, outcome.track_id, self.normalize) {
+            return;
+        }
+
+        self.track_gain_db = Some(crate::loudness::gain_db(measured, self.target_lufs));
+        self.apply_volume();
+        // So the settings panel stops saying the track has not been measured.
+        self.emit_state();
+    }
     /// Looks up what the track currently loading should be played at.
     ///
     /// Zero when there is no reading yet -- a stream nobody has finished once,
@@ -1564,7 +1700,7 @@ impl<E: PlayerEvents> Coordinator<E> {
     /// and the prepared decoder is `Send` but not `Sync`.
     async fn track_gain_for(&mut self, track_id: i64) -> Option<f32> {
         let measured = crate::loudness::stored(&self.pool, track_id).await?;
-        Some(crate::loudness::gain_db(measured, crate::loudness::TARGET_LUFS))
+        Some(crate::loudness::gain_db(measured, self.target_lufs))
     }
 
     /// Surfaces an engine failure to the UI. Returns whether it succeeded.
@@ -1598,8 +1734,8 @@ impl<E: PlayerEvents> Coordinator<E> {
             manual_length: self.queue.manual_len(),
             loop_queue: self.queue.loops_manual(),
             volume_ceiling_db: self.ceiling_db,
+            target_lufs: self.target_lufs,
             normalize: self.normalize,
-            wait_to_measure: self.wait_to_measure,
             track_gain_db: self.track_gain_db,
             stalled: self.stalled,
         });
@@ -1697,6 +1833,29 @@ impl<E: PlayerEvents> Coordinator<E> {
 /// instantly, but resolving a stream takes seconds, so walking a long queue of
 /// dead links would leave playback stalled for minutes with no explanation.
 const MAX_LOAD_ATTEMPTS: usize = 3;
+
+/// A loudness reading that arrived while a track was already playing.
+///
+/// Carries the track it belongs to because it is answered from a spawned task
+/// and the queue may have moved on: applying a gain measured for the previous
+/// song is exactly the mistake this guards against.
+struct LevelOutcome {
+    track_id: i64,
+    /// `None` when the sampling failed. Recorded either way, so a track that
+    /// cannot be measured is not sampled again on every play.
+    measured: Option<crate::loudness::Loudness>,
+}
+
+/// Whether a reading that has just arrived should move the gain.
+///
+/// Extracted so it can be tested. The condition sits in a spawned path an
+/// integration test cannot reach: the sampler only runs for long uncached
+/// streams, so a test built on local fixtures never produces a `LevelOutcome`
+/// at all, and a guard deleted from here would go on passing. That is exactly
+/// what happened to the first attempt at covering this.
+fn reading_applies_now(loaded: Option<i64>, measured_for: i64, normalize: bool) -> bool {
+    normalize && loaded == Some(measured_for)
+}
 
 /// A decoder built ahead of time for the track that comes next.
 ///
@@ -2121,16 +2280,6 @@ pub async fn set_normalize(on: bool, player: State<'_, PlayerHandle>) -> Result<
     player.send(PlayerCommand::SetNormalize(on))
 }
 
-/// Whether an unheard stream is measured before it starts, rather than played
-/// as mastered and corrected from the next time.
-#[tauri::command]
-pub async fn set_wait_to_measure(
-    on: bool,
-    player: State<'_, PlayerHandle>,
-) -> Result<(), String> {
-    player.send(PlayerCommand::SetWaitToMeasure(on))
-}
-
 #[tauri::command]
 pub async fn set_shuffle(shuffle: bool, player: State<'_, PlayerHandle>) -> Result<(), String> {
     player.send(PlayerCommand::SetShuffle(shuffle))
@@ -2407,4 +2556,131 @@ pub async fn set_equalizer_bands(
 #[tauri::command]
 pub async fn equalizer_bands() -> Vec<f32> {
     crate::equalizer::CENTRES.to_vec()
+}
+
+/// Resolves a playing track to something measurable, and measures it.
+///
+/// Prefers exact over approximate whenever exact is cheap:
+///
+/// 1. **A local file** -- measured in full. It is on disk, it costs about a
+///    second, and an approximation would be strictly worse for no saving.
+/// 2. **A cached stream** -- the same. The audio cache only ever holds complete
+///    copies (a partial write is discarded rather than published), so this is
+///    the whole track and the answer is exact. Reaching for the network here
+///    would spend traffic to get a worse number than the one already on disk.
+/// 3. **A cold stream** -- sampled, because there is nothing else to do. Four
+///    tenths of it, in parallel, while the song plays.
+///
+/// Short tracks are declined outright: the background pass measures them in
+/// full for about what sampling would cost, so an estimate buys nothing.
+async fn sample_playing_track(
+    pool: &SqlitePool,
+    ffmpeg: &std::path::Path,
+    yt_dlp: Option<&std::path::Path>,
+    stream_urls: &StreamUrlCache,
+    audio_cache: Option<&crate::audio_cache::AudioCache>,
+    track_id: i64,
+) -> Option<crate::loudness::Loudness> {
+    let row = sqlx::query(
+        "SELECT source, local_path, remote_id, remote_url, duration_secs \
+           FROM tracks WHERE id = ?",
+    )
+    .bind(track_id)
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+
+    let duration: Option<f64> = row.try_get("duration_secs").ok().flatten();
+    let duration = duration?;
+
+    // On disk in one form or the other: measure it properly.
+    let local: Option<String> = row.try_get("local_path").ok().flatten();
+    let on_disk = local
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            let source: String = row.try_get("source").ok()?;
+            let remote_id: Option<String> = row.try_get("remote_id").ok().flatten();
+            audio_cache?.lookup(&source, &remote_id?)
+        });
+
+    if let Some(path) = on_disk {
+        let ffmpeg = ffmpeg.to_path_buf();
+        return tokio::task::spawn_blocking(move || crate::loudness::measure(&ffmpeg, &path).ok())
+            .await
+            .ok()
+            .flatten();
+    }
+
+    if !crate::loudness_sample::worth_sampling(duration) {
+        return None;
+    }
+
+    // A cold stream. `resolve` hands back the URL playback is already using
+    // while it is still valid, so in the ordinary case this costs no yt-dlp run.
+    let page: Option<String> = row.try_get("remote_url").ok().flatten();
+    let page = page?;
+    let url = stream_urls
+        .resolve(yt_dlp?, &page, crate::stream_urls::Encoding::Preferred)
+        .await
+        .ok()?;
+
+    let ffmpeg = ffmpeg.to_path_buf();
+    tokio::task::spawn_blocking(move || crate::loudness_sample::sample(&ffmpeg, &url, duration).ok())
+        .await
+        .ok()
+        .flatten()
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::reading_applies_now;
+
+    /// The ordinary case: the track that was measured is the one playing.
+    #[test]
+    fn a_reading_for_the_playing_track_is_applied() {
+        assert!(reading_applies_now(Some(7), 7, true));
+    }
+
+    /// The failure this guard exists for.
+    ///
+    /// Sampling answers from a spawned task, seconds after it started. By then
+    /// the listener may have skipped. Applying the previous song's gain to this
+    /// one is the single most audible thing that could go wrong here -- a track
+    /// suddenly playing at a level nobody measured for it.
+    #[test]
+    fn a_reading_for_a_track_that_has_been_skipped_is_not_applied() {
+        assert!(!reading_applies_now(Some(8), 7, true));
+    }
+
+    /// Stopped between starting the measurement and finishing it.
+    #[test]
+    fn a_reading_arriving_after_playback_stopped_is_not_applied() {
+        assert!(!reading_applies_now(None, 7, true));
+    }
+
+    /// Levelling switched off while the slices were in flight. The reading is
+    /// still worth recording, but must not move a gain the listener has just
+    /// asked not to have.
+    #[test]
+    fn a_reading_is_not_applied_when_levelling_is_off() {
+        assert!(!reading_applies_now(Some(7), 7, false));
+        assert!(!reading_applies_now(Some(8), 7, false));
+        assert!(!reading_applies_now(None, 7, false));
+    }
+}
+
+/// The loudness every track is corrected towards, in LUFS.
+///
+/// Offered because the right answer depends on where the music is going.
+/// -14 is what YouTube and Spotify converge on and suits most listening. A
+/// quieter target leaves more headroom, so fewer tracks are pulled down by the
+/// limiter; a louder one gets closer to how a phone speaker wants to be driven,
+/// at the cost of asking for boost that many tracks have no room for.
+///
+/// Clamped rather than rejected: it arrives from the frontend as JSON, and a
+/// slider that silently did nothing would be a worse bug than one that stops.
+#[tauri::command]
+pub async fn set_target_lufs(lufs: f32, player: State<'_, PlayerHandle>) -> Result<(), String> {
+    player.send(PlayerCommand::SetTargetLufs(lufs))
 }

@@ -452,3 +452,72 @@ async fn a_play_key_never_pauses_and_a_pause_key_never_plays() {
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A reading that arrives after the track has gone must not be applied.
+///
+/// The whole design turns on this. Sampling runs on a spawned task while the
+/// song plays, so by the time it answers the listener may have skipped, or
+/// stopped, or switched levelling off. Applying a gain measured for the
+/// previous song is the one failure that would be plainly audible -- the next
+/// track suddenly at the wrong level -- and it is invisible in any test that
+/// only ever measures one track.
+#[tokio::test]
+async fn a_late_loudness_reading_is_not_applied_to_the_wrong_track() {
+    let base = std::env::temp_dir().join("music-app-late-level");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let (db, ids) = fixture(&base, 2000).await;
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![ids[0], ids[1]],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    if recorder.no_audio_device() {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    // Give the first track a reading it did not have, as the sampler would.
+    // A deliberately extreme one, so a gain computed from it is unmistakable.
+    sqlx::query(
+        "UPDATE tracks SET loudness_lufs = -30.0, loudness_peak = -6.0, \
+         loudness_at = datetime('now') WHERE id = ?",
+    )
+    .bind(ids[0])
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // Move on before anything could have applied it.
+    handle.send(PlayerCommand::Next).unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let states = recorder.0.states.lock().unwrap().clone();
+    let current = states.last().expect("a state should have been emitted");
+
+    assert_eq!(
+        current.track_id,
+        Some(ids[1]),
+        "the second track should be playing",
+    );
+    // The second track has no reading of its own, so it must be at unity --
+    // not at whatever the first track's -30 LUFS would have asked for.
+    assert!(
+        current.track_gain_db.is_none_or(|g| g.abs() < 0.01),
+        "the second track is playing at {:?} dB, which can only have come from \
+         the first track's reading",
+        current.track_gain_db,
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}

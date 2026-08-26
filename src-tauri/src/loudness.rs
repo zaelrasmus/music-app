@@ -27,11 +27,22 @@ use sqlx::{Row, SqlitePool};
 
 use crate::audio_cache::AudioCache;
 
-/// Where a normalised track lands.
+/// Where a normalised track lands, unless the listener says otherwise.
 ///
 /// -14 LUFS is what YouTube and Spotify converge on, which matters because it
-/// is the level this library's streamed half was mastered to sit near.
+/// is the level this library's streamed half was mastered to sit near. It is
+/// the default rather than the only choice: the right target depends on what
+/// someone is listening on, and the range below is what makes sense to offer.
 pub const TARGET_LUFS: f32 = -14.0;
+
+/// The quietest and loudest targets worth offering.
+///
+/// Quieter than -23 is broadcast territory and would leave this library barely
+/// audible on a laptop. Louder than -9 asks for more boost than most tracks
+/// have headroom for, so the limiter would spend its time undoing it and the
+/// levelling would stop being a level change.
+pub const MIN_TARGET_LUFS: f32 = -23.0;
+pub const MAX_TARGET_LUFS: f32 = -9.0;
 
 /// The most a track may be pushed up, and pulled down.
 ///
@@ -192,14 +203,36 @@ pub async fn stored(pool: &SqlitePool, track_id: i64) -> Option<Loudness> {
 ///
 /// `loudness_at` is stamped either way. A file that cannot be measured must
 /// not be retried on every pass -- see the note in `0019_track_loudness.sql`.
-async fn record(pool: &SqlitePool, track_id: i64, measured: Option<Loudness>) {
+pub(crate) async fn record(pool: &SqlitePool, track_id: i64, measured: Option<Loudness>) {
+    write_reading(pool, track_id, measured, false).await
+}
+
+/// Records a reading taken by sampling rather than by measuring in full.
+///
+/// Kept apart from [`record`] because of what it must *not* do: mark the track
+/// finished. The background pass looks for `loudness_at IS NULL`, so a sampled
+/// reading written like an exact one would end the search and the estimate
+/// would stand forever. The flag keeps the track on the list until the real
+/// figure can be taken from the cache copy playback already wrote.
+pub(crate) async fn record_sampled(pool: &SqlitePool, track_id: i64, measured: Loudness) {
+    write_reading(pool, track_id, Some(measured), true).await
+}
+
+async fn write_reading(
+    pool: &SqlitePool,
+    track_id: i64,
+    measured: Option<Loudness>,
+    sampled: bool,
+) {
     let _ = sqlx::query(
         "UPDATE tracks
-            SET loudness_lufs = ?, loudness_peak = ?, loudness_at = datetime('now')
+            SET loudness_lufs = ?, loudness_peak = ?, loudness_at = datetime('now'),
+                loudness_sampled = ?
           WHERE id = ?",
     )
     .bind(measured.map(|m| m.lufs as f64))
     .bind(measured.map(|m| m.true_peak_db as f64))
+    .bind(i64::from(sampled))
     .bind(track_id)
     .execute(pool)
     .await;
@@ -248,7 +281,7 @@ async fn pending(pool: &SqlitePool, cache: Option<&AudioCache>, limit: i64) -> V
     let rows = sqlx::query(
         "SELECT id, source, local_path, remote_id
            FROM tracks
-          WHERE loudness_at IS NULL
+          WHERE loudness_at IS NULL OR loudness_sampled = 1
           ORDER BY id
           LIMIT ?",
     )
@@ -324,12 +357,25 @@ const MEASURE_FETCH_MAX_SECS: f64 = 20.0 * 60.0;
 /// `loudness_at` is stamped even when measurement failed, so "tried and could
 /// not" is distinguishable from "never tried" -- without that, an unmeasurable
 /// file would be fetched and re-measured on every pass forever.
+///
+/// A *sampled* reading is deliberately not settled. It is good enough to level
+/// by and not good enough to stop looking: the exact figure is cheap once the
+/// audio is on disk, and leaving the estimate in place would make a stopgap
+/// permanent.
 async fn settled(pool: &SqlitePool, track_id: i64) -> Option<bool> {
-    let row = sqlx::query("SELECT loudness_at, loudness_lufs FROM tracks WHERE id = ?")
-        .bind(track_id)
-        .fetch_optional(pool)
-        .await
-        .ok()??;
+    let row = sqlx::query(
+        "SELECT loudness_at, loudness_lufs, loudness_sampled FROM tracks WHERE id = ?",
+    )
+    .bind(track_id)
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+
+    let sampled: i64 = row.try_get("loudness_sampled").unwrap_or(0);
+    if sampled != 0 {
+        return Some(false);
+    }
+
     let at: Option<String> = row.try_get("loudness_at").ok().flatten();
     at?;
     let lufs: Option<f64> = row.try_get("loudness_lufs").ok().flatten();
@@ -731,5 +777,145 @@ mod tests {
         };
         assert!(gain_db(absurdly_quiet, TARGET_LUFS) <= MAX_BOOST_DB);
         assert!(gain_db(absurdly_loud, TARGET_LUFS) >= -MAX_CUT_DB);
+    }
+}
+
+#[cfg(test)]
+mod sampled_tests {
+    use super::*;
+
+    async fn track_with(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO tracks (source, title, local_path, state) \
+             VALUES ('local', 'x', 'x.wav', 'present') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A sampled reading must be usable *and* still be looking for better.
+    ///
+    /// This is the failure the flag exists for. The background pass finds work
+    /// with `loudness_at IS NULL`, and a sampled reading writes that column --
+    /// so without the flag the estimate would end the search and stand forever,
+    /// which is precisely the thing it was introduced to avoid. It was written
+    /// that way first, and this is what would have caught it.
+    #[tokio::test]
+    async fn a_sampled_reading_is_used_but_not_treated_as_final() {
+        let dir = std::env::temp_dir().join("music-app-sampled-flag");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = crate::db::init(&dir).await.unwrap();
+        let id = track_with(&db.pool).await;
+
+        record_sampled(
+            &db.pool,
+            id,
+            Loudness {
+                lufs: -9.0,
+                true_peak_db: -1.0,
+            },
+        )
+        .await;
+
+        // Usable: the player reads it and levels by it.
+        let stored = stored(&db.pool, id).await;
+        assert!(stored.is_some(), "a sampled reading should be readable");
+        assert_eq!(stored.unwrap().lufs, -9.0);
+
+        // Not final: the analyser must still pick this track up.
+        assert_eq!(
+            settled(&db.pool, id).await,
+            Some(false),
+            "a sampled reading was treated as final, so the exact figure would \
+             never be taken and the estimate would be permanent",
+        );
+
+        db.pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And once the real measurement lands, the flag clears.
+    #[tokio::test]
+    async fn measuring_in_full_replaces_a_sampled_reading() {
+        let dir = std::env::temp_dir().join("music-app-sampled-replace");
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = crate::db::init(&dir).await.unwrap();
+        let id = track_with(&db.pool).await;
+
+        record_sampled(
+            &db.pool,
+            id,
+            Loudness {
+                lufs: -9.0,
+                true_peak_db: -1.0,
+            },
+        )
+        .await;
+        record(
+            &db.pool,
+            id,
+            Some(Loudness {
+                lufs: -8.4,
+                true_peak_db: -0.8,
+            }),
+        )
+        .await;
+
+        assert_eq!(stored(&db.pool, id).await.unwrap().lufs, -8.4);
+        assert_eq!(
+            settled(&db.pool, id).await,
+            Some(true),
+            "an exact measurement should settle the track",
+        );
+
+        db.pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    /// The target moves the gain, which is the whole point of offering it.
+    #[test]
+    fn a_quieter_target_asks_for_less_gain() {
+        let quiet = Loudness {
+            lufs: -20.0,
+            true_peak_db: -3.0,
+        };
+        let at_14 = gain_db(quiet, TARGET_LUFS);
+        let at_18 = gain_db(quiet, -18.0);
+
+        assert!(
+            at_18 < at_14,
+            "aiming quieter should ask for less boost: {at_18} vs {at_14}",
+        );
+    }
+
+    /// And the offered range stays inside what the gain limiter allows, so a
+    /// choice at either end is still a choice rather than a no-op.
+    #[test]
+    fn both_ends_of_the_range_still_change_something() {
+        let ordinary = Loudness {
+            lufs: -14.0,
+            true_peak_db: -1.0,
+        };
+        let quietest = gain_db(ordinary, MIN_TARGET_LUFS);
+        let loudest = gain_db(ordinary, MAX_TARGET_LUFS);
+
+        assert!(
+            quietest < 0.0,
+            "the quietest target should pull an already-on-target track down",
+        );
+        assert!(
+            loudest > 0.0,
+            "the loudest target should push an already-on-target track up",
+        );
+        assert!(
+            loudest > quietest,
+            "the range should be ordered: {quietest} then {loudest}",
+        );
     }
 }

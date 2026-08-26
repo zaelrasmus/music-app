@@ -768,6 +768,10 @@ struct Levelled<S> {
     inner: S,
     gain: Arc<AtomicU32>,
     limiter: Limiter,
+    /// What the gain actually is, as opposed to what has been asked for.
+    current_gain: f32,
+    /// Per-frame smoothing coefficient, from the source rate.
+    glide: f32,
 }
 
 impl<S> Levelled<S>
@@ -775,11 +779,18 @@ where
     S: Source,
 {
     fn new(inner: S, gain: Arc<AtomicU32>) -> Self {
-        let limiter = Limiter::new(inner.channels().get() as usize, inner.sample_rate().get());
+        let rate = inner.sample_rate().get();
+        let limiter = Limiter::new(inner.channels().get() as usize, rate);
+        // One-pole coefficient for a 30 ms time constant at this rate.
+        let glide = 1.0 - (-1.0 / (GLIDE_SECONDS * rate as f32)).exp();
         Self {
             inner,
+            // Starts *at* the requested gain rather than gliding up from zero:
+            // a track should begin at its level, not fade in.
+            current_gain: f32::from_bits(gain.load(Ordering::Relaxed)),
             gain,
             limiter,
+            glide,
         }
     }
 
@@ -788,8 +799,51 @@ where
     /// A short read at the end of a track is padded rather than dropped: the
     /// stream is interleaved, so half a frame would put every sample after it
     /// in the wrong channel.
+    /// One frame, scaled by the volume.
+    ///
+    /// The gain *glides* to whatever the cell says rather than jumping to it.
+    /// A jump is a step discontinuity: measured on a 440 Hz tone at 0.4 peak, a
+    /// +6 dB change moved the signal 0.3427 between two adjacent samples, where
+    /// the tone itself can only move 0.0230. That is fifteen times what the
+    /// music can do, and it is a click.
+    ///
+    /// It is reachable today by toggling levelling mid-track or moving the
+    /// ceiling -- and the settings panel invites exactly that, since comparing
+    /// the same passage both ways is the only way to judge it. So this is a fix
+    /// before it is groundwork.
+    ///
+    /// One-pole smoothing rather than a linear ramp: it cannot overshoot, needs
+    /// one multiply-add, and has no corner at either end where a linear ramp has
+    /// two. `SNAP` is what keeps it exact -- an exponential approach never quite
+    /// arrives, and a gain of 0.99999 forever would cost the bit-exactness that
+    /// unity gain is supposed to guarantee.
     fn pull_frame(&mut self) -> Option<Vec<rodio::Sample>> {
-        let gain = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        let target = f32::from_bits(self.gain.load(Ordering::Relaxed));
+
+        // Reached at the top rather than after the move, so a settled gain
+        // costs one comparison and multiplies by exactly the number asked for.
+        let delta = target - self.current_gain;
+        if delta.abs() <= SNAP {
+            self.current_gain = target;
+        } else {
+            let step = delta * self.glide;
+            // A one-pole stalls before it arrives. The increment is
+            // proportional to the remaining error, so once that error falls
+            // below about 1.7e-4 the step is smaller than an f32 ULP at unity
+            // gain and adding it changes nothing -- the glide stops short and
+            // stays there. Measured: a -6 dB change settled at 0.5012301 and
+            // never reached the 0.5011872 it was asked for, however long it
+            // ran. The floor guarantees the approach terminates; it only
+            // applies over the last fraction of the move, worth a few
+            // milliseconds.
+            self.current_gain += if step.abs() < MIN_STEP {
+                MIN_STEP.copysign(delta)
+            } else {
+                step
+            };
+        }
+        let gain = self.current_gain;
+
         let channels = self.limiter.channels;
         let mut frame = Vec::with_capacity(channels);
         for index in 0..channels {
@@ -802,6 +856,26 @@ where
         Some(frame)
     }
 }
+
+/// Below this the glide is finished and the target is taken exactly.
+///
+/// 1e-5 of linear gain is under a thousandth of a decibel.
+const SNAP: f32 = 1e-5;
+
+/// The smallest move the glide may make, so it cannot stall short of SNAP.
+///
+/// Ten times the f32 resolution at unity gain, which is where the stall
+/// happens. Large enough to always land, small enough to be a continuation of
+/// the curve rather than a step at the end of it.
+const MIN_STEP: f32 = 1e-6;
+
+/// How long the gain takes to cover most of a change, in seconds.
+///
+/// Thirty milliseconds is the usual figure for click-free volume smoothing: far
+/// slower than the step it replaces, far faster than a listener can notice a
+/// slider lagging. It also sets the pace for a loudness correction arriving
+/// mid-track, where slower would be fine and this is already imperceptible.
+const GLIDE_SECONDS: f32 = 0.03;
 
 impl<S> Iterator for Levelled<S>
 where
@@ -1347,6 +1421,121 @@ mod limiter_tests {
 mod signal_tests {
     use super::*;
 
+
+    /// A gain change mid-track must not be a step.
+    ///
+    /// Reachable today by toggling levelling or moving the ceiling while a
+    /// track plays, and the settings panel invites exactly that. It is also the
+    /// mechanism a loudness correction arriving mid-track would use, so this
+    /// guards both.
+    ///
+    /// The bar is the signal's own slew rate: a 440 Hz sine at amplitude A
+    /// moves at most `A * 2*pi*f/rate` between samples. Anything beyond that
+    /// did not come from the music. Before the glide, +6 dB measured 0.3427
+    /// against a natural 0.0230 -- fifteen times over.
+    #[test]
+    fn a_gain_change_never_moves_faster_than_the_music() {
+        const PEAK: f32 = 0.4;
+
+        for db in [-12.0f32, -6.0, -3.0, 3.0, 6.0, 12.0] {
+            let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+            let buffer = rodio::buffer::SamplesBuffer::new(
+                rodio::ChannelCount::new(2).unwrap(),
+                rodio::SampleRate::new(RATE).unwrap(),
+                stereo_tone(440.0, PEAK, 60_000),
+            );
+            let mut source = Levelled::new(buffer, Arc::clone(&gain));
+
+            let mut out = Vec::new();
+            for _ in 0..20_000 {
+                out.push(source.next().unwrap());
+            }
+            let linear = rodio::math::db_to_linear(db);
+            gain.store(linear.to_bits(), Ordering::Relaxed);
+            for _ in 0..40_000 {
+                match source.next() {
+                    Some(s) => out.push(s),
+                    None => break,
+                }
+            }
+
+            let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+            let worst = left
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0f32, f32::max);
+
+            // The tone after the change is louder by `linear`, so that is the
+            // amplitude whose slew rate sets the bar. A small margin covers the
+            // limiter, which is downstream and may act on a boost.
+            let natural = PEAK * linear.max(1.0) * (2.0 * std::f32::consts::PI * 440.0 / RATE as f32);
+            assert!(
+                worst <= natural * 1.15,
+                "a {db} dB change stepped {worst:.4}, where the music itself can \
+                 only move {natural:.4} -- that is a click",
+            );
+        }
+    }
+
+    /// The glide must not cost the pass-through it protects.
+    ///
+    /// Unity gain has to stay bit-exact: a one-pole approach never quite
+    /// arrives, and multiplying by 0.99999 forever would be a slow leak of
+    /// exactly the property the limiter tests establish.
+    #[test]
+    fn a_gain_that_never_changes_is_still_bit_exact() {
+        let input = stereo_tone(1000.0, 0.5, 40_000);
+        let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let buffer = rodio::buffer::SamplesBuffer::new(
+            rodio::ChannelCount::new(2).unwrap(),
+            rodio::SampleRate::new(RATE).unwrap(),
+            input.clone(),
+        );
+        let out: Vec<f32> = Levelled::new(buffer, gain).collect();
+
+        assert_eq!(out, input, "unity gain altered the samples");
+    }
+
+    /// And it must settle exactly, not asymptotically.
+    ///
+    /// A gain left a hair below its target is a level error that never
+    /// resolves. `SNAP` is what makes the approach terminate.
+    #[test]
+    fn a_glide_arrives_exactly_at_what_was_asked_for() {
+        let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let buffer = rodio::buffer::SamplesBuffer::new(
+            rodio::ChannelCount::new(2).unwrap(),
+            rodio::SampleRate::new(RATE).unwrap(),
+            // DC, so the output *is* the gain and can be read directly. Long
+            // enough to settle: a one-pole reaching SNAP from a 0.5 error takes
+            // about 15,500 frames, which is 320 ms and inaudible, but it is not
+            // instant and the test has to allow for it.
+            vec![1.0f32; 400_000],
+        );
+        let mut source = Levelled::new(buffer, Arc::clone(&gain));
+
+        for _ in 0..1_000 {
+            let _ = source.next();
+        }
+        let target = rodio::math::db_to_linear(-6.0);
+        gain.store(target.to_bits(), Ordering::Relaxed);
+
+        // Well past the 30 ms time constant, and past full settling.
+        let mut last = 0.0f32;
+        for _ in 0..380_000 {
+            if let Some(s) = source.next() {
+                last = s;
+            }
+        }
+        assert_eq!(
+            last, target,
+            "the glide settled at {last} rather than the {target} it was asked for",
+        );
+    }
+
+    /// What the f64 change is worth at settings people actually use.
+    ///
+    /// The -61 dB figure that justified the switch was measured with every band
 
     /// Changing the equaliser mid-song must not click.
     ///

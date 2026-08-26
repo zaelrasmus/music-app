@@ -1,0 +1,18 @@
+-- Marks a loudness reading as an approximation rather than the real thing.
+--
+-- A cold stream is now measured *while it plays*, by sampling four tenths of it
+-- spread across its length. That lands within 1 LU of the truth on every track
+-- measured against this library -- good enough to level by, and available a
+-- second or two into a song that started instantly, instead of not until the
+-- next play.
+--
+-- It is still an approximation, and the background pass finds work with
+-- `loudness_at IS NULL`. Writing a sampled reading into the same columns would
+-- therefore mark the track finished and the exact figure would never be taken:
+-- the estimate would become permanent. This column is what keeps the track on
+-- the list, so the analyser re-measures it properly once the full audio is on
+-- disk -- which it is the moment the stream finishes, because playback writes a
+-- cache copy from the same read for no extra traffic.
+--
+-- Defaults to 0, so every reading already stored is treated as exact. They were.
+ALTER TABLE tracks ADD COLUMN loudness_sampled INTEGER NOT NULL DEFAULT 0;

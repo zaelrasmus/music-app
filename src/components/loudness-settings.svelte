@@ -17,10 +17,47 @@
         { db: -12, label: "−12 dB", detail: "A quarter" },
     ];
 
+
+    /**
+     * The targets worth offering, with what each is actually for.
+     *
+     * Steps rather than a slider for the same reason as the ceiling: this is a
+     * number nobody can set by ear, and four labelled choices are more useful
+     * than a continuous control that invites landing on -13.4.
+     *
+     * The range stops at -23 and -9 because the backend clamps there: quieter
+     * is broadcast territory and would leave this library barely audible on a
+     * laptop, louder asks for more boost than most tracks have headroom for.
+     */
+    const TARGETS = [
+        {
+            lufs: -18,
+            label: "−18",
+            detail: "Quiet",
+            guide: "More headroom, so almost nothing is pulled down by the limiter. Good on headphones or a real hi-fi, where you can just turn it up.",
+        },
+        {
+            lufs: -14,
+            label: "−14",
+            detail: "Standard",
+            guide: "What YouTube and Spotify use, and the level most of this library was mastered near. Leave it here unless something bothers you.",
+        },
+        {
+            lufs: -11,
+            label: "−11",
+            detail: "Loud",
+            guide: "Closer to how a phone or laptop speaker wants to be driven. Quiet tracks get a real lift; loud ones have less room, so the limiter works harder.",
+        },
+        {
+            lufs: -9,
+            label: "−9",
+            detail: "Loudest",
+            guide: "As far as this goes. Most tracks have no headroom for it, so expect the limiter to be doing something on nearly everything. Useful in a noisy room, not for listening closely.",
+        },
+    ];
     const current = $derived(player.volumeCeilingDb);
     const on = $derived(player.normalize);
     const gain = $derived(player.trackGainDb);
-    const waiting = $derived(player.waitToMeasure);
 
     /** Signed, because the direction is the interesting half. */
     function formatGain(db: number) {
@@ -66,58 +103,64 @@
         </div>
 
         <p class="text-muted-foreground text-[13px] leading-relaxed">
-            Each track is measured once, in the background, and played back at a gain
-            that brings it towards
+            Each track is played at a gain that brings it towards
             <span class="text-foreground font-medium">−14 LUFS</span> — the level
-            YouTube and Spotify use. The gain is decided when the track starts and
-            never moves while it plays, so this is a volume correction and not a
-            compressor. Nothing is filtered.
+            YouTube and Spotify use. It is a volume correction and not a compressor:
+            one number per track, nothing filtered, nothing squashed.
         </p>
 
         <p class="text-muted-foreground text-[13px] leading-relaxed">
-            The next track in the queue is measured while the current one is still
-            playing, so ordinary listening is levelled all the way through. Files on
-            disk are measured in the background. Only a track you pick and play
-            immediately, that nobody has heard before, arrives unmeasured — it plays
-            as mastered and is corrected from the next time.
+            Files on disk are measured in the background, and so is every track you
+            have already heard. A stream nobody has played has nothing to measure
+            yet, so it is sampled instead — four short pieces spread across its
+            length, fetched while the song is already playing. That lands within
+            <span class="text-foreground font-medium">1 dB</span> of a full
+            measurement on every track tested here, and the correction fades in a
+            second or two in rather than switching, so you should not hear it
+            arrive. The exact figure is taken afterwards from the copy the stream
+            left behind, and is what every later play uses.
         </p>
 
         {#if on}
+
+
             <!--
-              Nested under the switch above because it does nothing on its own:
-              measuring a track changes nothing audible unless the correction is
-              being applied.
+              Steps, and each one labelled with what it is *for* rather than
+              what it is. "-14 LUFS" means nothing to most people; "what YouTube
+              and Spotify use" is the same fact in a form you can act on.
             -->
-            <div
-                class="border-border/60 flex items-start justify-between gap-4 rounded-lg border p-3"
-            >
-                <div class="flex flex-col gap-1">
-                    <span class="text-[13px] font-medium">Wait for unheard tracks</span>
-                    <span class="text-muted-foreground text-xs leading-relaxed">
-                        Measure a brand-new stream before playing it instead of after.
-                        Levels it from the very first listen, at the cost of roughly
-                        ten seconds before the sound starts. Nothing already measured,
-                        queued, or on disk is affected.
+            <div class="border-border/60 flex flex-col gap-2 rounded-lg border p-3">
+                <div class="flex items-baseline justify-between gap-3">
+                    <span class="text-[13px] font-medium">Target loudness</span>
+                    <span class="text-muted-foreground text-xs tabular-nums">
+                        {player.targetLufs} LUFS
                     </span>
                 </div>
-                <button
-                    type="button"
-                    role="switch"
-                    aria-checked={waiting}
-                    aria-label="Wait for unheard tracks"
-                    class="relative mt-0.5 inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors {waiting
-                        ? 'bg-primary'
-                        : 'bg-muted-foreground/30'}"
-                    onclick={() => player.setWaitToMeasure(!waiting)}
-                >
-                    <span
-                        class="bg-background inline-block size-4 rounded-full shadow-sm transition-transform {waiting
-                            ? 'translate-x-[18px]'
-                            : 'translate-x-0.5'}"
-                    ></span>
-                </button>
-            </div>
 
+                <div class="bg-muted flex flex-wrap items-center gap-0.5 rounded-lg p-0.5">
+                    {#each TARGETS as choice (choice.lufs)}
+                        {@const selected = player.targetLufs === choice.lufs}
+                        <button
+                            type="button"
+                            class="flex flex-1 flex-col items-center rounded-md px-2 py-1.5 text-xs transition-colors {selected
+                                ? 'bg-background shadow-sm'
+                                : 'text-muted-foreground hover:text-foreground'}"
+                            aria-pressed={selected}
+                            onclick={() => player.setTargetLufs(choice.lufs)}
+                        >
+                            <span class="font-medium tabular-nums">{choice.label}</span>
+                            <span class="text-muted-foreground text-[11px]">
+                                {choice.detail}
+                            </span>
+                        </button>
+                    {/each}
+                </div>
+
+                <p class="text-muted-foreground text-xs leading-relaxed">
+                    {TARGETS.find((t) => t.lufs === player.targetLufs)?.guide ??
+                        "A custom target."}
+                </p>
+            </div>
             <!-- The readout is the point of the toggle: switching it while a
                  track plays is how you check whether it is doing anything, and
                  a number makes "did that change?" answerable. -->

@@ -15,6 +15,7 @@ mod media_controls;
 mod now_playing;
 mod library;
 mod loudness;
+mod loudness_sample;
 #[cfg(test)]
 mod loudness_window;
 mod playable;
@@ -343,10 +344,10 @@ pub fn run() {
             player::set_loop_queue,
             player::set_volume_ceiling,
             player::set_normalize,
+            player::set_target_lufs,
             player::set_equalizer_enabled,
             player::set_equalizer_bands,
             player::equalizer_bands,
-            player::set_wait_to_measure,
             loudness::measure_track,
             loudness::measured_track_ids,
             player::seek,

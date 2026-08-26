@@ -28,6 +28,7 @@ export type PlayerStatus = {
   loopQueue: boolean;
   /** The chosen top of the slider, in dB below unity. 0 passes audio through. */
   volumeCeilingDb: number;
+  targetLufs: number;
   /** The stream has run dry without ending: the connection is not keeping up. */
   stalled: boolean;
   /** Whether per-track loudness correction is on. */
@@ -39,7 +40,6 @@ export type PlayerStatus = {
    */
   trackGainDb: number | null;
   /** Whether an unheard stream is measured before it starts playing. */
-  waitToMeasure: boolean;
 };
 
 export type PlayerProgress = {
@@ -70,9 +70,10 @@ class PlayerStore {
   manualLength = $state(0);
   loopQueue = $state(false);
   volumeCeilingDb = $state(0);
+  /** The loudness every track is corrected towards. */
+  targetLufs = $state(-14);
   normalize = $state(false);
   trackGainDb = $state<number | null>(null);
-  waitToMeasure = $state(false);
   stalled = $state(false);
 
   /** Authoritative position from the backend, in seconds. */
@@ -116,9 +117,9 @@ class PlayerStore {
       this.manualLength = s.manualLength;
       this.loopQueue = s.loopQueue;
       this.volumeCeilingDb = s.volumeCeilingDb;
+      this.targetLufs = s.targetLufs;
       this.normalize = s.normalize;
       this.trackGainDb = s.trackGainDb;
-      this.waitToMeasure = s.waitToMeasure;
       this.stalled = s.stalled;
 
       // Leaving a track is when one most often becomes cached, so this is the
@@ -221,7 +222,7 @@ class PlayerStore {
 
   /** Restores persisted preferences and pushes them to the backend. */
   async restorePreferences() {
-    const [volume, muted, repeat, shuffle, ceiling, normalize, waitToMeasure] =
+    const [volume, muted, repeat, shuffle, ceiling, normalize, target] =
       await Promise.all([
       readSetting("volume", 1),
       readSetting("muted", false),
@@ -234,9 +235,9 @@ class PlayerStore {
       // Off by default: it changes how every track sounds, so it should be a
       // thing someone turned on rather than something that happened to them.
       readSetting("normalizeLoudness", false),
-      // Also off: it trades about twelve seconds of waiting on a track nobody
-      // has heard, which nobody should discover by accident.
-      readSetting("waitToMeasure", false),
+      // What levelling aims at. -14 LUFS is where YouTube and Spotify sit, so
+      // it is the level this library was mostly mastered near.
+      readSetting("targetLufs", -14),
     ]);
 
     await Promise.all([
@@ -246,7 +247,7 @@ class PlayerStore {
       invoke("set_shuffle", { shuffle }),
       invoke("set_volume_ceiling", { db: ceiling }),
       invoke("set_normalize", { on: normalize }),
-      invoke("set_wait_to_measure", { on: waitToMeasure }),
+      invoke("set_target_lufs", { lufs: target }),
     ]);
   }
 
@@ -329,17 +330,6 @@ class PlayerStore {
     await writeSetting("normalizeLoudness", on);
   }
 
-  /**
-   * Whether an unheard stream waits to be measured before it starts.
-   *
-   * Only does anything while levelling is on — measuring a track changes
-   * nothing audible unless the correction is being applied.
-   */
-  async setWaitToMeasure(on: boolean) {
-    await this.run("set_wait_to_measure", { on });
-    await writeSetting("waitToMeasure", on);
-  }
-
   async setVolume(volume: number) {
     await this.run("set_volume", { volume });
     await writeSetting("volume", volume);
@@ -383,6 +373,17 @@ class PlayerStore {
    * Applied to what is already playing, not the next track — a control
    * whose effect you cannot hear is one you cannot judge.
    */
+  /**
+   * The loudness every track is corrected towards.
+   *
+   * Heard immediately, because the gain is derived from it: moving this and
+   * hearing nothing until the next track is how a setting gets called broken.
+   */
+  async setTargetLufs(lufs: number) {
+    await this.run("set_target_lufs", { lufs });
+    await writeSetting("targetLufs", lufs);
+  }
+
   async setVolumeCeiling(db: number) {
     await this.run("set_volume_ceiling", { db });
     await writeSetting("volumeCeilingDb", db);
