@@ -2,6 +2,7 @@ pub mod audio_cache;
 mod collections;
 mod covers;
 pub mod db;
+mod device_watch;
 mod download;
 mod downloads;
 #[cfg(test)]

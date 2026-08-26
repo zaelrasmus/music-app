@@ -137,3 +137,20 @@ panic = "abort"
 # Linux backend, which is 40-odd crates that cannot build here anyway.
 [target."cfg(windows)".dependencies]
 souvlaki = { version = "0.8", default-features = false }
+
+# Audio endpoint change notifications, for `device_watch`.
+#
+# The portable way to notice a device change is to poll cpal, which costs
+# 3.2 ms and a CPU wakeup every second for the life of the process. WASAPI will
+# simply tell us instead -- `IMMNotificationClient` is a callback the audio
+# service invokes -- for no wakeups at all and no delay.
+#
+# Version pinned to what the tree already resolves through Tauri, so this
+# builds nothing new. Two features only: the audio endpoint API and enough COM
+# to create the enumerator. `windows::core::implement`, which builds the
+# callback's vtable, needs no feature.
+windows = { version = "0.61", features = ["Win32_Media_Audio", "Win32_System_Com"] }
+# Named directly because `#[implement]` expands to `windows_core::` paths, which
+# only resolve if the crate is a dependency by that name. Same version the
+# `windows` facade re-exports, so it is the same crate either way.
+windows-core = "0.61"

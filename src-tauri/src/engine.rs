@@ -72,6 +72,20 @@ pub enum EngineEvent {
     /// Repeated roughly once a second while it lasts, so the coordinator can
     /// time it without running a clock of its own.
     Stalled { epoch: u64, stalled: bool },
+    /// The output device was reopened, or could not be.
+    ///
+    /// Sent only when the engine actually acted, never on a poll that found
+    /// nothing changed. Two things follow from it and neither is the engine's
+    /// to decide: anything prepared against the old device is now built at the
+    /// wrong rate, and a failure is the only sign the user will get that
+    /// their music stopped for a reason.
+    Output {
+        /// What audio now plays through, when that could be determined.
+        name: Option<String>,
+        /// `None` on success. Otherwise either no output could be opened at
+        /// all, or one was and the track playing could not be rebuilt on it.
+        error: Option<String>,
+    },
 }
 
 enum Command {
@@ -117,6 +131,21 @@ enum Command {
         reply: oneshot::Sender<Result<(), String>>,
     },
 }
+
+/// What the device watcher last saw, sent only when it changed.
+///
+/// Carries the observation rather than a verdict: the watcher knows what the
+/// system default is, and only the engine knows what it opened, so only the
+/// engine can tell a real switch from a probe confirming what is already
+/// playing.
+///
+/// Its own channel rather than a `Command`, for two reasons. The audio thread
+/// stops when its command channel disconnects, so a watcher holding a `Sender`
+/// clone would keep the thread alive after the engine that owns it was
+/// dropped. And a command *interrupts* the 50 ms poll, where this is drained
+/// on a tick that was going to happen anyway -- which matters because that
+/// poll is what decides how quickly one track hands over to the next.
+type DeviceReport = Option<crate::device_watch::DeviceIdentity>;
 
 /// Handle to the audio thread.
 ///
@@ -257,9 +286,16 @@ pub fn spawn(events: UnboundedSender<EngineEvent>, ffmpeg: Option<PathBuf>) -> A
     let eq = Arc::new(EqSettings::default());
     let audio_eq = Arc::clone(&eq);
 
+    // Watching starts with the engine and ends with it. The send fails once
+    // the audio thread has gone, which is what stops the watcher -- so nothing
+    // has to remember to shut it down, and a dropped engine does not leave a
+    // thread probing audio endpoints for the life of the process.
+    let (device_tx, device_rx) = mpsc::channel::<DeviceReport>();
+    crate::device_watch::watch(move |seen| device_tx.send(seen).is_ok());
+
     std::thread::Builder::new()
         .name("audio".to_string())
-        .spawn(move || run(rx, events, ffmpeg, published, audio_eq))
+        .spawn(move || run(rx, device_rx, events, ffmpeg, published, audio_eq))
         .expect("audio thread should spawn");
 
     AudioEngine {
@@ -282,25 +318,250 @@ struct Chain {
     eq: Arc<EqSettings>,
 }
 
+/// The output the engine is playing through.
+struct Output {
+    sink: rodio::MixerDeviceSink,
+    /// What the system said the default device was when this was opened.
+    ///
+    /// The *probe's* view of the device, never the sink's negotiated
+    /// configuration. rodio may settle on a config the device does not
+    /// advertise, and comparing those two would report a change on every poll
+    /// and reopen the stream once a second forever.
+    identity: Option<crate::device_watch::DeviceIdentity>,
+    /// Set by cpal when the stream itself fails.
+    ///
+    /// The only signal for a device that goes away without the *default*
+    /// changing -- which is what a Bluetooth headset does when it drops out
+    /// and comes back under the same name. A poll cannot see that: the
+    /// identity is unchanged and the stream is dead.
+    failed: Arc<AtomicBool>,
+}
+
+impl Output {
+    fn state(&self) -> OutputState<'_> {
+        OutputState::Open {
+            identity: self.identity.as_ref(),
+            failed: self.failed.load(Ordering::Relaxed),
+        }
+    }
+
+    fn rate(&self) -> u32 {
+        self.sink.config().sample_rate().get()
+    }
+}
+
+/// Opens the default output, with a callback that reports a dying stream.
+///
+/// Not `DeviceSinkBuilder::open_default_sink`, which is what this used to be:
+/// that is an associated function with no way to attach an error callback, and
+/// the callback is the only way to hear that a stream has failed while the
+/// default device is unchanged.
+///
+/// It is kept as a last resort, because it can do one thing this cannot --
+/// fall back to a *non-default* device, which is the only thing that works on
+/// a system reporting no default at all. A stream with no failure signal beats
+/// no stream.
+fn open_output() -> Result<Output, String> {
+    // Read before opening, so the identity describes the device this stream is
+    // about to be built on rather than whatever is default a moment later.
+    let identity = crate::device_watch::current_default();
+    let failed = Arc::new(AtomicBool::new(false));
+
+    let watched = Arc::clone(&failed);
+    let opened = DeviceSinkBuilder::from_default_device()
+        .map_err(|e| e.to_string())
+        .and_then(|builder| {
+            builder
+                .with_error_callback(move |_| watched.store(true, Ordering::Relaxed))
+                .open_sink_or_fallback()
+                .map_err(|e| e.to_string())
+        })
+        .or_else(|_| DeviceSinkBuilder::open_default_sink().map_err(|e| e.to_string()));
+
+    match opened {
+        Ok(mut sink) => {
+            sink.log_on_drop(false);
+            Ok(Output {
+                sink,
+                identity,
+                failed,
+            })
+        }
+        Err(e) => Err(format!("No audio output device: {e}")),
+    }
+}
+
+/// The engine's output as the reopen decision sees it.
+///
+/// Split from [`Output`] so that decision is a pure function of three facts
+/// and can be tested without an audio device -- a `MixerDeviceSink` cannot be
+/// constructed in a test, and the rules below are exactly the part worth
+/// testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputState<'a> {
+    /// No working sink.
+    None,
+    Open {
+        identity: Option<&'a crate::device_watch::DeviceIdentity>,
+        /// Whether the stream has since reported an error.
+        failed: bool,
+    },
+}
+
+/// Why the engine would reopen its output, if at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reopen {
+    No,
+    /// The default device changed, or was reconfigured.
+    Switched,
+    /// The stream reported an error.
+    Broken,
+    /// There is no working output. Retried on a timer rather than at once,
+    /// because the ordinary reason for this is that the machine has no audio
+    /// device and asking every 50 ms would achieve nothing but the asking.
+    Absent,
+}
+
+/// Decides whether the output needs reopening.
+///
+/// `seen` is the latest probe of the system default, or `None` when the probe
+/// found no device.
+fn reopen_reason(
+    state: OutputState<'_>,
+    seen: Option<&crate::device_watch::DeviceIdentity>,
+) -> Reopen {
+    match state {
+        OutputState::None => Reopen::Absent,
+        // Checked before the identity: a dead stream needs replacing whether
+        // or not the device it was opened on is still the default one.
+        OutputState::Open { failed: true, .. } => Reopen::Broken,
+        // A probe that found nothing is not evidence that the device went
+        // away. Enumeration can fail transiently, and tearing down a working
+        // stream over that would turn a hiccup into silence. A device that
+        // really vanished leaves a dead stream, which `failed` reports.
+        OutputState::Open { .. } if seen.is_none() => Reopen::No,
+        OutputState::Open { identity, .. } if identity != seen => Reopen::Switched,
+        OutputState::Open { .. } => Reopen::No,
+    }
+}
+
+/// How long to wait before trying again to open an output that is not there.
+const REOPEN_RETRY: Duration = Duration::from_secs(2);
+
+/// Keeps a prepared decode only if it still suits the device.
+///
+/// A decode prepared ahead of time is built to whatever rate the device had
+/// when preparation started. Reaching a device running at another rate, it
+/// would be fed through rodio's resampler -- "simple linear interpolation",
+/// measured on this library at 33 dB below the music -- for the whole of the
+/// track. That is the exact job the `output_rate` mechanism exists to keep it
+/// out of, and a device change is precisely when the two can disagree.
+///
+/// Discarding costs one rebuild, once. Keeping it costs every sample.
+///
+/// A backstop rather than the main defence: the coordinator drops what it has
+/// prepared when it hears the device changed. This is here because the decode
+/// travels in the `Play` command, so a stale one can already be in flight when
+/// that happens, and this is the last place it can be caught.
+fn still_matches(prepared: Option<BuiltSource>, device_rate: u32) -> Option<BuiltSource> {
+    prepared.filter(|ready| ready.decoded.sample_rate().get() == device_rate)
+}
+
+/// Reopens the output and puts the current track back where it was.
+///
+/// The resume is the same manoeuvre [`seek`] performs, for the same reason: a
+/// decode is bound to a rate and a mixer, so moving to another device means
+/// rebuilding it rather than redirecting it. Position and paused state are
+/// carried across, so the audible result of switching headphones mid-song is a
+/// short gap and then the same song.
+///
+/// Returns the name of the device now in use. An `Err` means either that no
+/// output could be opened at all, or that one was but the track on it could
+/// not be rebuilt -- in both cases the caller has something to tell the user.
+fn reopen(
+    device: &mut Result<Output, String>,
+    player: &mut Option<Player>,
+    loaded: &mut Option<Loaded>,
+    output_rate: &AtomicU32,
+    chain: &Chain,
+    ffmpeg: Option<&Path>,
+) -> Result<Option<String>, String> {
+    let position = position_of(player, loaded);
+    let was_paused = player.as_ref().is_some_and(|p| p.is_paused());
+
+    // Both go before the new sink opens, and in this order. The player's queue
+    // belongs to the old mixer, so it has to die with it -- and on WASAPI a
+    // second exclusive stream on the same endpoint can be refused outright
+    // while the first is still alive.
+    *player = None;
+    *device = Err("Reopening the audio output.".to_string());
+
+    let output = match open_output() {
+        Ok(output) => output,
+        Err(e) => {
+            *device = Err(e.clone());
+            return Err(e);
+        }
+    };
+
+    // Before anything is built against it. Every decoder asks for this rate so
+    // that rodio's resampler stays a pass-through, and a device change is
+    // precisely when the answer changes.
+    let rate = output.rate();
+    output_rate.store(rate, Ordering::Release);
+
+    let name = output
+        .identity
+        .as_ref()
+        .map(|identity| identity.name.clone());
+
+    let resumed = match loaded.as_mut() {
+        // Nothing was playing, so there is nothing to put back.
+        None => Ok(()),
+        Some(current) => match build_source(&current.source, ffmpeg, rate, position) {
+            Ok(built) => {
+                let replacement = start(&output.sink, built.decoded, chain);
+                // Switching devices while paused must not start playback.
+                if was_paused {
+                    replacement.pause();
+                }
+                *player = Some(replacement);
+                current.offset = position;
+                current.starved = built.starved;
+                Ok(())
+            }
+            // The device is fine, this track could not be rebuilt on it. Left
+            // loaded on purpose: a later seek or replay can try again, which
+            // is better than forgetting what was playing.
+            Err(e) => Err(e),
+        },
+    };
+
+    *device = Ok(output);
+    resumed.map(|()| name)
+}
+
 fn run(
     rx: Receiver<Command>,
+    device_rx: Receiver<DeviceReport>,
     events: UnboundedSender<EngineEvent>,
     ffmpeg: Option<PathBuf>,
     output_rate: Arc<AtomicU32>,
     eq: Arc<EqSettings>,
 ) {
-    // Opened once. If there is no device we keep the error and fail every play
-    // with it, rather than killing the thread and making every later command
-    // report "not running".
-    let device = match DeviceSinkBuilder::open_default_sink() {
-        Ok(mut sink) => {
-            sink.log_on_drop(false);
-            // Told to everyone who builds a decoder, before anything can.
-            output_rate.store(sink.config().sample_rate().get(), Ordering::Release);
-            Ok(sink)
-        }
-        Err(e) => Err(format!("No audio output device: {e}")),
-    };
+    // If there is no device we keep the error and fail every play with it,
+    // rather than killing the thread and making every later command report
+    // "not running". Unlike before, this is no longer the only chance: the
+    // device watcher and the retry below both lead back here.
+    let mut device = open_output();
+    if let Ok(output) = &device {
+        // Told to everyone who builds a decoder, before anything can.
+        output_rate.store(output.rate(), Ordering::Release);
+    }
+
+    // When an absent output may be retried. In the past, so the first
+    // opportunity is taken.
+    let mut retry_output_at = std::time::Instant::now();
 
     let mut player: Option<Player> = None;
     let mut epoch: Option<u64> = None;
@@ -329,6 +590,59 @@ fn run(
     let mut reported_stall = false;
 
     loop {
+        // --- the output device ------------------------------------------
+        //
+        // Checked before every command and on every poll, which costs a
+        // `try_recv` on an empty channel and one relaxed atomic load. No
+        // device is enumerated here: the probe runs on the watcher's thread,
+        // and `reopen` does the only other one, immediately before it opens
+        // something.
+        //
+        // `.last()` collapses a burst. Connecting a dock can report several
+        // times in a row and only the newest says where sound goes now.
+        let reported = device_rx.try_iter().last();
+        let state = device.as_ref().map_or(OutputState::None, Output::state);
+
+        let reason = match reported {
+            Some(seen) => reopen_reason(state, seen.as_ref()),
+            // Nothing new to report and a stream that is fine. The overwhelming
+            // majority of ticks.
+            None if matches!(state, OutputState::Open { failed: false, .. }) => Reopen::No,
+            // Nothing reported, and either there is no output at all or its
+            // stream has died. These are exactly the two failures a probe of
+            // the *default device* cannot see, because in both of them the
+            // default is unchanged -- a Bluetooth headset that dropped out and
+            // came back under the same name, or a machine that had no sound
+            // card when the engine started.
+            None => reopen_reason(state, None),
+        };
+
+        if reason != Reopen::No {
+            let now = std::time::Instant::now();
+
+            // A switch is acted on at once; the user is standing there waiting
+            // to hear something. An output that is absent or broken is retried
+            // on a timer, because the ordinary reason for it is that there is
+            // no device to open and asking twenty times a second would achieve
+            // nothing but the asking.
+            if reason == Reopen::Switched || now >= retry_output_at {
+                retry_output_at = now + REOPEN_RETRY;
+
+                let outcome = reopen(
+                    &mut device,
+                    &mut player,
+                    &mut loaded,
+                    &output_rate,
+                    &chain,
+                    ffmpeg.as_deref(),
+                );
+                let _ = events.send(EngineEvent::Output {
+                    name: outcome.as_ref().ok().cloned().flatten(),
+                    error: outcome.err(),
+                });
+            }
+        }
+
         match rx.recv_timeout(POLL_INTERVAL) {
             Ok(Command::Play {
                 source,
@@ -348,24 +662,23 @@ fn run(
 
                 let mut starved = None;
                 let result = match &device {
-                    Ok(sink) => match decoded {
-                        // Prepared ahead of time: nothing left to do but hand
-                        // it to the mixer.
-                        Some(ready) => {
-                            starved = ready.starved;
-                            Ok(start(sink, ready.decoded, &chain))
+                    Ok(output) => {
+                        match still_matches(decoded, output.rate()) {
+                            // Prepared ahead of time: nothing left to do but
+                            // hand it to the mixer.
+                            Some(ready) => {
+                                starved = ready.starved;
+                                Ok(start(&output.sink, ready.decoded, &chain))
+                            }
+                            None => {
+                                build_source(&source, ffmpeg.as_deref(), output.rate(), start_at)
+                                    .map(|built| {
+                                        starved = built.starved;
+                                        start(&output.sink, built.decoded, &chain)
+                                    })
+                            }
                         }
-                        None => build_source(
-                            &source,
-                            ffmpeg.as_deref(),
-                            output_rate.load(Ordering::Acquire),
-                            start_at,
-                        )
-                        .map(|built| {
-                            starved = built.starved;
-                            start(sink, built.decoded, &chain)
-                        }),
-                    },
+                    }
                     Err(e) => Err(e.clone()),
                 };
 
@@ -425,7 +738,7 @@ fn run(
 
             Ok(Command::Seek { position, reply }) => {
                 let result = seek(
-                    device.as_ref(),
+                    device.as_ref().map(|output| &output.sink),
                     &mut player,
                     &mut loaded,
                     position,
@@ -2467,5 +2780,757 @@ mod mixer_tap {
         }
         std::fs::write(&out, &bytes).expect("write");
         eprintln!("wrote {out} ({rate} Hz, 2 ch, f32le)");
+    }
+}
+
+/// The rules that decide when the engine throws away a working audio stream.
+///
+/// Worth testing on their own because both mistakes are expensive and neither
+/// is visible in a normal run: reopening when nothing changed restarts the
+/// decoder on a timer forever, and failing to reopen when something did leaves
+/// the app silent until it is restarted.
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+    use crate::device_watch::DeviceIdentity;
+
+    fn identity(id: &str, rate: u32) -> DeviceIdentity {
+        DeviceIdentity {
+            id: Some(id.to_string()),
+            name: "Speakers".to_string(),
+            sample_rate: rate,
+            channels: 2,
+        }
+    }
+
+    fn open(identity: Option<&DeviceIdentity>, failed: bool) -> OutputState<'_> {
+        OutputState::Open { identity, failed }
+    }
+
+    /// The steady state, and the one that has to be free: a probe confirming
+    /// what is already playing changes nothing.
+    #[test]
+    fn a_probe_that_matches_the_open_device_does_nothing() {
+        let device = identity("wasapi:a", 48_000);
+
+        assert_eq!(
+            reopen_reason(open(Some(&device), false), Some(&device.clone())),
+            Reopen::No
+        );
+    }
+
+    /// Headphones out, speakers in.
+    #[test]
+    fn a_different_default_device_is_a_switch() {
+        let open_on = identity("wasapi:a", 48_000);
+        let now = identity("wasapi:b", 48_000);
+
+        assert_eq!(
+            reopen_reason(open(Some(&open_on), false), Some(&now)),
+            Reopen::Switched
+        );
+    }
+
+    /// The quiet one. The device did not change, its rate did, and every
+    /// decode built for the old rate is now being resampled.
+    #[test]
+    fn the_same_device_at_a_new_rate_is_a_switch() {
+        let open_on = identity("wasapi:a", 48_000);
+        let now = identity("wasapi:a", 44_100);
+
+        assert_eq!(
+            reopen_reason(open(Some(&open_on), false), Some(&now)),
+            Reopen::Switched
+        );
+    }
+
+    /// A Bluetooth headset that drops and reconnects comes back with the same
+    /// identity and a dead stream. Only the error callback can see that, so it
+    /// is checked before the identity rather than after it.
+    #[test]
+    fn a_failed_stream_is_reopened_even_when_the_device_looks_unchanged() {
+        let device = identity("wasapi:a", 48_000);
+
+        assert_eq!(
+            reopen_reason(open(Some(&device), true), Some(&device.clone())),
+            Reopen::Broken
+        );
+    }
+
+    /// The regression this rule exists to prevent: enumeration failing for a
+    /// moment must not be read as "the device is gone" and take a working
+    /// stream down with it. A device that really vanished leaves a dead
+    /// stream, which the test above covers.
+    #[test]
+    fn a_probe_that_found_nothing_does_not_tear_down_a_working_stream() {
+        let device = identity("wasapi:a", 48_000);
+
+        assert_eq!(reopen_reason(open(Some(&device), false), None), Reopen::No);
+    }
+
+    /// Launched with no sound card, or an earlier reopen failed. Retried on a
+    /// timer, which is why it is its own reason rather than a `Switched`.
+    #[test]
+    fn having_no_output_is_retried_rather_than_left() {
+        assert_eq!(reopen_reason(OutputState::None, None), Reopen::Absent);
+        assert_eq!(
+            reopen_reason(OutputState::None, Some(&identity("wasapi:a", 48_000))),
+            Reopen::Absent
+        );
+    }
+
+    /// A backend that cannot produce an id still has to be comparable, or
+    /// every poll on it would look like a switch.
+    #[test]
+    fn a_device_with_no_id_still_compares_by_what_is_known() {
+        let mut device = identity("unused", 48_000);
+        device.id = None;
+
+        assert_eq!(
+            reopen_reason(open(Some(&device), false), Some(&device.clone())),
+            Reopen::No
+        );
+
+        let mut reconfigured = device.clone();
+        reconfigured.sample_rate = 44_100;
+        assert_eq!(
+            reopen_reason(open(Some(&device), false), Some(&reconfigured)),
+            Reopen::Switched
+        );
+    }
+
+    fn prepared(rate: u32) -> BuiltSource {
+        BuiltSource {
+            decoded: Box::new(rodio::buffer::SamplesBuffer::new(
+                rodio::ChannelCount::new(2).unwrap(),
+                rodio::SampleRate::new(rate).unwrap(),
+                vec![0.0f32; 64],
+            )),
+            starved: None,
+        }
+    }
+
+    /// A track prepared while the old device was still open must not be played
+    /// on the new one: it was decoded to a rate the mixer no longer runs at,
+    /// so rodio would resample it for its whole length.
+    #[test]
+    fn a_decode_prepared_for_another_rate_is_discarded() {
+        assert!(still_matches(Some(prepared(44_100)), 48_000).is_none());
+    }
+
+    /// And the case that must survive, or every handover pays for a rebuild
+    /// the preparation already did.
+    #[test]
+    fn a_decode_prepared_for_this_rate_is_kept() {
+        let kept = still_matches(Some(prepared(48_000)), 48_000);
+
+        assert_eq!(
+            kept.map(|ready| ready.decoded.sample_rate().get()),
+            Some(48_000)
+        );
+    }
+
+    #[test]
+    fn nothing_prepared_stays_nothing() {
+        assert!(still_matches(None, 48_000).is_none());
+    }
+}
+
+/// What reopening actually does, against a real sound card.
+///
+/// Ignored, like the other tests here that need one: they cannot run on a
+/// build machine and they take real time. They are also the only place the
+/// interesting half is exercised -- everything above this reasons about
+/// identities, and none of it can catch a reopen that opens a stream and
+/// forgets to put the music back on it.
+///
+/// Run with `cargo test --lib reopen_device_tests -- --ignored --nocapture`.
+#[cfg(test)]
+mod reopen_device_tests {
+    use super::*;
+
+    /// A real, silent, 5-second PCM WAV. Silent so running these makes no
+    /// noise, real so ffmpeg has something genuine to decode.
+    fn write_wav(path: &Path) {
+        use std::io::Write;
+
+        let samples: u32 = 44_100 * 5;
+        let data_len = samples * 2;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&44_100u32.to_le_bytes());
+        b.extend_from_slice(&88_200u32.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        b.extend_from_slice(&vec![0u8; data_len as usize]);
+
+        std::fs::File::create(path).unwrap().write_all(&b).unwrap();
+    }
+
+    /// Everything a reopen needs: an open output with a track playing on it.
+    #[allow(clippy::type_complexity)]
+    fn playing(
+        name: &str,
+    ) -> (
+        Result<Output, String>,
+        Option<Player>,
+        Option<Loaded>,
+        Chain,
+        PathBuf,
+        Arc<AtomicU32>,
+    ) {
+        let ffmpeg = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg)
+            .expect("the staged ffmpeg sidecar is missing");
+
+        let dir = std::env::temp_dir().join(format!("music-app-reopen-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        write_wav(&wav);
+
+        let device = open_output().expect("there is no output device to test against");
+        let output_rate = Arc::new(AtomicU32::new(device.rate()));
+
+        let chain = Chain {
+            volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            eq: Arc::new(EqSettings::default()),
+        };
+
+        let source = PlayableSource::LocalFile(wav);
+        let built = build_source(&source, Some(&ffmpeg), device.rate(), Duration::ZERO)
+            .expect("the fixture would not decode");
+        let starved = built.starved.clone();
+        let player = start(&device.sink, built.decoded, &chain);
+
+        (
+            Ok(device),
+            Some(player),
+            Some(Loaded {
+                source,
+                starved,
+                offset: Duration::ZERO,
+            }),
+            chain,
+            ffmpeg,
+            output_rate,
+        )
+    }
+
+    /// The whole point: unplugging headphones mid-song leaves you listening to
+    /// the same song, from where it was, out of the speakers.
+    #[test]
+    #[ignore = "needs a real output device and runs in real time"]
+    fn reopening_puts_the_track_back_where_it_was() {
+        let (mut device, mut player, mut loaded, chain, ffmpeg, output_rate) = playing("resume");
+
+        std::thread::sleep(Duration::from_millis(600));
+        let before = position_of(&player, &loaded);
+        assert!(
+            before >= Duration::from_millis(300),
+            "the fixture did not start playing ({before:?}), so this proves nothing"
+        );
+
+        let name = reopen(
+            &mut device,
+            &mut player,
+            &mut loaded,
+            &output_rate,
+            &chain,
+            Some(&ffmpeg),
+        )
+        .expect("reopening the default device failed");
+
+        eprintln!("reopened on {name:?}");
+        assert!(device.is_ok(), "the output was not reopened");
+        assert!(player.is_some(), "the track was not put back on the device");
+
+        let after = position_of(&player, &loaded);
+        assert!(
+            after >= before,
+            "the track restarted at {after:?} having reached {before:?} -- \
+             a device change must not rewind the song"
+        );
+        assert!(
+            after < before + Duration::from_secs(2),
+            "the track resumed at {after:?}, well past where it was"
+        );
+    }
+
+    /// Switching device while paused must not start playing. The reopen
+    /// rebuilds the decode, and a fresh rodio player runs unless told not to.
+    #[test]
+    #[ignore = "needs a real output device and runs in real time"]
+    fn reopening_while_paused_stays_paused() {
+        let (mut device, mut player, mut loaded, chain, ffmpeg, output_rate) = playing("paused");
+
+        std::thread::sleep(Duration::from_millis(300));
+        player.as_ref().unwrap().pause();
+
+        reopen(
+            &mut device,
+            &mut player,
+            &mut loaded,
+            &output_rate,
+            &chain,
+            Some(&ffmpeg),
+        )
+        .expect("reopening the default device failed");
+
+        assert!(
+            player.as_ref().expect("nothing is loaded").is_paused(),
+            "a paused track started playing because the headphones were unplugged"
+        );
+    }
+
+    /// The rate is what every later decode is built against, so republishing
+    /// it is the difference between a pass-through and rodio resampling every
+    /// track from then on.
+    #[test]
+    #[ignore = "needs a real output device and runs in real time"]
+    fn reopening_republishes_the_device_rate() {
+        let (mut device, mut player, mut loaded, chain, ffmpeg, output_rate) = playing("rate");
+
+        // A wrong value, so a reopen that forgets to publish leaves it wrong
+        // rather than accidentally right.
+        output_rate.store(1, Ordering::Release);
+
+        reopen(
+            &mut device,
+            &mut player,
+            &mut loaded,
+            &output_rate,
+            &chain,
+            Some(&ffmpeg),
+        )
+        .expect("reopening the default device failed");
+
+        let published = output_rate.load(Ordering::Acquire);
+        assert_eq!(
+            published,
+            device.as_ref().unwrap().rate(),
+            "decoders would keep being built for a rate the device does not run at"
+        );
+        eprintln!("republished {published} Hz");
+    }
+
+    /// Nothing playing is an ordinary state, not a special case -- the device
+    /// still has to be reopened so the *next* track has somewhere to go.
+    #[test]
+    #[ignore = "needs a real output device"]
+    fn reopening_with_nothing_playing_still_opens_the_device() {
+        let ffmpeg = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg);
+        let mut device = open_output();
+        let mut player = None;
+        let mut loaded = None;
+        let chain = Chain {
+            volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            eq: Arc::new(EqSettings::default()),
+        };
+        let output_rate = Arc::new(AtomicU32::new(0));
+
+        reopen(
+            &mut device,
+            &mut player,
+            &mut loaded,
+            &output_rate,
+            &chain,
+            ffmpeg.as_deref(),
+        )
+        .expect("reopening with nothing playing failed");
+
+        assert!(device.is_ok());
+        assert!(player.is_none());
+        assert!(output_rate.load(Ordering::Acquire) > 0);
+    }
+}
+
+/// That the audio thread still ends when the engine does.
+///
+/// Its own module because it guards a hazard rather than a feature: the device
+/// watcher needs a way to reach the audio thread, and the obvious way -- a
+/// clone of the command `Sender` -- silently breaks shutdown. The thread stops
+/// when that channel disconnects, and a channel with a live sender in a
+/// background thread never does. Everything would keep working; the threads
+/// would just never go away.
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    /// Observed through the event channel, which is the one thing that
+    /// outlives `run` by exactly as long as `run` does: it is moved in, and
+    /// dropped when the function returns.
+    #[tokio::test]
+    async fn dropping_the_engine_ends_the_audio_thread() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = spawn(tx, None);
+
+        drop(engine);
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            // A machine with no sound card reports that first, so this drains
+            // rather than asserting on the first thing it sees.
+            while rx.recv().await.is_some() {}
+        })
+        .await;
+
+        assert!(
+            ended.is_ok(),
+            "the audio thread outlived the engine -- something other than \
+             `AudioEngine` is holding a command sender, and dropping the \
+             engine no longer stops it"
+        );
+    }
+}
+
+/// Whether a device change damages the audio, as opposed to merely
+/// interrupting it.
+///
+/// The reopen tests above prove the track comes back at the right *place*.
+/// They say nothing about whether it comes back sounding right, and the two
+/// are separate: the reopen rebuilds the decode, and rebuilding is where the
+/// equaliser, the volume and the source itself could all quietly be dropped or
+/// reset without moving the position by a millisecond.
+#[cfg(test)]
+mod reopen_audio_tests {
+    use super::*;
+
+    /// A real 5-second PCM WAV at 44.1 kHz mono.
+    ///
+    /// `freq` of 0 writes silence, which is what the device tests want -- they
+    /// play through the real sound card and should make no noise. A tone is
+    /// for the tests that read the samples instead of playing them.
+    fn write_wav(path: &Path, freq: f32) {
+        use std::io::Write;
+
+        const RATE: u32 = 44_100;
+        let samples: u32 = RATE * 5;
+        let data_len = samples * 2;
+
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&RATE.to_le_bytes());
+        b.extend_from_slice(&(RATE * 2).to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+
+        for n in 0..samples {
+            let value = if freq == 0.0 {
+                0.0
+            } else {
+                let t = n as f32 / RATE as f32;
+                (std::f32::consts::TAU * freq * t).sin() * 0.8
+            };
+            b.extend_from_slice(&((value * 32_767.0) as i16).to_le_bytes());
+        }
+
+        std::fs::File::create(path).unwrap().write_all(&b).unwrap();
+    }
+
+    fn tone_file(name: &str, freq: f32) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("music-app-reopen-audio-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        write_wav(&wav, freq);
+        wav
+    }
+
+    /// Cycles per second, counted from sign changes.
+    ///
+    /// Crude on purpose: a pure tone crosses zero exactly twice per cycle, so
+    /// this reads its frequency directly, and anything that is *not* a clean
+    /// tone -- silence, noise, a half-decoded frame, the wrong channel count
+    /// read as interleaved -- lands nowhere near the right answer.
+    fn frequency_of(samples: &[f32], rate: u32) -> f32 {
+        let crossings = samples
+            .windows(2)
+            .filter(|pair| (pair[0] <= 0.0) != (pair[1] <= 0.0))
+            .count();
+
+        crossings as f32 * rate as f32 / samples.len() as f32 / 2.0
+    }
+
+    fn peak(samples: &[f32]) -> f32 {
+        samples.iter().fold(0.0f32, |worst, s| worst.max(s.abs()))
+    }
+
+    /// The claim a device change rests on: the decode it rebuilds at the
+    /// position the track had reached is the *same music*, at the right speed.
+    ///
+    /// No device needed -- this reads the samples rather than playing them,
+    /// which is also the only way to check them.
+    #[test]
+    fn the_decode_a_reopen_rebuilds_is_the_same_audio() {
+        let Some(ffmpeg) = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg) else {
+            panic!("the staged ffmpeg sidecar is missing");
+        };
+        let wav = tone_file("rebuilt", 440.0);
+        let source = PlayableSource::LocalFile(wav);
+
+        // The rate a 48 kHz device would ask for, which is also the case that
+        // matters: the fixture is 44.1 kHz, so ffmpeg is resampling, and a
+        // reopen onto a differently-rated device is exactly this.
+        const DEVICE_RATE: u32 = 48_000;
+
+        let built = build_source(&source, Some(&ffmpeg), DEVICE_RATE, Duration::from_secs(2))
+            .expect("the rebuild at an offset failed");
+
+        assert_eq!(
+            built.decoded.sample_rate().get(),
+            DEVICE_RATE,
+            "the rebuilt decode would be resampled by rodio for the whole track"
+        );
+
+        let channels = built.decoded.channels().get() as usize;
+        // One channel's worth of a second, de-interleaved, so the crossing
+        // count is not doubled by the stereo layout.
+        let samples: Vec<f32> = built
+            .decoded
+            .take(DEVICE_RATE as usize * channels)
+            .step_by(channels)
+            .collect();
+
+        assert!(
+            samples.len() > DEVICE_RATE as usize / 2,
+            "the rebuild produced {} samples -- it decoded almost nothing",
+            samples.len()
+        );
+
+        let peak = peak(&samples);
+        assert!(
+            peak > 0.5,
+            "the rebuilt decode peaks at {peak}, which is silence where there \
+             should be a tone -- a reopen would resume into nothing"
+        );
+
+        let heard = frequency_of(&samples, DEVICE_RATE);
+        assert!(
+            (heard - 440.0).abs() < 5.0,
+            "the rebuilt decode is a {heard} Hz tone where the file holds 440 Hz \
+             -- resuming after a device change is playing at the wrong speed"
+        );
+    }
+
+    /// The same, for the position the reopen actually asks for. A rebuild that
+    /// silently started from zero would sound perfect and be a rewind.
+    ///
+    /// The tone sweeps, so where you are in the file is audible as *what* you
+    /// hear -- which is the only way to check an offset from the samples alone.
+    #[test]
+    fn the_rebuild_starts_where_it_was_asked_to() {
+        let Some(ffmpeg) = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg) else {
+            panic!("the staged ffmpeg sidecar is missing");
+        };
+
+        // 200 Hz for the first half, 800 Hz for the second.
+        let dir = std::env::temp_dir().join("music-app-reopen-audio-offset");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("halves.wav");
+        {
+            use std::io::Write;
+            const RATE: u32 = 44_100;
+            let samples: u32 = RATE * 4;
+            let data_len = samples * 2;
+            let mut b = Vec::new();
+            b.extend_from_slice(b"RIFF");
+            b.extend_from_slice(&(36 + data_len).to_le_bytes());
+            b.extend_from_slice(b"WAVE");
+            b.extend_from_slice(b"fmt ");
+            b.extend_from_slice(&16u32.to_le_bytes());
+            b.extend_from_slice(&1u16.to_le_bytes());
+            b.extend_from_slice(&1u16.to_le_bytes());
+            b.extend_from_slice(&RATE.to_le_bytes());
+            b.extend_from_slice(&(RATE * 2).to_le_bytes());
+            b.extend_from_slice(&2u16.to_le_bytes());
+            b.extend_from_slice(&16u16.to_le_bytes());
+            b.extend_from_slice(b"data");
+            b.extend_from_slice(&data_len.to_le_bytes());
+            for n in 0..samples {
+                let t = n as f32 / RATE as f32;
+                let freq = if t < 2.0 { 200.0 } else { 800.0 };
+                let value = (std::f32::consts::TAU * freq * t).sin() * 0.8;
+                b.extend_from_slice(&((value * 32_767.0) as i16).to_le_bytes());
+            }
+            std::fs::File::create(&wav).unwrap().write_all(&b).unwrap();
+        }
+
+        let source = PlayableSource::LocalFile(wav);
+        const DEVICE_RATE: u32 = 48_000;
+
+        let built = build_source(&source, Some(&ffmpeg), DEVICE_RATE, Duration::from_secs(3))
+            .expect("the rebuild at an offset failed");
+
+        let channels = built.decoded.channels().get() as usize;
+        let samples: Vec<f32> = built
+            .decoded
+            .take(DEVICE_RATE as usize / 2 * channels)
+            .step_by(channels)
+            .collect();
+
+        let heard = frequency_of(&samples, DEVICE_RATE);
+        assert!(
+            (heard - 800.0).abs() < 20.0,
+            "resuming at 3s produced a {heard} Hz tone; 800 Hz is what is there \
+             and 200 Hz would mean the track silently restarted from the beginning"
+        );
+    }
+
+    /// That the settings the user has set are still the ones being applied.
+    ///
+    /// Checked by reference count rather than by listening, because what can
+    /// actually go wrong here is structural: `reopen` hands `start` the
+    /// engine's own `Chain`, and a rebuild that constructed a fresh
+    /// `EqSettings` or a fresh volume cell would sound perfectly clean and
+    /// silently ignore every setting. A count above one means the object the
+    /// engine holds is the object the rebuilt track is reading.
+    #[test]
+    #[ignore = "needs a real output device"]
+    fn the_volume_and_equaliser_reach_the_rebuilt_track() {
+        let ffmpeg = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg)
+            .expect("the staged ffmpeg sidecar is missing");
+        let wav = tone_file("settings", 0.0);
+        let source = PlayableSource::LocalFile(wav);
+
+        let mut device = Ok(open_output().expect("there is no output device to test against"));
+        let output_rate = Arc::new(AtomicU32::new(device.as_ref().unwrap().rate()));
+
+        // Distinctive on purpose: a reset would be flat and unity.
+        let chain = Chain {
+            volume: Arc::new(AtomicU32::new(0.375f32.to_bits())),
+            eq: Arc::new(EqSettings::default()),
+        };
+        chain.eq.set_enabled(true);
+        chain.eq.set_gains(&[6.0, -3.0, 0.0, 4.5, 0.0, 0.0, -2.0, 0.0, 5.0, 1.5]);
+
+        let rate = device.as_ref().unwrap().rate();
+        let built = build_source(&source, Some(&ffmpeg), rate, Duration::ZERO).unwrap();
+        let starved = built.starved.clone();
+        let mut player = Some(start(
+            &device.as_ref().unwrap().sink,
+            built.decoded,
+            &chain,
+        ));
+        let mut loaded = Some(Loaded {
+            source,
+            starved,
+            offset: Duration::ZERO,
+        });
+
+        reopen(
+            &mut device,
+            &mut player,
+            &mut loaded,
+            &output_rate,
+            &chain,
+            Some(&ffmpeg),
+        )
+        .expect("reopening the default device failed");
+
+        assert!(
+            Arc::strong_count(&chain.eq) > 1,
+            "nothing the reopen built is reading the engine's equaliser -- the \
+             rebuilt track is running through a fresh, flat one and every \
+             preset the user set has silently stopped applying"
+        );
+        assert!(
+            Arc::strong_count(&chain.volume) > 1,
+            "the rebuilt track is not reading the engine's volume cell, so the \
+             slider no longer moves what is playing"
+        );
+
+        // And the settings themselves are untouched, so what is being read is
+        // also still what the user asked for.
+        assert!(chain.eq.enabled());
+        assert_eq!(chain.eq.gains()[0], 6.0);
+        assert_eq!(f32::from_bits(chain.volume.load(Ordering::Relaxed)), 0.375);
+    }
+
+    /// Seeking after a device change has to work, and has to land where asked.
+    ///
+    /// It runs against the sink the engine holds, and a reopen replaces that
+    /// object -- so a seek left pointing at the old one is a plausible way for
+    /// this to break, and an invisible one until someone drags the scrubber
+    /// after unplugging their headphones.
+    #[test]
+    #[ignore = "needs a real output device and runs in real time"]
+    fn seeking_still_works_after_a_device_change() {
+        let ffmpeg = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg)
+            .expect("the staged ffmpeg sidecar is missing");
+        let wav = tone_file("seek", 0.0);
+        let source = PlayableSource::LocalFile(wav);
+
+        let mut device = Ok(open_output().expect("there is no output device to test against"));
+        let output_rate = Arc::new(AtomicU32::new(device.as_ref().unwrap().rate()));
+        let chain = Chain {
+            volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            eq: Arc::new(EqSettings::default()),
+        };
+
+        let rate = device.as_ref().unwrap().rate();
+        let built = build_source(&source, Some(&ffmpeg), rate, Duration::ZERO).unwrap();
+        let starved = built.starved.clone();
+        let mut player = Some(start(
+            &device.as_ref().unwrap().sink,
+            built.decoded,
+            &chain,
+        ));
+        let mut loaded = Some(Loaded {
+            source,
+            starved,
+            offset: Duration::ZERO,
+        });
+
+        std::thread::sleep(Duration::from_millis(300));
+        reopen(
+            &mut device,
+            &mut player,
+            &mut loaded,
+            &output_rate,
+            &chain,
+            Some(&ffmpeg),
+        )
+        .expect("reopening the default device failed");
+
+        // A brand-new player must not read as an ended track, or the poll that
+        // watches for the end would advance to the next song the instant
+        // someone unplugged their headphones.
+        assert!(
+            !player.as_ref().unwrap().empty(),
+            "the rebuilt player reports empty, which the engine reads as \
+             \"this track finished\" -- a device change would skip the song"
+        );
+
+        seek(
+            device.as_ref().map(|output| &output.sink),
+            &mut player,
+            &mut loaded,
+            Duration::from_secs(3),
+            &chain,
+            Some(&ffmpeg),
+        )
+        .expect("seeking after a device change failed");
+
+        let landed = position_of(&player, &loaded);
+        assert!(
+            landed >= Duration::from_secs(3) && landed < Duration::from_millis(3_500),
+            "the seek landed at {landed:?} rather than 3s"
+        );
     }
 }

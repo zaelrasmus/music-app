@@ -931,7 +931,43 @@ impl<E: PlayerEvents> Coordinator<E> {
                     self.emit_progress(position);
                 }
             }
+
+            EngineEvent::Output { name, error } => self.handle_output_change(name, error),
         }
+    }
+
+    /// The output device was reopened underneath us, or could not be.
+    ///
+    /// Two things have to happen here and neither belongs to the engine, which
+    /// reports facts and decides nothing.
+    ///
+    /// The prepared decode is dropped because it was built to the *old*
+    /// device's sample rate. Handing it to a device running at another rate
+    /// would put rodio's linear-interpolation resampler -- 33 dB below the
+    /// music -- in front of a track for its whole length, which is the exact
+    /// thing `output_rate` exists to prevent. The engine refuses a stale one
+    /// as a backstop; dropping it here is what stops a doomed ffmpeg process
+    /// sitting in memory until the track it was for comes round.
+    ///
+    /// A failure is surfaced because it is otherwise completely silent. The
+    /// engine has no player, so no progress arrives and no track finishes: the
+    /// bar simply stops, mid-song, with nothing to say why.
+    fn handle_output_change(&mut self, name: Option<String>, error: Option<String>) {
+        // Unconditional. Even a reopen that failed to resume the track may
+        // have landed on a device running at another rate.
+        self.prepared = None;
+
+        // Success says nothing. Playback was rebuilt on the new device and
+        // carried on from where it was, and the sound coming out of the right
+        // speakers is the whole message.
+        let Some(reason) = error else { return };
+
+        self.events.error(match name {
+            Some(device) => {
+                format!("Audio switched to {device}, but playback could not resume: {reason}")
+            }
+            None => format!("Lost the audio output device. {reason}"),
+        });
     }
 
     /// The decoder has run dry, or recovered.
