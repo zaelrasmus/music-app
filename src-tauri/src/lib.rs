@@ -289,6 +289,7 @@ pub fn run() {
             tracks::update_track_metadata,
             tracks::set_in_library,
             tracks::set_many_in_library,
+            tracks::filed_remote_ids,
             tracks::set_many_artists,
             playlists::create_playlist,
             playlists::rename_playlist,

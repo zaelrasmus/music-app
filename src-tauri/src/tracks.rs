@@ -112,6 +112,32 @@ pub async fn recently_played(db: State<'_, Db>, limit: Option<u32>) -> Result<Ve
     .map_err(|e| e.to_string())
 }
 
+/// The statement behind [`set_in_library`], named so its tests run this exact
+/// SQL rather than a paraphrase of it.
+///
+/// The `CASE` is the whole point. `date_added` means *when it joined the
+/// library*, and for a local file that is the moment the row appeared -- so
+/// leaving the column to its insert-time default was right for every track
+/// the scanner found. A streamed track's row appears much earlier: the first
+/// time it is auditioned, queued, or saved as part of a playlist. Deciding to
+/// keep it can come weeks later, and until this stamped it, adding one sorted
+/// it into whenever it was first heard. With the library ordered newest-first
+/// -- which is the default gesture after adding something -- the track landed
+/// twenty rows down and looked as though it had never been added at all.
+///
+/// Only on the way in, and only on the 0 -> 1 transition. Filing a track that
+/// is already filed must not move it, or every re-add would reshuffle the
+/// list; taking one out must not either, since removing is not a kind of
+/// adding and the original date is what re-adding has to be compared against.
+///
+/// SQLite evaluates every `SET` expression against the row as it was before
+/// the update, so reading `in_library` here sees the old value even though the
+/// same statement assigns it.
+pub(crate) const SET_IN_LIBRARY: &str = "UPDATE tracks
+     SET date_added = CASE WHEN ? = 1 AND in_library = 0 THEN unixepoch() ELSE date_added END,
+         in_library = ?
+     WHERE id = ?";
+
 /// Adds a track to the library, or takes it out.
 ///
 /// Removing does not delete anything: the row, its history, its cache entry
@@ -130,7 +156,8 @@ pub async fn set_in_library(
     track_id: i64,
     in_library: bool,
 ) -> Result<(), String> {
-    let outcome = sqlx::query("UPDATE tracks SET in_library = ? WHERE id = ?")
+    let outcome = sqlx::query(SET_IN_LIBRARY)
+        .bind(i64::from(in_library))
         .bind(i64::from(in_library))
         .bind(track_id)
         .execute(&db.pool)
@@ -222,6 +249,40 @@ pub async fn update_track_metadata(
     Ok(())
 }
 
+/// Builds the statement behind [`set_many_in_library`].
+///
+/// Separate from the command so a test can run the real SQL without a Tauri
+/// window, which is the same trade [`SET_IN_LIBRARY`] makes for one track.
+///
+/// `WHERE in_library <> ?` means every row this touches is a transition, so
+/// unlike the single-track statement the stamp needs no `CASE` -- a track
+/// already filed is not in the result set at all.
+fn set_many_statement(
+    in_library: bool,
+    track_ids: &[i64],
+) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+    let mut query = sqlx::QueryBuilder::new("UPDATE tracks SET in_library = ");
+    query.push_bind(i64::from(in_library));
+
+    // Same rule as the single-track path, and the same reason: a selection of
+    // thirty streamed tracks filed in one gesture joined the library now, not
+    // whenever each of them was first played.
+    if in_library {
+        query.push(", date_added = unixepoch()");
+    }
+
+    query.push(" WHERE in_library <> ");
+    query.push_bind(i64::from(in_library));
+    query.push(" AND id IN (");
+    let mut ids = query.separated(", ");
+    for id in track_ids {
+        ids.push_bind(*id);
+    }
+    query.push(") RETURNING id");
+
+    query
+}
+
 /// Files many tracks in the library at once, or takes them out.
 ///
 /// One statement rather than the single-track command in a loop: three hundred
@@ -239,18 +300,7 @@ pub async fn set_many_in_library(
         return Ok(0);
     }
 
-    let mut query = sqlx::QueryBuilder::new("UPDATE tracks SET in_library = ");
-    query.push_bind(i64::from(in_library));
-    query.push(" WHERE in_library <> ");
-    query.push_bind(i64::from(in_library));
-    query.push(" AND id IN (");
-    let mut ids = query.separated(", ");
-    for id in &track_ids {
-        ids.push_bind(id);
-    }
-    query.push(") RETURNING id");
-
-    let changed: Vec<i64> = query
+    let changed: Vec<i64> = set_many_statement(in_library, &track_ids)
         .build_query_scalar()
         .fetch_all(&db.pool)
         .await
@@ -273,6 +323,62 @@ pub async fn set_many_in_library(
     }
 
     Ok(count)
+}
+
+/// How many ids one statement asks about.
+///
+/// A track search returns twenty-five, but an opened artist page can carry
+/// several hundred, and SQLite caps how many values one statement may bind.
+/// Chunking costs one extra round trip per four hundred results and removes
+/// the size of a playlist as something that can break this.
+const FILED_CHUNK: usize = 400;
+
+/// Which of these provider tracks the library already holds.
+///
+/// The question a search result cannot answer about itself. A result is just
+/// what YouTube said; whether the same recording is already filed is a fact
+/// about this machine's database, and without asking, the Add button offers to
+/// add something that has been in the library for weeks. That is how a track
+/// gets "added" twice and appears to go missing, since the second add changes
+/// nothing the user can see.
+///
+/// Scoped by provider because `remote_id` alone is not an identity: SoundCloud
+/// ids are plain integers and could collide with anything. The database's own
+/// uniqueness is on `(source, remote_id)`, and this matches it.
+///
+/// Returns the subset that is filed, so the caller can mark rows without
+/// holding a second list of everything it asked about.
+#[tauri::command]
+pub async fn filed_remote_ids(
+    db: State<'_, Db>,
+    provider: crate::providers::Provider,
+    remote_ids: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let mut filed = Vec::new();
+
+    for chunk in remote_ids.chunks(FILED_CHUNK) {
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT remote_id FROM tracks WHERE in_library = 1 AND source = ",
+        );
+        query.push_bind(provider.as_str());
+        query.push(" AND remote_id IN (");
+
+        let mut list = query.separated(", ");
+        for id in chunk {
+            list.push_bind(id.as_str());
+        }
+        query.push(")");
+
+        let found: Vec<String> = query
+            .build_query_scalar()
+            .fetch_all(&db.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        filed.extend(found);
+    }
+
+    Ok(filed)
 }
 
 /// Sets the display artist on many tracks at once.
@@ -398,5 +504,273 @@ mod tests {
             .await
             .unwrap();
         assert!(missing.is_none());
+    }
+}
+
+/// The reported bug: a YouTube track was added to the library and did not
+/// appear in it.
+///
+/// It was in it. The library was ordered newest-added-first, and the track's
+/// `date_added` said six days ago -- because the row had been created six days
+/// earlier, when a whole album's worth of results was saved for auditioning.
+/// Adding it only flipped `in_library`, so it took its place among last week's
+/// tracks, twenty-three rows down, where the user could reasonably conclude it
+/// had not been added.
+///
+/// Local files never showed this: the scanner creates the row and files it in
+/// the same statement, so the default was always right for them. It needed a
+/// track that existed before the decision to keep it, which is every streamed
+/// one that was played, queued, or saved from a playlist first.
+#[cfg(test)]
+mod date_added_tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    /// A week ago, give or take -- old enough that a stamp is unmistakable.
+    const LONG_AGO: i64 = 1_787_186_899;
+
+    async fn pool(name: &str) -> SqlitePool {
+        let dir = std::env::temp_dir().join(format!("music-app-date-added-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::db::init(&dir).await.unwrap().pool
+    }
+
+    /// An audition: a real row, created long before any decision to keep it.
+    async fn audition(pool: &SqlitePool, remote_id: &str, in_library: i64) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO tracks (source, title, state, remote_id, remote_url, \
+             in_library, date_added) \
+             VALUES ('youtube', 'Light no Theme', 'saved', ?, \
+                     'https://www.youtube.com/watch?v=srDmw7kSjik', ?, ?) \
+             RETURNING id",
+        )
+        .bind(remote_id)
+        .bind(in_library)
+        .bind(LONG_AGO)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn date_added(pool: &SqlitePool, id: i64) -> i64 {
+        sqlx::query_scalar("SELECT date_added FROM tracks WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn now(pool: &SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT unixepoch()")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn file(pool: &SqlitePool, id: i64, in_library: bool) {
+        sqlx::query(SET_IN_LIBRARY)
+            .bind(i64::from(in_library))
+            .bind(i64::from(in_library))
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// The fix, stated as the user would: add it, and it is at the top.
+    #[tokio::test]
+    async fn filing_an_audition_dates_it_from_the_gesture_not_the_row() {
+        let pool = pool("stamps").await;
+        let id = audition(&pool, "srDmw7kSjik", 0).await;
+
+        let before = now(&pool).await;
+        file(&pool, id, true).await;
+
+        assert!(
+            date_added(&pool, id).await >= before,
+            "adding a track to the library must date it from now -- it was \
+             left at {LONG_AGO}, which is where the row was created, and a \
+             newest-first library buries it there"
+        );
+    }
+
+    /// The other half, and the reason this is a `CASE` rather than a plain
+    /// assignment: filing what is already filed must not reshuffle the list.
+    #[tokio::test]
+    async fn re_filing_a_track_already_in_the_library_does_not_move_it() {
+        let pool = pool("refile").await;
+        let id = audition(&pool, "already", 1).await;
+
+        file(&pool, id, true).await;
+
+        assert_eq!(
+            date_added(&pool, id).await,
+            LONG_AGO,
+            "a track that was already in the library did not join it again"
+        );
+    }
+
+    /// Removing is not a kind of adding. The original date is what a later
+    /// re-add has to be measured against.
+    #[tokio::test]
+    async fn removing_a_track_leaves_its_date_alone() {
+        let pool = pool("remove").await;
+        let id = audition(&pool, "removed", 1).await;
+
+        file(&pool, id, false).await;
+
+        assert_eq!(date_added(&pool, id).await, LONG_AGO);
+    }
+
+    /// Selecting thirty rows and filing them is one gesture, and the bulk
+    /// statement is a separate piece of SQL -- so it can regress on its own.
+    #[tokio::test]
+    async fn filing_many_at_once_dates_them_from_the_gesture_too() {
+        let pool = pool("many").await;
+        let filed = audition(&pool, "kept", 1).await;
+        let first = audition(&pool, "one", 0).await;
+        let second = audition(&pool, "two", 0).await;
+
+        let before = now(&pool).await;
+        let changed: Vec<i64> = set_many_statement(true, &[filed, first, second])
+            .build_query_scalar::<i64>()
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(changed.len(), 2, "the already-filed track was not a change");
+        assert!(date_added(&pool, first).await >= before);
+        assert!(date_added(&pool, second).await >= before);
+        assert_eq!(
+            date_added(&pool, filed).await,
+            LONG_AGO,
+            "the `WHERE` is what keeps an already-filed track out of the \
+             stamp; without it a bulk add would redate the whole selection"
+        );
+    }
+
+    /// And taking a selection out must not stamp them either.
+    #[tokio::test]
+    async fn removing_many_at_once_leaves_their_dates_alone() {
+        let pool = pool("many-remove").await;
+        let first = audition(&pool, "one", 1).await;
+        let second = audition(&pool, "two", 1).await;
+
+        let changed: Vec<i64> = set_many_statement(false, &[first, second])
+            .build_query_scalar::<i64>()
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(changed.len(), 2);
+        assert_eq!(date_added(&pool, first).await, LONG_AGO);
+        assert_eq!(date_added(&pool, second).await, LONG_AGO);
+    }
+
+    /// The scanner's case, which was never broken and must stay that way: a
+    /// local file's row is created and filed in one statement, so its default
+    /// is already the right answer and nothing here may disturb it.
+    #[tokio::test]
+    async fn a_local_file_keeps_the_date_its_row_was_created_with() {
+        let pool = pool("local").await;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO tracks (source, title, local_path, state, in_library, date_added) \
+             VALUES ('local', 'Kept', '/tmp/kept.wav', 'present', 1, ?) RETURNING id",
+        )
+        .bind(LONG_AGO)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        file(&pool, id, true).await;
+
+        assert_eq!(date_added(&pool, id).await, LONG_AGO);
+    }
+}
+
+/// What `filed_remote_ids` has to get right for the Add button to stop lying.
+#[cfg(test)]
+mod filed_tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    async fn pool(name: &str) -> SqlitePool {
+        let dir = std::env::temp_dir().join(format!("music-app-filed-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::db::init(&dir).await.unwrap().pool
+    }
+
+    async fn track(pool: &SqlitePool, source: &str, remote_id: &str, in_library: i64) {
+        sqlx::query(
+            "INSERT INTO tracks (source, title, state, remote_id, remote_url, in_library) \
+             VALUES (?, 'A Song', 'saved', ?, 'https://example.invalid/x', ?)",
+        )
+        .bind(source)
+        .bind(remote_id)
+        .bind(in_library)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// The query the command runs, without a Tauri window around it.
+    async fn filed(pool: &SqlitePool, source: &str, ids: &[&str]) -> Vec<String> {
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT remote_id FROM tracks WHERE in_library = 1 AND source = ",
+        );
+        query.push_bind(source);
+        query.push(" AND remote_id IN (");
+        let mut list = query.separated(", ");
+        for id in ids {
+            list.push_bind(*id);
+        }
+        query.push(")");
+
+        query.build_query_scalar().fetch_all(pool).await.unwrap()
+    }
+
+    /// The three states a search result can be in, and only one of them is
+    /// "in your library".
+    #[tokio::test]
+    async fn only_filed_tracks_come_back() {
+        let pool = pool("states").await;
+        track(&pool, "youtube", "kept", 1).await;
+        // Auditioned: a real row, played once, never kept. The Add button must
+        // still offer it -- this is the case that makes a plain "does a row
+        // exist" check the wrong question.
+        track(&pool, "youtube", "auditioned", 0).await;
+
+        let found = filed(&pool, "youtube", &["kept", "auditioned", "unknown"]).await;
+
+        assert_eq!(found, vec!["kept".to_string()]);
+    }
+
+    /// `remote_id` is not an identity on its own. SoundCloud ids are plain
+    /// integers, so without the provider a numeric id could match anything.
+    #[tokio::test]
+    async fn a_matching_id_under_another_provider_is_not_a_match() {
+        let pool = pool("scoped").await;
+        track(&pool, "soundcloud", "123456", 1).await;
+
+        assert!(
+            filed(&pool, "youtube", &["123456"]).await.is_empty(),
+            "the provider is part of the question -- the database's own \
+             uniqueness is on (source, remote_id) and this must match it"
+        );
+        assert_eq!(filed(&pool, "soundcloud", &["123456"]).await.len(), 1);
+    }
+
+    /// An opened artist page can carry more results than one statement may
+    /// bind, so the command chunks. This is the arithmetic that does it.
+    #[test]
+    fn every_id_lands_in_exactly_one_chunk() {
+        let ids: Vec<String> = (0..FILED_CHUNK * 2 + 7).map(|i| i.to_string()).collect();
+
+        let chunked: Vec<&String> = ids.chunks(FILED_CHUNK).flatten().collect();
+
+        assert_eq!(chunked.len(), ids.len());
+        assert!(ids.chunks(FILED_CHUNK).all(|c| c.len() <= FILED_CHUNK));
     }
 }

@@ -222,14 +222,85 @@ class ProviderSearchStore {
   saving = $state<string | null>(null);
 
   /**
-   * Results filed in the library during this session, by remote id.
+   * Which results are in the library, keyed by `provider:remoteId`.
    *
-   * Only so the button can say "Added" instead of offering again. Not a source
-   * of truth -- the database is -- and deliberately not persisted: it exists
-   * to give feedback within one search, and a stale answer after a restart
-   * would be worse than no answer.
+   * Asked of the database after every search rather than remembered from this
+   * session's own clicks. Remembering only the clicks was the bug: a track
+   * added last week came back from a search looking exactly like one never
+   * seen before, so the obvious move was to add it again — which changes
+   * nothing, gives no feedback, and reads as the add having failed.
+   *
+   * Keyed by provider as well as id because `remoteId` is not an identity.
+   * SoundCloud ids are plain integers and the database's own uniqueness is on
+   * `(source, remote_id)`; a bare-id set would let one provider's result mark
+   * another's.
    */
-  added = new SvelteSet<string>();
+  filed = new SvelteSet<string>();
+
+  /** The key `filed` is indexed by. */
+  #key(provider: Provider, remoteId: string) {
+    return `${provider}:${remoteId}`;
+  }
+
+  /** Whether the library already holds this result. */
+  isFiled(result: SearchResult) {
+    return this.filed.has(this.#key(result.provider, result.remoteId));
+  }
+
+  /**
+   * Re-asks about whatever is currently on screen.
+   *
+   * For coming back to a search that was left open: the results are still the
+   * ones the provider returned, but the library may have changed underneath
+   * them in the meantime.
+   */
+  async refreshFiled() {
+    await this.#markFiled([...this.results, ...(this.opened?.tracks ?? [])]);
+  }
+
+  /**
+   * Asks the database which of these it already holds, and marks them.
+   *
+   * Best effort and silent. A failure here leaves rows offering to add
+   * something already added, which is where this started — annoying, not
+   * broken — and is not worth a toast over a list the user is reading.
+   *
+   * The answer replaces what was known about these exact ids, in both
+   * directions -- so a track removed from the library elsewhere loses its
+   * badge the next time it is searched for, rather than claiming forever that
+   * it is still filed. Ids this was not asked about are left alone, which is
+   * what keeps two searches in flight from undoing each other.
+   */
+  async #markFiled(results: SearchResult[]) {
+    if (results.length === 0) return;
+
+    // One call per provider. In practice a result list is all one provider,
+    // but an opened artist page reached from a track is not guaranteed to be,
+    // and the backend scopes the question by provider anyway.
+    const byProvider = new Map<Provider, string[]>();
+    for (const result of results) {
+      const ids = byProvider.get(result.provider);
+      if (ids) ids.push(result.remoteId);
+      else byProvider.set(result.provider, [result.remoteId]);
+    }
+
+    await Promise.all(
+      [...byProvider].map(async ([provider, remoteIds]) => {
+        try {
+          const found = new Set(
+            await invoke<string[]>("filed_remote_ids", { provider, remoteIds }),
+          );
+          for (const id of remoteIds) {
+            const key = this.#key(provider, id);
+            if (found.has(id)) this.filed.add(key);
+            else this.filed.delete(key);
+          }
+        } catch {
+          // Deliberately silent -- see above.
+        }
+      }),
+    );
+  }
 
   /**
    * Saves a result as a `saved` track and plays it.
@@ -321,7 +392,7 @@ class ProviderSearchStore {
     try {
       const trackId = await invoke<number>("save_remote_track", { result });
       await invoke("set_in_library", { trackId, inLibrary: true });
-      this.added.add(result.remoteId);
+      this.filed.add(this.#key(result.provider, result.remoteId));
       await Promise.all([trackStore.load(), libraryView.refresh()]);
       return true;
     } catch (e) {
@@ -363,6 +434,10 @@ class ProviderSearchStore {
 
         if (request !== this.#latestRequest) return;
         this.results = results;
+
+        // Not awaited: the rows are already on screen and readable, and the
+        // badge is an annotation on them rather than something to wait for.
+        void this.#markFiled(results);
       } else {
         const collections = await invoke<Collection[]>("search_collections", {
           provider: this.provider,
@@ -472,6 +547,8 @@ class ProviderSearchStore {
         },
         tracks: expansion.tracks,
       };
+
+      void this.#markFiled(expansion.tracks);
     } catch (e) {
       if (this.opened?.collection.url !== collection.url) return;
       this.error = String(e);

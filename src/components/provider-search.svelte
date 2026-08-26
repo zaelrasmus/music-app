@@ -133,6 +133,11 @@
      */
     let maxExpanded = $state(200);
     onMount(async () => {
+        // Results survive leaving this page, and the library can change while
+        // they are gone — a track removed from it elsewhere must not still be
+        // wearing an "In library" badge on the way back.
+        void providerSearch.refreshFiled();
+
         try {
             maxExpanded = await invoke<number>("max_expanded_tracks");
         } catch {
@@ -465,7 +470,7 @@
     {@const count = formatCount(result.viewCount, countNoun)}
     {@const busy = providerSearch.saving === result.remoteId}
     {@const preview = looksLikePreview(result)}
-    {@const inLibrary = providerSearch.added.has(result.remoteId)}
+    {@const inLibrary = providerSearch.isFiled(result)}
                 <div
                     class="group/result hover:bg-accent/50 flex items-start gap-3 rounded-lg px-2 py-2 transition-colors"
                 >

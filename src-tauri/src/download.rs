@@ -72,6 +72,28 @@ pub fn downloads_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// What a finished download writes back to the row.
+///
+/// Downloading is the strongest "I want to keep this" there is, so it also
+/// files the track in the library. Otherwise you could deliberately save a copy
+/// to disk and still not find it anywhere but history.
+///
+/// The upload date comes along for free from the same resolve. `COALESCE` so a
+/// date already known -- from the search result, or from an earlier play -- is
+/// never replaced by a NULL from a provider that did not report one.
+///
+/// The `CASE` is the rule [`crate::tracks::SET_IN_LIBRARY`] carries, for the
+/// third and last place that files a track: downloading one that was only ever
+/// auditioned files it *now*, and "now" is what its date has to say -- while
+/// downloading one already in the library must not move it.
+pub(crate) const FINISH_DOWNLOAD: &str = "UPDATE tracks
+     SET local_path = ?,
+         state = 'downloaded',
+         date_added = CASE WHEN in_library = 0 THEN unixepoch() ELSE date_added END,
+         in_library = 1,
+         uploaded_at = COALESCE(uploaded_at, ?)
+     WHERE id = ?";
+
 /// Downloads a saved YouTube track for offline playback.
 ///
 /// The audio is **stream-copied**, never re-encoded: yt-dlp resolves the best
@@ -139,25 +161,13 @@ pub(crate) async fn fetch_track(
         .to_str()
         .ok_or("The download path is not valid UTF-8.")?;
 
-    // Downloading is the strongest "I want to keep this" there is, so it also
-    // files the track in the library. Otherwise you could deliberately save a
-    // copy to disk and still not find it anywhere but history.
-    //
-    // The upload date comes along for free from the same resolve. COALESCE so
-    // a date already known -- from the search result, or from an earlier play
-    // -- is never replaced by a NULL from a provider that did not report one.
-    sqlx::query(
-        "UPDATE tracks \
-         SET local_path = ?, state = 'downloaded', in_library = 1, \
-             uploaded_at = COALESCE(uploaded_at, ?) \
-         WHERE id = ?",
-    )
-    .bind(stored)
-    .bind(uploaded_at)
-    .bind(track_id)
-    .execute(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    sqlx::query(FINISH_DOWNLOAD)
+        .bind(stored)
+        .bind(uploaded_at)
+        .bind(track_id)
+        .execute(pool)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // A downloaded track is meant to work with the network off, and a
     // thumbnail URL does not. This is the other half of what filing it in the
@@ -583,5 +593,83 @@ mod network_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The rule [`FINISH_DOWNLOAD`] shares with `tracks::SET_IN_LIBRARY`, which is
+/// easy to lose here because this statement is mostly about a file path and the
+/// library stamp rides along at the end of it.
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    const LONG_AGO: i64 = 1_787_186_899;
+
+    async fn pool(name: &str) -> SqlitePool {
+        let dir = std::env::temp_dir().join(format!("music-app-finish-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::db::init(&dir).await.unwrap().pool
+    }
+
+    async fn saved(pool: &SqlitePool, remote_id: &str, in_library: i64) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO tracks (source, title, state, remote_id, remote_url, \
+             in_library, date_added) \
+             VALUES ('youtube', 'A Song', 'saved', ?, 'https://y.invalid/w', ?, ?) \
+             RETURNING id",
+        )
+        .bind(remote_id)
+        .bind(in_library)
+        .bind(LONG_AGO)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn finish(pool: &SqlitePool, id: i64, path: &str) {
+        sqlx::query(FINISH_DOWNLOAD)
+            .bind(path)
+            .bind(None::<i64>)
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn date_added(pool: &SqlitePool, id: i64) -> i64 {
+        sqlx::query_scalar("SELECT date_added FROM tracks WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Downloading something you had only auditioned files it, so it has to be
+    /// dated from the download rather than from whenever you first heard it.
+    #[tokio::test]
+    async fn downloading_an_audition_dates_it_from_the_download() {
+        let pool = pool("audition").await;
+        let id = saved(&pool, "aud", 0).await;
+
+        let before: i64 = sqlx::query_scalar("SELECT unixepoch()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        finish(&pool, id, "D:/downloads/aud.m4a").await;
+
+        assert!(date_added(&pool, id).await >= before);
+    }
+
+    /// And downloading one you already keep is not a second act of keeping it.
+    #[tokio::test]
+    async fn downloading_a_track_already_kept_does_not_move_it() {
+        let pool = pool("kept").await;
+        let id = saved(&pool, "kept", 1).await;
+
+        finish(&pool, id, "D:/downloads/kept.m4a").await;
+
+        assert_eq!(date_added(&pool, id).await, LONG_AGO);
     }
 }

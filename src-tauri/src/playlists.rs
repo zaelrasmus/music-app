@@ -1208,6 +1208,23 @@ pub async fn remove_playlist_artist_rule(
     load_playlist(&db.pool, playlist_id).await
 }
 
+/// The statement behind [`add_playlist_to_library`].
+///
+/// `date_added` is stamped for the same reason it is in
+/// [`crate::tracks::SET_IN_LIBRARY`], and this is the site where it matters
+/// most: every row an import created has existed since the import, so without
+/// the stamp filing a fifty-track playlist scatters all fifty through last
+/// month and the library looks unchanged.
+///
+/// No `CASE` here, unlike the single-track statement -- the `WHERE` already
+/// restricts this to tracks that were not filed, so every row it touches is a
+/// transition by construction.
+const ADD_PLAYLIST_TO_LIBRARY: &str = "UPDATE tracks
+     SET in_library = 1, date_added = unixepoch()
+     WHERE in_library = 0
+       AND id IN (SELECT track_id FROM playlist_tracks WHERE playlist_id = ?)
+     RETURNING id";
+
 /// Files every track in a playlist in the library.
 ///
 /// The gesture an imported playlist needs. Importing deliberately does not add
@@ -1229,12 +1246,7 @@ pub async fn add_playlist_to_library(
     covers: State<'_, crate::covers::CoverStore>,
     playlist_id: i64,
 ) -> Result<usize, String> {
-    let filed: Vec<i64> = sqlx::query_scalar(
-        "UPDATE tracks SET in_library = 1
-         WHERE in_library = 0
-           AND id IN (SELECT track_id FROM playlist_tracks WHERE playlist_id = ?)
-         RETURNING id",
-    )
+    let filed: Vec<i64> = sqlx::query_scalar(ADD_PLAYLIST_TO_LIBRARY)
     .bind(playlist_id)
     .fetch_all(&db.pool)
     .await
@@ -1280,4 +1292,95 @@ pub async fn mark_playlist_played(db: State<'_, Db>, playlist_id: i64) -> Result
     .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// The library stamp on [`ADD_PLAYLIST_TO_LIBRARY`], which is the site where
+/// losing it does the most visible damage: an imported playlist's rows all
+/// share the import's date, so an unstamped "add all to library" puts fifty
+/// tracks somewhere in last month at once.
+#[cfg(test)]
+mod add_to_library_tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    const LONG_AGO: i64 = 1_787_186_899;
+
+    async fn pool(name: &str) -> SqlitePool {
+        let dir = std::env::temp_dir().join(format!("music-app-playlist-filing-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::db::init(&dir).await.unwrap().pool
+    }
+
+    /// An imported row: created when the playlist was imported, filed or not.
+    async fn imported(pool: &SqlitePool, remote_id: &str, in_library: i64) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO tracks (source, title, state, remote_id, remote_url, \
+             in_library, date_added) \
+             VALUES ('youtube', 'A Song', 'saved', ?, 'https://y.invalid/w', ?, ?) \
+             RETURNING id",
+        )
+        .bind(remote_id)
+        .bind(in_library)
+        .bind(LONG_AGO)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn date_added(pool: &SqlitePool, id: i64) -> i64 {
+        sqlx::query_scalar("SELECT date_added FROM tracks WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn filing_a_playlist_dates_its_tracks_from_the_gesture() {
+        let pool = pool("stamp").await;
+
+        let playlist: i64 =
+            sqlx::query_scalar("INSERT INTO playlists (name) VALUES ('Imported') RETURNING id")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let fresh = imported(&pool, "one", 0).await;
+        let already = imported(&pool, "two", 1).await;
+
+        for (position, track) in [fresh, already].into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (?, ?, ?)",
+            )
+            .bind(playlist)
+            .bind(track)
+            .bind(position as i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let before: i64 = sqlx::query_scalar("SELECT unixepoch()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let filed: Vec<i64> = sqlx::query_scalar(ADD_PLAYLIST_TO_LIBRARY)
+            .bind(playlist)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(filed, vec![fresh], "only the unfiled track was a change");
+        assert!(
+            date_added(&pool, fresh).await >= before,
+            "a track filed by this gesture joined the library now, not at import"
+        );
+        assert_eq!(
+            date_added(&pool, already).await,
+            LONG_AGO,
+            "a track already in the library must not be redated by it"
+        );
+    }
 }
