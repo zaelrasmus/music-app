@@ -660,54 +660,6 @@ pub fn is_transient(message: &str) -> bool {
     message.contains("YouTube refused")
 }
 
-/// Whether a file needs ffmpeg, based on what rodio can actually decode.
-///
-/// rodio's enabled codecs are mp3, flac, wav, AAC/ALAC in mp4, and Vorbis in
-/// Ogg. Opus has no symphonia codec at all, so anything carrying it must go
-/// through ffmpeg.
-pub fn needs_transcode(path: &Path) -> bool {
-    let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
-        // No extension: let rodio try, and fall back if it cannot cope.
-        return false;
-    };
-
-    match extension.to_lowercase().as_str() {
-        // Always Opus, or a container rodio has no demuxer for.
-        "opus" | "webm" | "weba" | "mka" | "mkv" => true,
-        // Ogg carries Vorbis (native) or Opus (not) -- the extension alone
-        // cannot say which, so look inside.
-        "ogg" | "oga" => is_opus_stream(path),
-        _ => false,
-    }
-}
-
-/// Reads the head of an Ogg file to identify its codec.
-///
-/// An Ogg stream announces itself in the first page: an Opus stream's first
-/// packet begins with the magic `OpusHead`, a Vorbis stream's with `\x01vorbis`.
-/// Checking the bytes is both cheaper and more honest than trusting `.ogg`.
-fn is_opus_stream(path: &Path) -> bool {
-    use std::fs::File;
-
-    let Ok(mut file) = File::open(path) else {
-        return false;
-    };
-
-    // The identification header sits in the first page, well inside 4 KiB.
-    let mut head = [0u8; 4096];
-    let Ok(read) = file.read(&mut head) else {
-        return false;
-    };
-
-    contains(&head[..read], b"OpusHead")
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
-}
-
 #[cfg(test)]
 mod tests {
     /// Builds a source with no ffmpeg behind it, so starvation can be staged.
@@ -790,7 +742,6 @@ mod tests {
         assert_eq!(super::pad_to_frame(3, 2), 1);
     }
     use super::*;
-    use std::io::Write;
     use std::path::PathBuf;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -855,63 +806,8 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    #[test]
-    fn formats_rodio_handles_natively_are_left_alone() {
-        assert!(!needs_transcode(Path::new("a.mp3")));
-        assert!(!needs_transcode(Path::new("a.flac")));
-        assert!(!needs_transcode(Path::new("a.wav")));
-        assert!(!needs_transcode(Path::new("a.m4a")));
-        assert!(!needs_transcode(Path::new("a.M4A")));
-    }
-
-    #[test]
-    fn opus_and_matroska_always_need_ffmpeg() {
-        assert!(needs_transcode(Path::new("a.opus")));
-        assert!(needs_transcode(Path::new("a.OPUS")));
-        assert!(needs_transcode(Path::new("a.webm")));
-        assert!(needs_transcode(Path::new("a.mka")));
-    }
-
-    #[test]
-    fn an_extensionless_file_is_left_for_rodio_to_attempt() {
-        assert!(!needs_transcode(Path::new("mystery")));
-    }
-
-    /// The whole point of sniffing: two files with the same extension, only one
-    /// of which rodio can decode.
-    #[test]
-    fn ogg_is_decided_by_its_contents_not_its_extension() {
-        let dir = temp_dir("ogg-sniff");
-
-        let opus = dir.join("opus.ogg");
-        let mut page = vec![0u8; 28];
-        page.splice(0..4, *b"OggS");
-        page.extend_from_slice(b"OpusHead");
-        page.extend_from_slice(&[0u8; 64]);
-        std::fs::File::create(&opus).unwrap().write_all(&page).unwrap();
-
-        let vorbis = dir.join("vorbis.ogg");
-        let mut page = vec![0u8; 28];
-        page.splice(0..4, *b"OggS");
-        page.extend_from_slice(b"\x01vorbis");
-        page.extend_from_slice(&[0u8; 64]);
-        std::fs::File::create(&vorbis)
-            .unwrap()
-            .write_all(&page)
-            .unwrap();
-
-        assert!(needs_transcode(&opus), "Opus in Ogg needs ffmpeg");
-        assert!(!needs_transcode(&vorbis), "Vorbis in Ogg is native");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_missing_ogg_file_does_not_panic() {
-        assert!(!needs_transcode(Path::new("nope.ogg")));
-    }
 }
+
 
 #[cfg(test)]
 mod ffmpeg_error_tests {

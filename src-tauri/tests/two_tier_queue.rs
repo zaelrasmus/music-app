@@ -10,9 +10,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use music_app_lib::player::{
-    self, PlayerCommand, PlayerEvents, PlayerProgress, PlayerStatus, QueueState,
+    self, PlaybackState, PlayerCommand, PlayerEvents, PlayerProgress, PlayerStatus, QueueState,
 };
 
+
+/// The bundled ffmpeg, which local playback now requires.
+///
+/// Passing `None` used to be fine here: rodio decoded a plain WAV natively, so
+/// a test that only played local files needed no sidecar at all. ffmpeg is now
+/// the only decoder, so `None` means every track fails to load -- and the
+/// failure is quiet, because the coordinator responds by skipping to the next
+/// track, three times, and then halting. That looks exactly like a queue-order
+/// bug rather than a missing binary.
+fn ffmpeg() -> Option<std::path::PathBuf> {
+    music_app_lib::sidecar::staged_for_tests(music_app_lib::sidecar::Tool::Ffmpeg)
+}
 #[derive(Default)]
 struct Captured {
     progress: Mutex<Vec<f64>>,
@@ -149,7 +161,7 @@ async fn a_queued_track_interrupts_the_context_then_the_context_resumes() {
     let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -190,7 +202,7 @@ async fn changing_context_keeps_the_queue_and_the_panel_shows_it() {
     let (a, b, c, d) = (ids[0], ids[1], ids[2], ids[3]);
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -243,7 +255,7 @@ async fn queueing_with_nothing_playing_starts_playback() {
     let (db, ids) = fixture(&base, 400).await;
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     // No context at all: nothing would ever pick this up without the
     // start-if-idle rule, and "Add to queue" would look broken on a fresh
@@ -285,7 +297,7 @@ async fn skipping_an_unplayable_track_still_honours_the_queue() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -331,7 +343,7 @@ async fn a_repeated_track_starts_each_loop_from_the_beginning() {
     let track = ids[0];
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -365,6 +377,77 @@ async fn a_repeated_track_starts_each_loop_from_the_beginning() {
         "the track never restarted from zero, so loops are not fresh decodes \
          (got {positions:?})"
     );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A media key must do what it says, not the opposite.
+///
+/// The system panel sends what it *wants* -- Play, or Pause -- rather than
+/// "the other one". Wiring both to the toggle looks equivalent and is not: if
+/// the panel and the player ever disagree about the current state, or the key
+/// is pressed twice, a toggle does the reverse of what was asked. That is the
+/// difference between a working media key and one that fights the flyout.
+#[tokio::test]
+async fn a_play_key_never_pauses_and_a_pause_key_never_plays() {
+    let base = std::env::temp_dir().join("music-app-media-keys");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let (db, ids) = fixture(&base, 2000).await;
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![ids[0]],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+    // Generous: these tests share one audio device, so a run alongside the
+    // others can take noticeably longer to reach Playing than a run alone.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    if recorder.no_audio_device() {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    let playing = |r: &Recorder| {
+        matches!(
+            r.0.states.lock().unwrap().last().map(|s| s.state),
+            Some(PlaybackState::Playing)
+        )
+    };
+    assert!(playing(&recorder), "the fixture should be playing by now");
+
+    // Play while already playing: nothing should change. A toggle here would
+    // pause the music, which is the bug this exists to prevent.
+    handle.send(PlayerCommand::Resume).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        playing(&recorder),
+        "a Play key pressed during playback paused the music",
+    );
+
+    handle.send(PlayerCommand::Pause).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!playing(&recorder), "a Pause key did not pause");
+
+    // And again: still paused, not resumed.
+    handle.send(PlayerCommand::Pause).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !playing(&recorder),
+        "a second Pause key press resumed playback",
+    );
+
+    handle.send(PlayerCommand::Resume).unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(playing(&recorder), "a Play key did not resume");
 
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);

@@ -40,7 +40,23 @@ walkdir = "2.5.0"
 tauri-plugin-store = "2"
 tauri-plugin-dialog = "2"
 lofty = "0.25.0"
-rodio = "0.22.2"
+# Device output and mixing only -- deliberately no decoders.
+#
+# rodio's default features pull symphonia in as its decoder (`flac`, `mp3`,
+# `mp4`, `vorbis`, `wav` each map to a `symphonia-*` feature). ffmpeg decodes
+# everything this app plays, and the two were measured to be identical: equal
+# to 0.1 dB against a known original on MP3, AAC and Vorbis, and bit-exact on
+# FLAC and WAV. Keeping both meant two decode paths with different seek
+# behaviour, no Opus on one of them, and filters available on only one.
+#
+# `playback` is cpal -- the device sink and the mixer, which is the part
+# nothing else can replace. `dither` is kept deliberately: it is in the default
+# set, it pulls no symphonia (`dither = ["noise"]` -> rand), and dropping it
+# would silently change what reaches a device that wants fewer bits than f32.
+rodio = { version = "0.22.2", default-features = false, features = [
+    "playback",
+    "dither",
+] }
 # Shuffle only. Was already present transitively; promoted to a direct dep.
 rand = "0.10"
 # Lock-free ring buffer between the ffmpeg reader thread and the audio
@@ -85,6 +101,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "native-tls",
 ] }
+url = "2.5.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -111,3 +128,12 @@ strip = true
 # Deliberately not applied to `profile.test` -- the test harness needs unwinding
 # to report which test panicked rather than aborting the whole run.
 panic = "abort"
+
+# Windows media transport controls: the flyout that appears on a media-key
+# press, plus the lock-screen and volume-panel now-playing panel. Registering
+# with it is also what makes the keys themselves reach this app at all.
+#
+# `default-features = false` because the defaults pull the D-Bus stack for the
+# Linux backend, which is 40-odd crates that cannot build here anyway.
+[target."cfg(windows)".dependencies]
+souvlaki = { version = "0.8", default-features = false }

@@ -21,6 +21,18 @@ use music_app_lib::player::{
 static NETWORK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+
+/// The bundled ffmpeg, which local playback now requires.
+///
+/// Passing `None` used to be fine here: rodio decoded a plain WAV natively, so
+/// a test that only played local files needed no sidecar at all. ffmpeg is now
+/// the only decoder, so `None` means every track fails to load -- and the
+/// failure is quiet, because the coordinator responds by skipping to the next
+/// track, three times, and then halting. That looks exactly like a queue-order
+/// bug rather than a missing binary.
+fn ffmpeg() -> Option<std::path::PathBuf> {
+    music_app_lib::sidecar::staged_for_tests(music_app_lib::sidecar::Tool::Ffmpeg)
+}
 #[derive(Default)]
 struct Captured {
     progress: Mutex<Vec<f64>>,
@@ -41,6 +53,13 @@ struct Captured {
     state_seq: Mutex<Vec<(u64, Option<i64>, bool)>>,
     /// (sequence, current track_id) for every queue payload.
     queue_seq: Mutex<Vec<(u64, Option<i64>)>>,
+    /// The same, keeping the title the panel would have drawn.
+    ///
+    /// The player bar needs more than the id: it needs the payload to actually
+    /// *describe* the track, and a row the hydrating query missed comes back
+    /// titled "Unavailable" rather than absent. An id-only record cannot tell
+    /// those apart.
+    queue_desc: Mutex<Vec<(u64, Option<i64>, Option<String>)>>,
 }
 
 /// Newtype so the impl is local (orphan rule).
@@ -88,6 +107,11 @@ impl PlayerEvents for Recorder {
             .lock()
             .unwrap()
             .push((seq, queue.current.as_ref().map(|c| c.track_id)));
+        self.0.queue_desc.lock().unwrap().push((
+            seq,
+            queue.current.as_ref().map(|c| c.track_id),
+            queue.current.as_ref().map(|c| c.title.clone()),
+        ));
         self.0.queues.lock().unwrap().push(queue);
     }
 }
@@ -147,7 +171,7 @@ async fn progress_reaches_the_ui_while_a_track_plays() {
 
     let recorder = Recorder::default();
     // No ffmpeg: the fixture is a plain WAV, decoded natively by rodio.
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -230,7 +254,7 @@ async fn an_opus_file_plays_through_ffmpeg() {
         recorder.clone(),
         db.pool.clone(),
         // Resolved off PATH; Command::new does the lookup.
-        Some(std::path::PathBuf::from("ffmpeg")),
+        ffmpeg(),
         // No yt-dlp: this fixture is a local file.
         None,
         None,
@@ -305,7 +329,7 @@ async fn a_saved_youtube_track_streams() {
     let handle = player::spawn(
         recorder.clone(),
         db.pool.clone(),
-        Some(std::path::PathBuf::from("ffmpeg")),
+        ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
     );
@@ -436,7 +460,7 @@ async fn a_saved_soundcloud_track_streams() {
     let handle = player::spawn(
         recorder.clone(),
         db.pool.clone(),
-        Some(std::path::PathBuf::from("ffmpeg")),
+        ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
     );
@@ -517,7 +541,7 @@ async fn a_stream_can_be_seeked_and_reports_the_real_position() {
     let handle = player::spawn(
         recorder.clone(),
         db.pool.clone(),
-        Some(std::path::PathBuf::from("ffmpeg")),
+        ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
     );
@@ -613,7 +637,7 @@ async fn a_local_file_still_seeks_natively() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -691,7 +715,7 @@ async fn replaying_a_stream_skips_the_resolve() {
     let handle = player::spawn(
         recorder.clone(),
         db.pool.clone(),
-        Some(std::path::PathBuf::from("ffmpeg")),
+        ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
     );
@@ -818,7 +842,7 @@ async fn the_next_stream_is_ready_before_the_current_track_ends() {
     let handle = player::spawn(
         recorder.clone(),
         db.pool.clone(),
-        Some(std::path::PathBuf::from("ffmpeg")),
+        ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
     );
@@ -986,7 +1010,7 @@ async fn a_streamed_track_is_cached_and_replays_without_the_network() {
     let handle = player::spawn(
         recorder.clone(),
         db.pool.clone(),
-        Some(std::path::PathBuf::from("ffmpeg")),
+        ffmpeg(),
         // The whole point: there is no way to resolve a stream now.
         None,
         Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
@@ -1059,7 +1083,7 @@ async fn commands_are_answered_while_a_track_is_loading() {
     let handle = player::spawn(
         recorder.clone(),
         db.pool.clone(),
-        Some(std::path::PathBuf::from("ffmpeg")),
+        ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
     );
@@ -1158,7 +1182,7 @@ async fn a_restored_track_waits_in_the_bar_then_resumes_where_it_was() {
     .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     handle
         .send(PlayerCommand::Restore {
@@ -1251,7 +1275,7 @@ async fn a_position_at_the_end_of_a_track_is_not_restored() {
     .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     // Two seconds from the end.
     handle
@@ -1304,7 +1328,7 @@ async fn a_track_left_part_way_through_is_fetched_for_offline() {
     let handle = player::spawn(
         recorder.clone(),
         db.pool.clone(),
-        Some(std::path::PathBuf::from("ffmpeg")),
+        ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
     );
@@ -1479,7 +1503,7 @@ async fn a_play_is_recorded_only_once_it_has_been_listened_to() {
     .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     // Play the short one through to its end.
     handle
@@ -1589,12 +1613,19 @@ async fn leaving_a_streamed_track_part_way_announces_the_cache_fill() {
         .unwrap();
 
     let recorder = Recorder::default();
-    // The tool paths are never reached: the fetch they would run happens after
-    // the announcement, and fails immediately with nothing at these paths.
+    // A real ffmpeg, because the track has to actually play: the announcement
+    // only happens once the listen passes halfway, and nothing reaches halfway
+    // without a decoder. This used to pass a bogus path for it too -- fine when
+    // rodio decoded the WAV natively, and now the difference between the test
+    // measuring something and measuring nothing.
+    //
+    // yt-dlp stays bogus, which is what the test actually relies on: the fetch
+    // triggered *after* the announcement resolves through yt-dlp and so fails
+    // immediately, leaving the announcement itself as the only thing observed.
     let handle = player::spawn(
         recorder.clone(),
         db.pool.clone(),
-        Some(base.join("no-such-ffmpeg.exe")),
+        ffmpeg(),
         Some(base.join("no-such-yt-dlp.exe")),
         Some(music_app_lib::audio_cache::AudioCache::new(
             base.join("cache"),
@@ -1703,7 +1734,7 @@ async fn a_track_that_never_starts_still_resets_the_position() {
     let (playable, broken) = (ids[0], ids[1]);
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -1789,7 +1820,7 @@ async fn the_state_and_the_queue_agree_about_what_is_playing() {
     .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -1874,7 +1905,7 @@ async fn changing_track_leaves_nothing_of_the_previous_one_in_the_bar() {
     .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     for id in [local, online] {
         handle
@@ -1966,7 +1997,7 @@ async fn a_cache_copy_that_will_not_decode_is_thrown_away() {
         db.pool.clone(),
         // Resolved through PATH. Without it there is no decoder, and "no
         // ffmpeg" is a different failure that must not evict anything.
-        Some(std::path::PathBuf::from("ffmpeg")),
+        ffmpeg(),
         // Deliberately absent, so the retry after eviction fails immediately
         // instead of going to the network. Eviction is what is under test.
         Some(base.join("no-such-yt-dlp.exe")),
@@ -2143,7 +2174,7 @@ async fn a_track_that_starts_playing_is_also_described() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -2182,6 +2213,485 @@ async fn a_track_that_starts_playing_is_also_described() {
         "the track was announced at sequence {announced} and no queue payload \
          describing it followed (queues: {queues:?}) -- the bar has an id and \
          nothing to draw with",
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The beta report: a streamed track plays, but the bar cannot name it.
+///
+/// This is the *player bar's* contract, not the queue panel's, and the two
+/// differ in one way that matters. The bar resolves what is playing by
+/// matching `player-state`'s track id against the `player-queue` payload, and
+/// falls back to the library list when they disagree. A streamed audition is
+/// `in_library = 0`, so for it that fallback is empty -- the queue payload is
+/// the only thing in the app that can produce a title, an artist or a cover.
+/// Which is why this shows up on YouTube and SoundCloud tracks and on nothing
+/// else: every other kind of track is quietly rescued by the fallback.
+///
+/// So the assertion is not "a queue payload was emitted". It is the thing the
+/// user can actually see: replay the two event streams in the order they were
+/// emitted, exactly as the bar does, and ask what the bar is showing when the
+/// dust settles.
+///
+/// Live, because the failure is about the timing of a real resolve -- yt-dlp
+/// takes seconds, and that gap is the whole point. See the note on
+/// `a_saved_youtube_track_streams`.
+#[tokio::test]
+async fn the_bar_can_name_a_streamed_track() {
+    let _network = NETWORK.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-bar-names-stream");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    // Exactly what `save_remote_track` writes when a search result is played:
+    // metadata, no local path, and deliberately *not* in the library.
+    sqlx::query(
+        "INSERT INTO tracks (source, title, artist, state, remote_id, remote_url, \
+         remote_thumbnail_url, in_library) \
+         VALUES ('youtube', 'Never Gonna Give You Up', 'Rick Astley', 'saved', \
+                 'dQw4w9WgXcQ', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', \
+                 'https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg', 0)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let track_id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        ffmpeg(),
+        Some(std::path::PathBuf::from("yt-dlp")),
+        None,
+    );
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![track_id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(25)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    if errors
+        .iter()
+        .any(|e| e.contains("No audio output device") || e.contains("yt-dlp"))
+    {
+        eprintln!("SKIP: cannot reach the stream on this machine: {errors:?}");
+        return;
+    }
+
+    let states = recorder.0.state_seq.lock().unwrap().clone();
+    let queues = recorder.0.queue_desc.lock().unwrap().clone();
+
+    if !states.iter().any(|(_, _, playing)| *playing) {
+        eprintln!("SKIP: the track never reached Playing: {errors:?}");
+        return;
+    }
+
+    // Replay both streams in emission order and drive the bar the way the
+    // component does.
+    let mut merged: Vec<(u64, Option<i64>, Option<Option<String>>)> = Vec::new();
+    for (seq, id, _) in &states {
+        merged.push((*seq, *id, None));
+    }
+    for (seq, id, title) in &queues {
+        merged.push((*seq, *id, Some(title.clone())));
+    }
+    merged.sort_by_key(|(seq, _, _)| *seq);
+
+    // `player.trackId`, and `queueStore.current` as (id, title).
+    let mut bar_track: Option<i64> = None;
+    let mut bar_queue: Option<(i64, String)> = None;
+    // What the bar was showing after each event, so a failure can say where it
+    // went blank rather than only that it did.
+    let mut shown: Vec<(u64, Option<String>)> = Vec::new();
+
+    for (seq, id, payload) in &merged {
+        match payload {
+            // A queue payload: the panel redraws from it wholesale.
+            Some(title) => {
+                bar_queue = match (id, title) {
+                    (Some(i), Some(t)) => Some((*i, t.clone())),
+                    _ => None,
+                }
+            }
+            // A state event: the id, and nothing that describes it.
+            None => bar_track = *id,
+        }
+
+        // `nowPlaying`, verbatim: the queue payload where it agrees, and for an
+        // audition there is no library row to fall back to.
+        let now = match (bar_track, &bar_queue) {
+            (Some(t), Some((qid, title))) if *qid == t => Some(title.clone()),
+            _ => None,
+        };
+        shown.push((*seq, now));
+    }
+
+    eprintln!("states: {states:?}");
+    eprintln!("queues: {queues:?}");
+    eprintln!("bar:    {shown:?}");
+
+    let (_, settled) = shown.last().expect("no events at all").clone();
+
+    assert_eq!(
+        settled.as_deref(),
+        Some("Never Gonna Give You Up"),
+        "the bar could not name the streamed track once everything had \
+         settled -- this is the \"Loading track details…\" the testers see. \
+         Bar over time: {shown:?}",
+    );
+}
+
+/// The same question, but in the state a listener is actually in.
+///
+/// Nobody launches the app and immediately plays one YouTube result. They are
+/// already listening to something, and *then* pick a stream -- which is the
+/// case where the bar has a queue payload already, describing the wrong track.
+/// A payload that is merely stale is far more dangerous than a missing one:
+/// it is truthy, it satisfies "a payload exists", and the bar still cannot use
+/// it because it names somebody else.
+#[tokio::test]
+async fn the_bar_can_name_a_stream_chosen_mid_listen() {
+    let _network = NETWORK.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-bar-names-midlisten");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let wav = base.join("tone.wav");
+    write_wav_secs(&wav, 30);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    // A local library track, then the audition that interrupts it.
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state, in_library) \
+         VALUES ('local', 'Tone', ?, 'present', 1)",
+    )
+    .bind(wav.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO tracks (source, title, artist, state, remote_id, remote_url, \
+         remote_thumbnail_url, in_library) \
+         VALUES ('youtube', 'Never Gonna Give You Up', 'Rick Astley', 'saved', \
+                 'dQw4w9WgXcQ', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', \
+                 'https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg', 0)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let local_id: i64 = sqlx::query_scalar("SELECT id FROM tracks WHERE source = 'local'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let stream_id: i64 = sqlx::query_scalar("SELECT id FROM tracks WHERE source = 'youtube'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        ffmpeg(),
+        Some(std::path::PathBuf::from("yt-dlp")),
+        None,
+    );
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![local_id],
+            start_index: 0,
+            context_name: Some("Library".to_string()),
+        })
+        .unwrap();
+
+    // Let it genuinely start, so the bar is in the settled, describing state
+    // the interruption has to survive.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![stream_id],
+            start_index: 0,
+            context_name: Some("YouTube search".to_string()),
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(25)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    if errors
+        .iter()
+        .any(|e| e.contains("No audio output device") || e.contains("yt-dlp"))
+    {
+        eprintln!("SKIP: cannot reach the stream on this machine: {errors:?}");
+        return;
+    }
+
+    let states = recorder.0.state_seq.lock().unwrap().clone();
+    let queues = recorder.0.queue_desc.lock().unwrap().clone();
+
+    if !states
+        .iter()
+        .any(|(_, id, playing)| *id == Some(stream_id) && *playing)
+    {
+        eprintln!("SKIP: the stream never reached Playing: {errors:?}");
+        return;
+    }
+
+    let shown = replay_the_bar(&states, &queues);
+    eprintln!("states: {states:?}");
+    eprintln!("queues: {queues:?}");
+    eprintln!("bar:    {shown:?}");
+
+    let (_, settled) = shown.last().expect("no events at all").clone();
+    assert_eq!(
+        settled.as_deref(),
+        Some("Never Gonna Give You Up"),
+        "the bar could not name the stream that interrupted a local track. \
+         Bar over time: {shown:?}",
+    );
+}
+
+/// Drives the player bar the way the component does, over the real emission
+/// order, and reports what it was showing after each event.
+///
+/// The fallback the bar has for a library track is deliberately absent: this
+/// asks what a *streamed audition* can show, and for that the queue payload is
+/// the only source in the app.
+fn replay_the_bar(
+    states: &[(u64, Option<i64>, bool)],
+    queues: &[(u64, Option<i64>, Option<String>)],
+) -> Vec<(u64, Option<String>)> {
+    let mut merged: Vec<(u64, Option<i64>, Option<Option<String>>)> = Vec::new();
+    for (seq, id, _) in states {
+        merged.push((*seq, *id, None));
+    }
+    for (seq, id, title) in queues {
+        merged.push((*seq, *id, Some(title.clone())));
+    }
+    merged.sort_by_key(|(seq, _, _)| *seq);
+
+    let mut bar_track: Option<i64> = None;
+    let mut bar_queue: Option<(i64, String)> = None;
+    let mut shown = Vec::new();
+
+    for (seq, id, payload) in &merged {
+        match payload {
+            Some(title) => {
+                bar_queue = match (id, title) {
+                    (Some(i), Some(t)) => Some((*i, t.clone())),
+                    _ => None,
+                }
+            }
+            None => bar_track = *id,
+        }
+
+        let now = match (bar_track, &bar_queue) {
+            (Some(t), Some((qid, title))) if *qid == t => Some(title.clone()),
+            _ => None,
+        };
+        shown.push((*seq, now));
+    }
+
+    shown
+}
+
+/// The path with a hand-off in it: advancing *into* a stream.
+///
+/// This is the one a listener hits without choosing to. A queued or playlisted
+/// stream is resolved ahead of time by the prefetcher, and when the track
+/// before it ends `begin_load` takes the prepared branch -- which returns
+/// early, before the `Loading` state the slow path emits. Fewer events on the
+/// way through is exactly the condition under which a payload can be missed,
+/// so the contract is worth checking here rather than assumed from the paths
+/// where the load is slow and noisy.
+#[tokio::test]
+async fn the_bar_can_name_a_stream_it_advanced_into() {
+    let _network = NETWORK.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-bar-names-advanced");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let wav = base.join("tone.wav");
+    write_wav_secs(&wav, 12);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state, in_library) \
+         VALUES ('local', 'Tone', ?, 'present', 1)",
+    )
+    .bind(wav.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO tracks (source, title, artist, state, remote_id, remote_url, \
+         remote_thumbnail_url, in_library) \
+         VALUES ('youtube', 'Never Gonna Give You Up', 'Rick Astley', 'saved', \
+                 'dQw4w9WgXcQ', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', \
+                 'https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg', 0)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let local_id: i64 = sqlx::query_scalar("SELECT id FROM tracks WHERE source = 'local'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let stream_id: i64 = sqlx::query_scalar("SELECT id FROM tracks WHERE source = 'youtube'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        ffmpeg(),
+        Some(std::path::PathBuf::from("yt-dlp")),
+        None,
+    );
+
+    // Both in one context, so the stream is reached by the track before it
+    // ending -- never by a command.
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![local_id, stream_id],
+            start_index: 0,
+            context_name: Some("Mixed playlist".to_string()),
+        })
+        .unwrap();
+
+    // 12s of tone, then the resolve and buffer for what follows it.
+    tokio::time::sleep(Duration::from_secs(45)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    if errors
+        .iter()
+        .any(|e| e.contains("No audio output device") || e.contains("yt-dlp"))
+    {
+        eprintln!("SKIP: cannot reach the stream on this machine: {errors:?}");
+        return;
+    }
+
+    let states = recorder.0.state_seq.lock().unwrap().clone();
+    let queues = recorder.0.queue_desc.lock().unwrap().clone();
+
+    if !states
+        .iter()
+        .any(|(_, id, playing)| *id == Some(stream_id) && *playing)
+    {
+        eprintln!("SKIP: never advanced into the stream: {errors:?}");
+        return;
+    }
+
+    let shown = replay_the_bar(&states, &queues);
+    eprintln!("states: {states:?}");
+    eprintln!("queues: {queues:?}");
+    eprintln!("bar:    {shown:?}");
+
+    let (_, settled) = shown.last().expect("no events at all").clone();
+    assert_eq!(
+        settled.as_deref(),
+        Some("Never Gonna Give You Up"),
+        "the bar could not name the stream it advanced into. Bar: {shown:?}",
+    );
+}
+
+/// With no decoder, the player stops on the track it was asked for.
+///
+/// ffmpeg decodes everything now, so its absence is not a per-track problem —
+/// every track fails identically. The load-failure path treats a failure as
+/// evidence the *track* is bad and skips to the next one, up to
+/// `MAX_LOAD_ATTEMPTS`, which here would walk two innocent tracks out of the
+/// queue and leave the listener reading an error about the third.
+///
+/// So the queue must not move, and the message must be the one written for
+/// somebody who has never heard of ffmpeg.
+#[tokio::test]
+async fn without_a_decoder_the_player_stops_and_says_why() {
+    let base = std::env::temp_dir().join("music-app-no-decoder");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+
+    let mut ids = Vec::new();
+    for name in ["First", "Second", "Third"] {
+        let wav = base.join(format!("{name}.wav"));
+        write_wav(&wav);
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO tracks (source, title, local_path, state) \
+             VALUES ('local', ?, ?, 'present') RETURNING id",
+        )
+        .bind(name)
+        .bind(wav.to_str().unwrap())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+
+    let recorder = Recorder::default();
+    // The condition under test: no decoder anywhere.
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: ids.clone(),
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    let states = recorder.0.state_seq.lock().unwrap().clone();
+    eprintln!("errors: {errors:?}");
+    eprintln!("states: {states:?}");
+
+    assert!(
+        errors.iter().any(|e| e.contains("Reinstalling")),
+        "the listener should be told what is actually wrong, got {errors:?}",
+    );
+    assert!(
+        !errors.iter().any(|e| e.contains("src-tauri")),
+        "a path in our source tree is not something to show a listener: {errors:?}",
+    );
+
+    // Never advanced past the track that was asked for. Without the guard the
+    // coordinator reaches the third id here.
+    let reached: Vec<Option<i64>> = states.iter().map(|(_, id, _)| *id).collect();
+    assert!(
+        !reached.contains(&Some(ids[1])) && !reached.contains(&Some(ids[2])),
+        "the queue was walked looking for a track that would play, but none \
+         can: {reached:?}",
     );
 
     db.pool.close().await;

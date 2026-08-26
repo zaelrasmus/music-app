@@ -32,8 +32,8 @@ pub fn quiet(command: &mut Command) -> &mut Command {
 pub enum Tool {
     /// Search and stream/download resolution.
     YtDlp,
-    /// Decoding anything rodio cannot handle natively: Opus files, and every
-    /// remote stream.
+    /// Decoding. Every format and every source -- local files included, since
+    /// it replaced rodio's native decoder rather than only covering for it.
     Ffmpeg,
 }
 
@@ -50,6 +50,33 @@ impl Tool {
 const EXE_SUFFIX: &str = ".exe";
 #[cfg(not(windows))]
 const EXE_SUFFIX: &str = "";
+
+/// What the listener is told when there is no decoder.
+///
+/// One message, in one place, because this is the single failure that stops
+/// *everything* playing -- local files included, since ffmpeg replaced rodio's
+/// native decoder rather than only covering for it.
+///
+/// Written for someone who has never heard of ffmpeg. The old wording pointed
+/// at `src-tauri/binaries/README.md`, which is a path in our source tree: fine
+/// while this could only affect an Opus file on a developer's machine, useless
+/// to a listener whose whole library has gone quiet. ffmpeg is bundled, so its
+/// absence means the install is damaged rather than incomplete -- and security
+/// software quarantining it is the most common way that happens.
+pub const NO_DECODER: &str = "Playback needs ffmpeg, which is missing from this \
+     installation. It normally ships with the app, so this usually means some \
+     files did not install or security software removed them. Reinstalling \
+     should put it back.";
+
+/// Whether a failure is the decoder being absent, not the track being bad.
+///
+/// The distinction decides what the player does next. An unplayable track is
+/// worth skipping past -- the next one may be fine. A missing decoder is not:
+/// every track will fail identically, so skipping only walks the queue and
+/// buries the reason under two tracks that never had a chance.
+pub fn is_missing_decoder(message: &str) -> bool {
+    message == NO_DECODER
+}
 
 #[derive(Debug, Clone)]
 pub struct Resolved {
@@ -253,28 +280,47 @@ fn bundled_candidates(tool: Tool, file_name: &str) -> Vec<PathBuf> {
 /// Tests that exercise a real sidecar have no Tauri app to ask, and the
 /// alternative -- reaching for whatever `ffmpeg` is on PATH -- would quietly
 /// test a different binary from the one that ships.
-#[cfg(test)]
+///
+/// Deliberately *not* `#[cfg(test)]`. The integration tests in `tests/`
+/// compile against this crate as an ordinary dependency, where a `cfg(test)`
+/// item is invisible -- and they need this more than the unit tests do: since
+/// ffmpeg became the only decoder, any test that plays audio at all has to
+/// hand the player a real one.
+#[doc(hidden)]
 pub fn staged_for_tests(tool: Tool) -> Option<std::path::PathBuf> {
     let file_name = format!("{}{EXE_SUFFIX}", tool.base_name());
+    let staged = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries");
+
     bundled_candidates(tool, &file_name)
         .into_iter()
+        // The staged copies again, unconditionally. `bundled_candidates` only
+        // looks here in a debug build, and a test binary lives in
+        // `target/<profile>/deps` where nothing is staged beside it -- so
+        // without this a `--release` test run finds no sidecar at all.
+        .chain([
+            staged.join(format!(
+                "{}-{}{EXE_SUFFIX}",
+                tool.base_name(),
+                current_target_triple()
+            )),
+            staged.join(&file_name),
+        ])
         .find(|path| path.exists())
 }
 
 /// The triple Tauri uses when naming staged sidecars.
-#[cfg(debug_assertions)]
 fn current_target_triple() -> &'static str {
     // Set by build.rs; falls back to the host triple this crate was built for.
     option_env!("TAURI_ENV_TARGET_TRIPLE").unwrap_or(DEFAULT_TRIPLE)
 }
 
-#[cfg(all(debug_assertions, target_os = "windows", target_arch = "x86_64"))]
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const DEFAULT_TRIPLE: &str = "x86_64-pc-windows-msvc";
-#[cfg(all(debug_assertions, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const DEFAULT_TRIPLE: &str = "aarch64-apple-darwin";
-#[cfg(all(debug_assertions, target_os = "macos", target_arch = "x86_64"))]
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 const DEFAULT_TRIPLE: &str = "x86_64-apple-darwin";
-#[cfg(all(debug_assertions, target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const DEFAULT_TRIPLE: &str = "x86_64-unknown-linux-gnu";
 
 fn is_executable_file(path: &Path) -> bool {
@@ -286,6 +332,43 @@ fn find_on_path(file_name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join(file_name))
         .find(|candidate| is_executable_file(candidate))
+}
+
+// --- commands ----------------------------------------------------------
+
+/// Whether playback is possible at all, for the UI to say so up front.
+///
+/// Worth a command of its own because the alternative is discovering it by
+/// pressing play: the library lists, the playlists open, the settings work,
+/// and then every track fails. Asking once at launch lets the app say what is
+/// wrong while the listener is still looking at a screen that seems fine.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DecoderStatus {
+    /// False means nothing will play, whatever is clicked.
+    pub present: bool,
+    /// Shown only in the failure case, where "which ffmpeg?" is the first
+    /// question anyone debugging this will ask.
+    pub path: Option<String>,
+    /// The same words the player would use, so the banner and the error a
+    /// listener sees after pressing play cannot drift apart.
+    pub message: Option<String>,
+}
+
+#[tauri::command]
+pub async fn decoder_status(app: AppHandle) -> DecoderStatus {
+    match resolve(&app, Tool::Ffmpeg) {
+        Ok(found) => DecoderStatus {
+            present: true,
+            path: Some(found.path.display().to_string()),
+            message: None,
+        },
+        Err(_) => DecoderStatus {
+            present: false,
+            path: None,
+            message: Some(NO_DECODER.to_string()),
+        },
+    }
 }
 
 #[cfg(test)]

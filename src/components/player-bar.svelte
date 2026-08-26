@@ -5,7 +5,8 @@
     import { coverSeed } from "$lib/cover";
     import { player } from "$lib/player.svelte";
     import { queueStore } from "$lib/queue.svelte";
-    import { trackStore } from "$lib/tracks.svelte";
+    import { trackStore, type Track } from "$lib/tracks.svelte";
+    import { invoke } from "@tauri-apps/api/core";
     import { cacheStore } from "$lib/cache.svelte";
     import ListMusicIcon from "@lucide/svelte/icons/list-music";
     import PlayIcon from "@lucide/svelte/icons/play";
@@ -32,7 +33,10 @@
      *
      * The queue payload is preferred where it agrees, because the backend
      * hydrates it directly and so knows about a YouTube result saved seconds
-     * ago that the library list has not reloaded yet.
+     * ago that the library list has not reloaded yet. The library list is
+     * second, and a direct fetch by id is the floor under both — so this
+     * returning `null` now means the track is genuinely not in the database,
+     * not merely that an event has yet to arrive.
      */
     const nowPlaying = $derived.by(() => {
         const id = player.trackId;
@@ -41,53 +45,60 @@
         const queued = queueStore.current;
         if (queued?.trackId === id) return queued;
 
-        return trackStore.tracks.find((t) => t.id === id) ?? null;
+        const known = trackStore.tracks.find((t) => t.id === id);
+        if (known) return known;
+
+        // Asked for by id when neither list could answer. See `fetched`.
+        return fetched?.id === id ? fetched.track : null;
     });
 
     /**
      * Something is playing that the bar cannot name.
      *
-     * Only reachable when the two events have drifted: the id arrived and its
-     * details did not. A library track survives it — `trackStore` can describe
-     * that one — but a streamed audition is deliberately not in the library,
-     * so there is nowhere else to look and the bar has an id and nothing else.
+     * Now a genuinely transient state: it lasts as long as the fetch below,
+     * rather than as long as whatever event went missing. It is still worth a
+     * branch of its own, because the alternatives are a flat lie ("Nothing
+     * playing", with audio coming out of the speakers) or the previous track's
+     * title sitting over the new one's music.
      */
     const undescribed = $derived(player.trackId !== null && nowPlaying === null);
 
     /**
-     * Ask again when the queue moves under us.
+     * Ask for the track by id, rather than waiting to be told about it.
      *
-     * The queue payload is pushed, so a lost or late one leaves the bar blank
-     * with no way back — the coordinator only emits on change, and the change
-     * has already happened. Asking costs one round trip.
+     * Both earlier attempts at this bug patched the *push*: make the queue
+     * payload arrive, then make the bar re-ask for it. Neither removed the
+     * dependency, so the bar could still be left holding an id it had no way
+     * to describe, and for a streamed audition — `in_library = 0`, so no
+     * library row to fall back on — that reads as "Loading track details…"
+     * over audible music.
      *
-     * Latched on the track id *and* on the payload the last attempt saw, not on
-     * the id alone. One attempt per track was the old rule, and it had a hole:
-     * if that single refresh answered with a payload still describing the
-     * previous track, nothing ever asked again and the bar stayed on "Loading
-     * track details…" for the rest of the song. A track not in the library —
-     * any streamed audition, since those are `in_library = 0` — has no other
-     * source to fall back to, so being stuck there is permanent.
-     *
-     * Re-arming on a *changed* payload is what keeps this bounded: each attempt
-     * needs new information to justify itself, so a queue that never changes
-     * cannot make this loop.
+     * A fetch by id cannot come back describing somebody else, which is what
+     * makes one attempt per track correct here. The re-ask it replaces was
+     * bounded on the *identity* of the last payload seen, and every payload is
+     * freshly deserialised — so a bar that stayed undescribed re-armed on each
+     * reply and spun a request round trip per event, forever.
      */
-    // Deliberately not `$state`: the effect reads these as latches, and making
-    // them reactive would have the effect depend on its own writes.
+    // Deliberately not `$state`: the effect reads it as a latch, and making it
+    // reactive would have the effect depend on its own write.
     let asked: number | null = null;
-    let askedAgainst: unknown = undefined;
+    let fetched = $state<{ id: number; track: Track } | null>(null);
 
     $effect(() => {
         const id = player.trackId;
-        // Read so the effect re-runs when a new payload arrives.
-        const payload = queueStore.current;
-        if (id === null || !undescribed) return;
-        if (asked === id && askedAgainst === payload) return;
+        if (id === null || !undescribed || asked === id) return;
 
         asked = id;
-        askedAgainst = payload;
-        void queueStore.refresh();
+        void invoke<Track | null>("track_details", { trackId: id })
+            .then((track) => {
+                if (track) fetched = { id, track };
+            })
+            // Re-arm, so a transient failure is not permanent. The latch is
+            // what keeps this from becoming a retry loop: it only clears for
+            // the track that actually failed.
+            .catch(() => {
+                if (asked === id) asked = null;
+            });
     });
 
     // Total comes from the scanned tag, not from rodio, whose total_duration

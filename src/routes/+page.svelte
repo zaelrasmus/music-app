@@ -7,6 +7,8 @@
     import { providerSearch } from "$lib/provider-search.svelte";
     import { cacheStore } from "$lib/cache.svelte";
     import { loudnessStore } from "$lib/loudness.svelte";
+    import { decoder } from "$lib/decoder.svelte";
+    import { equalizer } from "$lib/equalizer.svelte";
     import { historyStore } from "$lib/history.svelte";
     import { playlistStore } from "$lib/playlists.svelte";
     import { tagStore } from "$lib/tags.svelte";
@@ -38,11 +40,13 @@
         providerSearch.loadProviders();
         cacheStore.restore();
         loudnessStore.refresh();
+        decoder.refresh();
         historyStore.load();
         covers.load();
         ytDlp.refresh();
         downloads.refresh();
         player.restorePreferences().then(() => player.restorePlayback());
+        equalizer.restore();
 
         const scans = trackStore.listenForScans();
         const playback = player.listenForPlayer();

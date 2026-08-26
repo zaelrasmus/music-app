@@ -1324,3 +1324,28 @@ mod thumbnail_tests {
     }
 
 }
+
+/// Searches YouTube Music's catalogue, falling back to yt-dlp.
+///
+/// The fallback is *technical*, not a preference. `youtubei` is a private API
+/// whose client version and filter blob are constants somebody else derived;
+/// when it stops answering, a search that returns nothing would look like the
+/// app being broken rather than one route of two being unavailable.
+///
+/// It is deliberately not the other way round either. These two searches are
+/// peers -- see the module docs on `crate::ytmusic` -- and picking between them
+/// is the user's choice, made in the UI. This command is "the music catalogue,
+/// or the best we can manage".
+#[tauri::command]
+pub async fn search_yt_music(
+    app: AppHandle,
+    query: String,
+    limit: Option<u32>,
+) -> Result<Vec<SearchResult>, String> {
+    let limit = limit.unwrap_or(10).clamp(1, MAX_RESULTS);
+
+    match crate::ytmusic::search(&query, limit).await {
+        Ok(results) => Ok(results),
+        Err(_) => search_provider(app, Provider::YouTube, query, Some(limit)).await,
+    }
+}

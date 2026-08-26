@@ -58,11 +58,19 @@
         providerSearch.provider === "soundcloud" ? "plays" : "views",
     );
 
-    /** SoundCloud artwork is square; YouTube thumbnails are 16:9. */
+    /**
+     * Cover art is square; video thumbnails are 16:9.
+     *
+     * Keyed on the *source* rather than the provider, which is what makes YT
+     * Music right: it reaches YouTube, but what it returns is album art from
+     * the music catalogue, not a frame from a video. Deciding by provider put
+     * square art in a 16:9 box, which is what "the thumbnails look weird"
+     * actually was.
+     */
     const artClass = $derived(
-        providerSearch.provider === "soundcloud"
-            ? "aspect-square w-16"
-            : "aspect-video w-[7rem]",
+        providerSearch.source === "youtube"
+            ? "aspect-video w-[7rem]"
+            : "aspect-square w-16",
     );
 
     function uploaderLabel(result: SearchResult) {
@@ -201,7 +209,7 @@
                 onenter={() => providerSearch.searchNow()}
             />
 
-            {#if providerSearch.providers.length > 1}
+            {#if providerSearch.sources.length > 1}
                 <!-- A segmented control rather than chips: these are mutually
                      exclusive and one is always on, which chips do not say. -->
                 <div
@@ -209,8 +217,8 @@
                     role="tablist"
                     aria-label="Search provider"
                 >
-                    {#each providerSearch.providers as provider (provider.id)}
-                        {@const selected = providerSearch.provider === provider.id}
+                    {#each providerSearch.sources as provider (provider.id)}
+                        {@const selected = providerSearch.source === provider.id}
                         <button
                             type="button"
                             role="tab"

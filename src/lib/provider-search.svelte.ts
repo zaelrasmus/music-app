@@ -8,6 +8,14 @@ import { SvelteSet } from "svelte/reactivity";
 
 export type Provider = "youtube" | "soundcloud";
 
+/**
+ * A tab in the search picker.
+ *
+ * A superset of `Provider`: "ytmusic" is not a service and is never stored,
+ * only a different way of asking YouTube. See `ProviderSearch.source`.
+ */
+export type SearchSource = Provider | "ytmusic";
+
 /** What a search is looking for. */
 export type SearchKind = "track" | "playlist" | "artist";
 
@@ -90,7 +98,29 @@ export function looksLikePreview(result: SearchResult) {
 class ProviderSearchStore {
   /** Filled from the backend so the enum stays the single source of truth. */
   providers = $state<ProviderInfo[]>([]);
-  provider = $state<Provider>("youtube");
+  /**
+   * Which search is running, which is not the same as which service.
+   *
+   * "YT Music" and "YouTube" both reach YouTube and both store `youtube`
+   * tracks — the schema allows no third value, and everything found either way
+   * streams down the same path. They differ in what they *know*: the music
+   * catalogue returns a title, an artist and a duration as separate fields,
+   * while a plain search returns an upload title and whoever posted it. That
+   * is the difference between a track filed under "Set It Off" and one filed
+   * under "Music Terminal".
+   *
+   * Neither is the better search. The catalogue is tidier and misses things —
+   * it will not find the Queen recording of Bohemian Rhapsody, and it happily
+   * returns a re-upload credited to "Freddy Mercury". A plain search is
+   * messier and reaches everything, including versions that were never
+   * released. So this is a choice offered, not a default with a fallback.
+   */
+  source = $state<SearchSource>("ytmusic");
+
+  /** Which service the current source actually talks to. */
+  readonly provider = $derived<Provider>(
+    this.source === "ytmusic" ? "youtube" : this.source,
+  );
 
   query = $state("");
   results = $state<SearchResult[]>([]);
@@ -115,10 +145,30 @@ class ProviderSearchStore {
     }
   }
 
+  /**
+   * The tabs, with the music catalogue offered beside YouTube itself.
+   *
+   * Built from the backend's provider list rather than hardcoded, so a
+   * provider that disappears takes its tab with it — and inserted rather than
+   * appended, because "YT Music" and "YouTube" are two ways of searching the
+   * same service and belong next to each other.
+   */
+  readonly sources = $derived.by(() => {
+    const tabs: { id: SearchSource; name: string; kinds: SearchKind[] }[] = [];
+    for (const provider of this.providers) {
+      if (provider.id === "youtube") {
+        // Tracks only. The catalogue has albums and artists behind different
+        // filters, but nothing here reads them yet, and offering a tab that
+        // cannot answer is worse than not offering it.
+        tabs.push({ id: "ytmusic", name: "YT Music", kinds: ["track"] });
+      }
+      tabs.push(provider);
+    }
+    return tabs;
+  });
+
   get providerName() {
-    return (
-      this.providers.find((p) => p.id === this.provider)?.name ?? "YouTube"
-    );
+    return this.sources.find((s) => s.id === this.source)?.name ?? "YouTube";
   }
 
   /**
@@ -128,10 +178,10 @@ class ProviderSearchStore {
    * them on screen under the new one's label for the several seconds a search
    * takes would be actively misleading.
    */
-  async setProvider(provider: Provider) {
-    if (provider === this.provider) return;
+  async setProvider(source: SearchSource) {
+    if (source === this.source) return;
 
-    this.provider = provider;
+    this.source = source;
     this.results = [];
     this.collections = [];
     this.opened = null;
@@ -296,11 +346,20 @@ class ProviderSearchStore {
 
     try {
       if (this.kind === "track") {
-        const results = await invoke<SearchResult[]>("search_provider", {
-          provider: this.provider,
-          query,
-          limit: 15,
-        });
+        // The music catalogue has its own command, which falls back to yt-dlp
+        // by itself if the endpoint is unavailable — so a failure here is a
+        // real failure rather than the private API having moved again.
+        const results =
+          this.source === "ytmusic"
+            ? await invoke<SearchResult[]>("search_yt_music", {
+                query,
+                limit: 25,
+              })
+            : await invoke<SearchResult[]>("search_provider", {
+                provider: this.provider,
+                query,
+                limit: 25,
+              });
 
         if (request !== this.#latestRequest) return;
         this.results = results;
@@ -347,9 +406,7 @@ class ProviderSearchStore {
   importing = $state(false);
 
   get kinds(): SearchKind[] {
-    return (
-      this.providers.find((p) => p.id === this.provider)?.kinds ?? ["track"]
-    );
+    return this.sources.find((s) => s.id === this.source)?.kinds ?? ["track"];
   }
 
   async setKind(kind: SearchKind) {

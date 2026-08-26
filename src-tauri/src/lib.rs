@@ -4,9 +4,19 @@ mod covers;
 pub mod db;
 mod download;
 mod downloads;
+#[cfg(test)]
+mod ytmusic_probe;
 mod engine;
+mod ytmusic;
+mod equalizer;
+#[cfg(test)]
+mod eq_bench;
+mod media_controls;
+mod now_playing;
 mod library;
 mod loudness;
+#[cfg(test)]
+mod loudness_window;
 mod playable;
 pub mod playlists;
 pub mod player;
@@ -14,7 +24,7 @@ mod providers;
 mod queue;
 mod scanner;
 mod search;
-mod sidecar;
+pub mod sidecar;
 mod soundcloud;
 mod stream_urls;
 mod tags;
@@ -89,9 +99,15 @@ pub fn run() {
             // Coordinator (queue, repeat, shuffle, volume) plus the dumb audio
             // engine it drives. The engine thread owns the output device for
             // the whole process.
-            // Optional on purpose: without ffmpeg the app still plays every
-            // format rodio handles natively, and only Opus files report a
-            // clear "ffmpeg not found" instead of failing obscurely.
+            // Still an `Option`, but no longer optional in practice: ffmpeg is
+            // the only decoder, so without it nothing plays at all -- local
+            // files included. It used to cover only Opus and streams, with
+            // rodio handling the rest natively.
+            //
+            // Kept as an `Option` rather than made fatal so a missing sidecar
+            // reports "ffmpeg not found" per track, with the rest of the app --
+            // library, playlists, settings -- still usable. Failing to launch
+            // would tell the user less and cost them more.
             let ffmpeg = sidecar::resolve(app.handle(), sidecar::Tool::Ffmpeg)
                 .ok()
                 .map(|found| found.path);
@@ -163,13 +179,72 @@ pub fn run() {
                 });
             }
 
-            app.manage(player::spawn(
-                app.handle().clone(),
-                pool,
-                ffmpeg,
-                yt_dlp,
-                Some(audio_cache),
-            ));
+            // The system media panel, and with it the media keys.
+            //
+            // Registering needs the main window's handle, so this happens after
+            // the window exists and before the player is managed -- the player
+            // is handed the sink that feeds it.
+            //
+            // Every failure is survivable and none of them stop playback: no
+            // window, no handle, no controls, or a platform that has none. The
+            // player then gets the plain `AppHandle` it always had.
+            let media = app
+                .get_webview_window("main")
+                .and_then(|window| window_handle(&window))
+                .and_then(|hwnd| {
+                    let handle = app.handle().clone();
+                    media_controls::spawn(hwnd, move |button| {
+                        // Buttons arrive on a system thread with no async
+                        // context, so this hops onto the runtime rather than
+                        // sending from where it was called.
+                        let handle = handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            use media_controls::Button;
+                            use player::PlayerCommand;
+
+                            let Some(player) = handle.try_state::<player::PlayerHandle>() else {
+                                // A key pressed during startup, before the
+                                // player exists. Dropping it is right.
+                                return;
+                            };
+                            let _ = player.send(match button {
+                                Button::Play => PlayerCommand::Resume,
+                                Button::Pause => PlayerCommand::Pause,
+                                Button::Toggle => PlayerCommand::TogglePlayPause,
+                                Button::Next => PlayerCommand::Next,
+                                Button::Previous => PlayerCommand::Previous,
+                                Button::Stop => PlayerCommand::Stop,
+                            });
+                        });
+                    })
+                });
+
+            let events = media.map(|bridge| {
+                now_playing::NowPlaying::new(
+                    app.handle().clone(),
+                    bridge,
+                    pool.clone(),
+                    data_dir.join("covers"),
+                )
+            });
+
+            // Two spawns rather than one over a boxed trait object: the sink
+            // is a generic parameter, and the whole point of that is that the
+            // coordinator calls it without a vtable on every progress tick.
+            match events {
+                Some(events) => {
+                    app.manage(player::spawn(events, pool, ffmpeg, yt_dlp, Some(audio_cache)));
+                }
+                None => {
+                    app.manage(player::spawn(
+                        app.handle().clone(),
+                        pool,
+                        ffmpeg,
+                        yt_dlp,
+                        Some(audio_cache),
+                    ));
+                }
+            }
 
             // Keeps yt-dlp current. Managed before it is started so the first
             // status event has somewhere to land, and started last so that
@@ -208,6 +283,7 @@ pub fn run() {
             library::remove_library_folder,
             tracks::list_tracks,
             tracks::recently_played,
+            tracks::track_details,
             tracks::rescan_library,
             tracks::update_track_metadata,
             tracks::set_in_library,
@@ -267,6 +343,9 @@ pub fn run() {
             player::set_loop_queue,
             player::set_volume_ceiling,
             player::set_normalize,
+            player::set_equalizer_enabled,
+            player::set_equalizer_bands,
+            player::equalizer_bands,
             player::set_wait_to_measure,
             loudness::measure_track,
             loudness::measured_track_ids,
@@ -277,6 +356,7 @@ pub fn run() {
             audio_cache::cached_track_ids,
             providers::list_providers,
             youtube::search_provider,
+            youtube::search_yt_music,
             youtube::save_remote_track,
             youtube::save_remote_tracks,
             collections::search_collections,
@@ -284,8 +364,25 @@ pub fn run() {
             collections::max_expanded_tracks,
             playlists::import_playlist,
             updater::yt_dlp_status,
+            sidecar::decoder_status,
             updater::update_yt_dlp,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+/// The main window's native handle, for whatever the platform registers with.
+///
+/// An `isize` rather than a pointer type because it has to cross a thread
+/// boundary to reach the media-controls thread, and a raw pointer is not
+/// `Send`. Reconstituted on the other side, where it is used and nothing else.
+#[cfg(windows)]
+fn window_handle<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> Option<isize> {
+    window.hwnd().ok().map(|hwnd| hwnd.0 as isize)
+}
+
+/// No such thing here, so nothing registers.
+#[cfg(not(windows))]
+fn window_handle<R: tauri::Runtime>(_window: &tauri::WebviewWindow<R>) -> Option<isize> {
+    None
 }

@@ -4,6 +4,7 @@
     import SettingsSection from "$components/settings-section.svelte";
     import CacheSettings from "$components/cache-settings.svelte";
     import LoudnessSettings from "$components/loudness-settings.svelte";
+    import EqualizerSettings from "$components/equalizer-settings.svelte";
     import ExtractorSettings from "$components/extractor-settings.svelte";
     import TagManager from "$components/tag-manager.svelte";
     import { library } from "$lib/library.svelte";
@@ -21,6 +22,8 @@
     import PanelLeftIcon from "@lucide/svelte/icons/panel-left";
     import PanelLeftDashedIcon from "@lucide/svelte/icons/panel-left-dashed";
     import EyeOffIcon from "@lucide/svelte/icons/eye-off";
+    import TriangleAlertIcon from "@lucide/svelte/icons/triangle-alert";
+    import { decoder } from "$lib/decoder.svelte";
 
     const summary = $derived(trackStore.lastSummary);
 
@@ -68,6 +71,32 @@
 
 <PageShell title="Settings" subtitle="Everything here is local to this machine.">
     <div class="mx-auto flex max-w-3xl flex-col gap-4 px-2">
+        <!--
+          First, above everything, and only when it is true.
+
+          Nothing else on this page matters if the app cannot make a sound, and
+          the failure is invisible until a track is clicked: the library lists,
+          playlists open, every control responds. Saying it here, before the
+          listener goes looking for a setting that would explain it, is the
+          whole point.
+        -->
+        {#if decoder.checked && !decoder.present}
+            <div
+                class="border-destructive/40 bg-destructive/10 flex items-start gap-3 rounded-xl border px-4 py-3"
+                role="alert"
+            >
+                <TriangleAlertIcon class="text-destructive mt-0.5 size-4 shrink-0" />
+                <div class="flex min-w-0 flex-col gap-1">
+                    <h2 class="text-destructive text-sm font-semibold">
+                        Nothing can play right now
+                    </h2>
+                    <p class="text-[13px] leading-relaxed">
+                        {decoder.message}
+                    </p>
+                </div>
+            </div>
+        {/if}
+
         <SettingsSection
             icon={FolderIcon}
             title="Library folders"
@@ -245,6 +274,7 @@
         </SettingsSection>
 
         <LoudnessSettings />
+        <EqualizerSettings />
 
         <CacheSettings />
 

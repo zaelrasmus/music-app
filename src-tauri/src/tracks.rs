@@ -50,6 +50,40 @@ pub async fn list_tracks(db: State<'_, Db>) -> Result<Vec<Track>, String> {
     .map_err(|e| e.to_string())
 }
 
+/// A named const so the test exercises this exact statement.
+///
+/// The one rule it encodes is an absence: no `in_library` filter. That is easy
+/// to "tidy" back in by matching the queries around it, and doing so would
+/// silently restore the bug it exists to fix -- while leaving every local
+/// track working, so nothing would look wrong.
+pub(crate) const TRACK_BY_ID: &str =
+    "SELECT id, source, title, artist, album, duration_secs, state, cover_key, in_library, \
+     remote_thumbnail_url \
+     FROM tracks WHERE id = ?";
+
+/// One track by id, whether or not the library lists it.
+///
+/// The player bar's last resort. Everything else that can name a playing track
+/// is *pushed*: `player-state` carries the id, `player-queue` carries the
+/// details, and if the two ever drift the bar is left holding an id it cannot
+/// describe. A library track survives that -- `list_tracks` already has it --
+/// but a streamed audition is `in_library = 0`, so for that one the push is
+/// the only source in the app, and a missed or late payload shows as
+/// "Loading track details…" over audible music.
+///
+/// Deliberately unfiltered, which is the whole point: the rows this has to
+/// reach are exactly the ones every other list leaves out. That makes the bar
+/// able to *ask* rather than only be told, so naming what is playing no longer
+/// depends on an event arriving.
+#[tauri::command]
+pub async fn track_details(db: State<'_, Db>, track_id: i64) -> Result<Option<Track>, String> {
+    sqlx::query_as(TRACK_BY_ID)
+        .bind(track_id)
+        .fetch_optional(&db.pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// The tracks played most recently, newest first.
 ///
 /// Deliberately not filtered by library membership. This is the one list that
@@ -284,4 +318,85 @@ pub async fn set_many_artists(
         .rows_affected();
 
     Ok(affected as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The point of the query: it reaches a track the library does not list.
+    ///
+    /// Every other list in the app filters on `in_library = 1`, which is
+    /// correct for them and fatal here -- a streamed audition is exactly the
+    /// row the player bar cannot describe any other way. Asserting the local
+    /// track too keeps this from passing for the trivial reason that the
+    /// filter was dropped along with something else.
+    #[tokio::test]
+    async fn an_audition_can_still_be_looked_up_by_id() {
+        let dir = std::env::temp_dir().join("music-app-track-details-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let db = crate::db::init(&dir).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO tracks (source, title, artist, state, remote_id, remote_url, \
+             remote_thumbnail_url, in_library) \
+             VALUES ('youtube', 'Auditioned', 'Somebody', 'saved', 'abc123', \
+                     'https://example.invalid/x', 'https://example.invalid/t.jpg', 0)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO tracks (source, title, local_path, state, in_library) \
+             VALUES ('local', 'Kept', '/tmp/kept.wav', 'present', 1)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let audition: i64 =
+            sqlx::query_scalar("SELECT id FROM tracks WHERE source = 'youtube'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let kept: i64 = sqlx::query_scalar("SELECT id FROM tracks WHERE source = 'local'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+        let found: Option<Track> = sqlx::query_as(TRACK_BY_ID)
+            .bind(audition)
+            .fetch_optional(&db.pool)
+            .await
+            .unwrap();
+
+        let found = found.expect(
+            "the audition was not found -- an `in_library` filter has crept \
+             back into TRACK_BY_ID, and the player bar cannot name a stream",
+        );
+        assert_eq!(found.title, "Auditioned");
+        assert_eq!(found.artist.as_deref(), Some("Somebody"));
+        assert!(!found.in_library);
+        // The bar draws artwork from this for a track with no stored cover.
+        assert!(found.remote_thumbnail_url.is_some());
+
+        let kept: Option<Track> = sqlx::query_as(TRACK_BY_ID)
+            .bind(kept)
+            .fetch_optional(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(kept.expect("the library track was not found").title, "Kept");
+
+        // A track that genuinely does not exist is still `None`, so the bar can
+        // tell "no such row" from "nobody has told me yet".
+        let missing: Option<Track> = sqlx::query_as(TRACK_BY_ID)
+            .bind(9_999_999_i64)
+            .fetch_optional(&db.pool)
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+    }
 }

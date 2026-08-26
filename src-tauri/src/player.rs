@@ -307,6 +307,15 @@ pub enum PlayerCommand {
         position_secs: f64,
     },
     TogglePlayPause,
+    /// Play, if not already playing.
+    ///
+    /// Distinct from the toggle because the system media panel sends what it
+    /// *wants*, not "the other one": a Play arriving while already playing
+    /// must do nothing, where a toggle would pause. That is the difference
+    /// between a media key that works and one that fights the flyout.
+    Resume,
+    /// Pause, if not already paused. See [`PlayerCommand::Resume`].
+    Pause,
     Next,
     Previous,
     Stop,
@@ -323,6 +332,13 @@ pub enum PlayerCommand {
     SetNormalize(bool),
     /// Whether to measure an unheard stream before playing it.
     SetWaitToMeasure(bool),
+    /// Whether the equaliser is in circuit at all.
+    SetEqualizerEnabled(bool),
+    /// Every band at once, in dB, low to high.
+    ///
+    /// The whole curve rather than one band: a preset applied band by band
+    /// would be audible as a sweep across the spectrum.
+    SetEqualizerBands(Vec<f32>),
     Seek(f64),
 }
 
@@ -648,6 +664,21 @@ impl<E: PlayerEvents> Coordinator<E> {
                 position_secs,
             } => self.restore(track_id, position_secs).await,
 
+            PlayerCommand::Resume => {
+                if matches!(self.state, PlaybackState::Paused) && self.report(self.engine.resume())
+                {
+                    self.state = PlaybackState::Playing;
+                    self.emit_state();
+                }
+            }
+
+            PlayerCommand::Pause => {
+                if matches!(self.state, PlaybackState::Playing) && self.report(self.engine.pause()) {
+                    self.state = PlaybackState::Paused;
+                    self.emit_state();
+                }
+            }
+
             PlayerCommand::TogglePlayPause => match self.state {
                 PlaybackState::Playing => {
                     if self.report(self.engine.pause()) {
@@ -732,6 +763,15 @@ impl<E: PlayerEvents> Coordinator<E> {
                     self.track_gain_db = self.track_gain_for(track_id).await;
                 }
                 self.apply_volume();
+            }
+
+            // Straight through to the shared atomics the audio thread reads.
+            // No decode restart and no gap: the change lands on the next frame.
+            PlayerCommand::SetEqualizerEnabled(on) => {
+                self.engine.equaliser().set_enabled(on);
+            }
+            PlayerCommand::SetEqualizerBands(bands) => {
+                self.engine.equaliser().set_gains(&bands);
             }
 
             // Both change the preview, so both re-emit the queue.
@@ -1118,7 +1158,15 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // Skipping a dead track goes through the same priority rule as
                 // a natural end, so an unplayable context track cannot swallow
                 // the tracks the user queued behind it.
-                let candidate = (next_attempt < MAX_LOAD_ATTEMPTS)
+                //
+                // Except when there is no decoder at all. Skipping assumes the
+                // *track* is the problem and the next one may be fine; with
+                // ffmpeg missing every track fails identically, so retrying
+                // walks two innocent tracks out of the queue and leaves the
+                // listener reading an error about the third. Stop on the one
+                // they actually asked for, and say why.
+                let candidate = (next_attempt < MAX_LOAD_ATTEMPTS
+                    && !crate::sidecar::is_missing_decoder(&e))
                     .then(|| self.queue.on_next())
                     .flatten();
 
@@ -2321,4 +2369,42 @@ mod volume_curve_report {
             }
         }
     }
+}
+
+
+/// Turns the equaliser on or off without disturbing the band settings.
+///
+/// Separate from the bands so the panel can offer a bypass: comparing "with"
+/// against "without" is the only way to judge an equaliser, and it must not
+/// cost the curve someone just spent a minute setting.
+#[tauri::command]
+pub async fn set_equalizer_enabled(
+    on: bool,
+    player: State<'_, PlayerHandle>,
+) -> Result<(), String> {
+    player.send(PlayerCommand::SetEqualizerEnabled(on))
+}
+
+/// Sets every band at once, in dB, low to high.
+///
+/// Values outside the allowed range are clamped rather than rejected: this
+/// arrives from the frontend as JSON, and a slider that silently did nothing
+/// because one number was out of range would be a worse bug than a curve that
+/// stops where the control does.
+#[tauri::command]
+pub async fn set_equalizer_bands(
+    bands: Vec<f32>,
+    player: State<'_, PlayerHandle>,
+) -> Result<(), String> {
+    player.send(PlayerCommand::SetEqualizerBands(bands))
+}
+
+/// The band centres, so the panel labels itself from the audio code.
+///
+/// Hardcoding ten frequencies in the frontend would let the labels drift away
+/// from the filters they name -- and a label that lies about which frequency a
+/// slider moves is worse than no label.
+#[tauri::command]
+pub async fn equalizer_bands() -> Vec<f32> {
+    crate::equalizer::CENTRES.to_vec()
 }

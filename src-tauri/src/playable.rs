@@ -21,28 +21,32 @@ pub struct PlayableTrack {
 
 /// Something the audio thread knows how to play.
 ///
-/// Only a local file today. When YouTube streaming lands it becomes another
-/// variant here, and the player learns one new arm -- nothing else moves.
+/// Every variant is decoded by ffmpeg. What separates them is not *how* they
+/// are decoded but what they are worth: a file the user owns, a copy this app
+/// made and may throw away, or a URL that expires.
+///
+/// There used to be a fourth -- `Transcoded` -- for the files rodio could not
+/// decode natively. It is gone because the distinction it drew is gone: rodio
+/// no longer decodes anything.
 #[derive(Debug, Clone)]
 pub enum PlayableSource {
-    /// rodio decodes this itself.
+    /// A file the user owns, wherever it came from.
+    ///
+    /// The user's, which is the whole of what this variant means: if it will
+    /// not decode, that is worth reporting rather than quietly discarding.
     LocalFile(PathBuf),
-    /// rodio has no codec for this, so ffmpeg decodes it instead. Today that
-    /// means Opus; the same path will carry YouTube streams.
-    Transcoded(PathBuf),
     /// A disposable copy the app made of a stream it already played.
     ///
-    /// Decoded exactly like [`Self::Transcoded`]; the distinction is
+    /// Decoded exactly like [`Self::LocalFile`]; the distinction is
     /// *provenance*. This file is the app's own, it is worth nothing, and
     /// it can be wrong -- a copy written from an interrupted stream decodes
     /// happily until it reaches the damage. Naming it separately is what
     /// lets the player throw it away and go back to the provider instead of
     /// treating a track as unplayable forever.
     Cached(PathBuf),
-    /// A remote audio stream, decoded by ffmpeg.
+    /// A remote audio stream.
     ///
-    /// Always ffmpeg, never rodio: rodio's decoder needs `Read + Seek` and a
-    /// URL is not seekable, so the container format is irrelevant here. (The
+    /// The container format is irrelevant here, as it now is everywhere. (The
     /// preference for m4a still matters when *downloading*, where it avoids a
     /// re-encode.)
     ///
@@ -78,14 +82,15 @@ pub async fn get_playable_source(
             .ok_or_else(|| format!("Unknown track source \"{}\".", track.source))?;
 
         // Downloaded: there is a real file, so it plays exactly like a local
-        // track and needs no network at all.
+        // track and needs no network at all. The user asked for this one to be
+        // kept, so it is theirs -- not something to discard on a bad decode.
         if let Some(path) = track.local_path.as_deref() {
-            return Ok(decode_route(PathBuf::from(path)));
+            return Ok(PlayableSource::LocalFile(PathBuf::from(path)));
         }
 
         // Cached from an earlier play: the bytes are already on disk, so this
-        // needs no network at all -- and seeking backwards through it becomes
-        // instant, because a file seeks natively.
+        // needs no network at all -- and seeking backwards through it is a
+        // local seek rather than another trip to the provider.
         let cached = track
             .remote_id
             .as_deref()
@@ -147,19 +152,10 @@ pub async fn get_playable_source(
         // corrupted row rather than an expected condition.
         .ok_or("That track has no file path recorded.")?;
 
-    Ok(decode_route(PathBuf::from(path)))
-}
-
-/// Decides *how* a file is decoded, not just what to play.
-///
-/// The one place that knowledge lives, which is what keeps the engine dumb --
-/// and why a downloaded remote track needs no special handling at all.
-fn decode_route(path: PathBuf) -> PlayableSource {
-    if crate::transcode::needs_transcode(&path) {
-        PlayableSource::Transcoded(path)
-    } else {
-        PlayableSource::LocalFile(path)
-    }
+    // No route to choose any more. ffmpeg decodes every format this app plays,
+    // so the extension no longer decides anything -- which is also why a
+    // downloaded remote track needs no special handling here.
+    Ok(PlayableSource::LocalFile(PathBuf::from(path)))
 }
 
 #[cfg(test)]
@@ -206,18 +202,22 @@ mod tests {
         }
     }
 
-    /// The seam decides the decode route, so an Opus file must come back
-    /// marked for ffmpeg rather than handed to rodio.
+    /// Opus is no longer a special case, and that is the point.
+    ///
+    /// It used to need its own route because rodio had no codec for it, and
+    /// the sniffing that decided which files took that route was a standing
+    /// source of "this one format does not play". ffmpeg decodes every format
+    /// this app plays, so an Opus file resolves exactly like an MP3.
     #[tokio::test]
-    async fn an_opus_track_resolves_to_the_transcode_route() {
+    async fn an_opus_track_is_no_longer_a_special_case() {
         let resolved = get_playable_source(&track("local", "present", Some(r"D:\a.opus")), None, &StreamUrlCache::default(), None, Encoding::Preferred)
             .await
             .expect("should resolve");
 
-        assert!(
-            matches!(resolved, PlayableSource::Transcoded(_)),
-            "opus has no rodio codec, got {resolved:?}"
-        );
+        match resolved {
+            PlayableSource::LocalFile(path) => assert_eq!(path, PathBuf::from(r"D:\a.opus")),
+            other => panic!("opus should resolve like any other file, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -248,13 +248,21 @@ mod tests {
         }
     }
 
-    /// A downloaded Opus file still routes through ffmpeg.
+    /// A downloaded Opus track plays from its file, not from the network.
+    ///
+    /// The file is what matters here: a downloaded track must never go back to
+    /// the provider, whatever its format. Being `LocalFile` rather than
+    /// `Cached` also says it is the user's -- a bad decode is worth reporting,
+    /// not silently discarding the way a cache copy would be.
     #[tokio::test]
-    async fn a_downloaded_opus_track_still_transcodes() {
+    async fn a_downloaded_opus_track_plays_from_disk() {
         let track = remote_track("youtube", "downloaded", Some(r"D:\yt\abc.opus"), Some(YT_URL));
         let resolved = get_playable_source(&track, None, &StreamUrlCache::default(), None, Encoding::Preferred).await.expect("resolves");
 
-        assert!(matches!(resolved, PlayableSource::Transcoded(_)));
+        match resolved {
+            PlayableSource::LocalFile(path) => assert_eq!(path, PathBuf::from(r"D:\yt\abc.opus")),
+            other => panic!("a downloaded file must play from disk, got {other:?}"),
+        }
     }
 
     #[tokio::test]
