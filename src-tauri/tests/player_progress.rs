@@ -4246,3 +4246,213 @@ async fn seeking_backwards_never_reports_the_old_position_again() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// An A-B loop returns to A, on time, and keeps doing it.
+///
+/// The timing is the point. The coordinator hears about position every 200 ms,
+/// so acting on the first tick reported past B would overshoot by up to that
+/// much -- 200 ms of the next phrase, every time round a practice loop. It
+/// instead arms a deadline computed from the position, which is what this
+/// measures: not "did it loop" but "did it loop *when it said*".
+#[tokio::test]
+async fn an_ab_loop_returns_to_its_start_on_time() {
+    let _guard = TIMING.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-ab-loop");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let path = base.join("track.wav");
+    write_wav_secs(&path, 60);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+         VALUES ('local', 'Loopable', ?, 'present', 60)",
+    )
+    .bind(path.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    handle.send(PlayerCommand::SetTrimSilence(false)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    // A two-second window, starting well ahead of where playback is.
+    handle.send(PlayerCommand::Seek(10.0)).unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    handle
+        .send(PlayerCommand::SetLoopPoints(Some((10.0, 12.0))))
+        .unwrap();
+
+    // Long enough for several laps of a two-second loop.
+    tokio::time::sleep(Duration::from_secs(9)).await;
+
+    let seen = recorder.0.progress.lock().unwrap().clone();
+    let inside: Vec<f64> = seen
+        .iter()
+        .copied()
+        .filter(|&p| p >= 9.0)
+        .collect();
+
+    assert!(
+        inside.len() > 10,
+        "only {} positions were reported at all",
+        inside.len()
+    );
+
+    // How often playback was *reported* past B.
+    //
+    // Counted rather than measured as a worst case, because the coordinator
+    // hardens against a late deadline by closing the loop the moment it sees a
+    // position past B -- which caps the overshoot at one tick however the
+    // deadline behaves, and so makes a "furthest past B" threshold unable to
+    // tell the two apart.
+    //
+    // What still separates them is how *often* it happens. Closing on the
+    // deadline, no tick should ever land past B; closing on the tick, one does
+    // every lap. One is allowed for the rare schedule where the tick beats the
+    // timer.
+    let worst = inside.iter().copied().fold(0.0_f64, f64::max);
+    let past_b = inside.iter().filter(|&&p| p > 12.0).count();
+    eprintln!("furthest reported: {worst:.3}s (B = 12.0), ticks past B: {past_b}");
+    assert!(
+        past_b <= 1,
+        "{past_b} reported positions were past B (furthest {worst:.3}s) -- the \
+         loop is closing on the progress tick rather than on its own deadline"
+    );
+
+    // And it went round more than once, rather than looping once and stopping.
+    let laps = seen.windows(2).filter(|w| w[1] < w[0] - 0.5).count();
+    eprintln!("laps: {laps}");
+    assert!(laps >= 2, "only {laps} lap(s) in nine seconds of a 2s loop");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The sleep timer pauses, and pauses rather than stops.
+///
+/// The distinction is the whole feature: the point is to fall asleep to music,
+/// and waking to a player that has forgotten where it was is a worse morning
+/// than one that simply resumes. So this asserts both that the audio stopped
+/// and that the position survived it.
+#[tokio::test]
+async fn the_sleep_timer_pauses_where_it_was() {
+    let _guard = TIMING.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-sleep-timer");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let path = base.join("track.wav");
+    write_wav_secs(&path, 60);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+         VALUES ('local', 'Lullaby', ?, 'present', 60)",
+    )
+    .bind(path.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    handle.send(PlayerCommand::SetTrimSilence(false)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    handle
+        .send(PlayerCommand::SetSleepTimer(Some(
+            music_app_lib::player::Sleep::In(2.0),
+        )))
+        .unwrap();
+
+    // Past the deadline, with room for the pause to land.
+    tokio::time::sleep(Duration::from_millis(2_800)).await;
+    let at_pause = recorder
+        .0
+        .progress
+        .lock()
+        .unwrap()
+        .last()
+        .copied()
+        .unwrap_or(0.0);
+
+    // Silence for a good while. If it were still playing, positions would keep
+    // arriving and the last one would have moved on.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let later = recorder
+        .0
+        .progress
+        .lock()
+        .unwrap()
+        .last()
+        .copied()
+        .unwrap_or(0.0);
+
+    eprintln!("position at the deadline: {at_pause:.2}s, three seconds later: {later:.2}s");
+
+    assert!(
+        (later - at_pause).abs() < 0.3,
+        "playback carried on: {at_pause:.2}s became {later:.2}s"
+    );
+
+    // Paused, not stopped.
+    //
+    // Read from the player's own state rather than from the positions above:
+    // those are a *history*, and stopping leaves the last one sitting in it
+    // exactly as pausing does. Asserting on them looks like it checks this and
+    // does not -- replacing the pause with a full stop passes.
+    let last = recorder
+        .0
+        .states
+        .lock()
+        .unwrap()
+        .last()
+        .map(|status| (status.state, status.track_id))
+        .expect("at least one state");
+
+    eprintln!("final state: {:?}, track {:?}", last.0, last.1);
+    assert_eq!(
+        last.0,
+        music_app_lib::player::PlaybackState::Paused,
+        "the sleep timer stopped playback instead of pausing it, which throws \
+         away where the listener had got to"
+    );
+    assert_eq!(last.1, Some(id), "the track was cleared from the bar");
+
+    let _ = std::fs::remove_dir_all(&base);
+}

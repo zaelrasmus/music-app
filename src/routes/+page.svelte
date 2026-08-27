@@ -17,6 +17,8 @@
     import { covers } from "$lib/covers.svelte";
     import { ytDlp } from "$lib/ytdlp.svelte";
     import { downloads } from "$lib/downloads.svelte";
+    import { extras } from "$lib/extras.svelte";
+    import { waveform } from "$lib/waveform.svelte";
 
     import LibraryView from "$components/library-view.svelte";
     import ProviderSearch from "$components/provider-search.svelte";
@@ -45,6 +47,7 @@
         covers.load();
         ytDlp.refresh();
         downloads.refresh();
+        extras.restore().then(() => waveform.reload(player.trackId));
         player.restorePreferences().then(() => player.restorePlayback());
         equalizer.restore();
 

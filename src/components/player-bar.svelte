@@ -9,6 +9,10 @@
     import { invoke } from "@tauri-apps/api/core";
     import { cacheStore } from "$lib/cache.svelte";
     import { lyricsStore } from "$lib/lyrics.svelte";
+    import { abLoop } from "$lib/ab-loop.svelte";
+    import { waveform } from "$lib/waveform.svelte";
+    import { extras } from "$lib/extras.svelte";
+    import SleepTimer from "$components/sleep-timer.svelte";
     import ListMusicIcon from "@lucide/svelte/icons/list-music";
     import Mic2Icon from "@lucide/svelte/icons/mic-2";
     import PlayIcon from "@lucide/svelte/icons/play";
@@ -335,6 +339,9 @@
                 disabled={!seekable}
                 label="Seek"
                 valueText="{formatTime(player.displaySecs)} of {formatTime(totalSecs)}"
+                peaks={extras.waveform ? waveform.peaks : null}
+                loop={extras.abLoop ? abLoop.points : null}
+                loopPending={extras.abLoop ? abLoop.pending : null}
                 onScrub={(v) => player.scrubTo(v)}
                 onCommit={(v) => player.commitScrub(v)}
             />
@@ -386,6 +393,42 @@
             onScrub={(v) => player.previewVolume(v)}
             onCommit={(v) => player.setVolume(v)}
         />
+
+        {#if extras.abLoop}
+        <!--
+          One button, three states: mark A, mark B, clear.
+
+          Sequential rather than three controls, because someone setting a loop
+          is listening rather than looking — the gesture is a press at the start
+          of the phrase and another at the end.
+        -->
+        <button
+            type="button"
+            class="{ghost} {abLoop.active || abLoop.pending !== null ? on : off}"
+            aria-label={abLoop.active
+                ? "Clear the loop"
+                : abLoop.pending !== null
+                  ? "Set the end of the loop"
+                  : "Set the start of a loop"}
+            title={abLoop.active
+                ? `Looping ${formatTime(abLoop.points![0])}–${formatTime(abLoop.points![1])} — click to clear`
+                : abLoop.pending !== null
+                  ? `A set at ${formatTime(abLoop.pending)} — click again to set B`
+                  : "Loop a section (A-B)"}
+            aria-pressed={abLoop.active}
+            disabled={!seekable}
+            onclick={() => abLoop.mark()}
+        >
+            <RepeatIcon class="size-4" />
+            {#if abLoop.pending !== null && !abLoop.active}
+                <span class="absolute mt-4 text-[8px] leading-none font-bold">A</span>
+            {/if}
+        </button>
+        {/if}
+
+        {#if extras.sleepTimer}
+            <SleepTimer />
+        {/if}
 
         <button
             type="button"

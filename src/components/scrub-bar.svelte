@@ -39,6 +39,21 @@
          * it harder to grab.
          */
         compact?: boolean;
+        /**
+         * The track's shape, 0–255 per column.
+         *
+         * When given, the flat track is drawn as a waveform instead. Same
+         * control, same hit area, same keyboard handling — a waveform you
+         * cannot drag is a picture, and this one is the transport.
+         *
+         * Absent for a stream, which has no file to measure, and for the
+         * volume slider, which has no shape to have.
+         */
+        peaks?: Uint8Array | null;
+        /** An A-B loop to mark out, as fractions of `max`. */
+        loop?: [number, number] | null;
+        /** A half-built loop: A is marked, B is not. */
+        loopPending?: number | null;
         class?: string;
     }
 
@@ -52,8 +67,50 @@
         step = 1,
         valueText,
         compact = false,
+        peaks = null,
+        loop = null,
+        loopPending = null,
         class: className = "",
     }: Props = $props();
+
+    /**
+     * The waveform as one SVG path.
+     *
+     * One element rather than four hundred, because this is redrawn whenever
+     * the layout changes and a div per column is a lot of nodes to keep alive
+     * behind a bar nobody is looking at. Built once per track: the *played*
+     * portion is coloured by clipping a second copy, so moving the playhead
+     * changes one rectangle's width and never touches this.
+     *
+     * Drawn into a fixed 0–100 box and stretched with
+     * `preserveAspectRatio="none"`, so the same path fits any bar width.
+     */
+    const wave = $derived.by(() => {
+        if (!peaks?.length) return null;
+
+        const columns = peaks.length;
+        // A little under one unit wide, which leaves a hairline gap between
+        // columns at any bar width.
+        const width = 0.72;
+        let path = "";
+
+        for (let i = 0; i < columns; i++) {
+            // A floor, so a quiet passage is a thin line rather than a hole in
+            // the bar — the shape should read as continuous even where the
+            // music nearly stops.
+            const height = Math.max(6, (peaks[i] / 255) * 100);
+            const top = (100 - height) / 2;
+            path += `M${(i * 100) / columns} ${top}h${(width * 100) / columns}v${height}h${(-width * 100) / columns}z`;
+        }
+
+        return path;
+    });
+
+    const loopFrom = $derived(loop && max > 0 ? (loop[0] / max) * 100 : null);
+    const loopTo = $derived(loop && max > 0 ? (loop[1] / max) * 100 : null);
+    const loopMark = $derived(
+        loopPending !== null && max > 0 ? (loopPending / max) * 100 : null,
+    );
 
     let track = $state<HTMLDivElement | null>(null);
     let dragging = $state(false);
@@ -152,22 +209,71 @@
     onpointerleave={() => (hovering = false)}
     onkeydown={key}
 >
-    <div
-        class="bg-muted relative w-full overflow-hidden rounded-full transition-[height] duration-100 {active
-            ? compact
-                ? 'h-1'
-                : 'h-1.5'
-            : compact
-              ? 'h-[3px]'
-              : 'h-1'}"
-    >
+    {#if wave}
+        <!--
+          The waveform *is* the track. It fills the control's whole 16px rather
+          than sitting behind a 1px bar, because a shape drawn at one pixel is
+          not a shape — and the point of it is to show where the song goes
+          quiet, where it breaks and where it lands.
+        -->
+        <svg
+            class="pointer-events-none h-full w-full"
+            viewBox="0 0 100 100"
+            preserveAspectRatio="none"
+            aria-hidden="true"
+        >
+            <defs>
+                <!-- One rectangle decides how much is coloured, so moving the
+                     playhead never rebuilds the path. -->
+                <clipPath id="played-{label}">
+                    <rect x="0" y="0" width={fraction * 100} height="100" />
+                </clipPath>
+            </defs>
+
+            <path d={wave} class="fill-muted-foreground/30" />
+            <path
+                d={wave}
+                clip-path="url(#played-{label})"
+                class={active ? "fill-primary" : "fill-foreground/75"}
+            />
+        </svg>
+    {:else}
         <div
-            class="h-full rounded-full {active ? 'bg-primary' : 'bg-foreground/55'} {dragging
-                ? ''
-                : 'transition-[width,background-color] duration-100'}"
-            style="width: {fraction * 100}%"
+            class="bg-muted relative w-full overflow-hidden rounded-full transition-[height] duration-100 {active
+                ? compact
+                    ? 'h-1'
+                    : 'h-1.5'
+                : compact
+                  ? 'h-[3px]'
+                  : 'h-1'}"
+        >
+            <div
+                class="h-full rounded-full {active ? 'bg-primary' : 'bg-foreground/55'} {dragging
+                    ? ''
+                    : 'transition-[width,background-color] duration-100'}"
+                style="width: {fraction * 100}%"
+            ></div>
+        </div>
+    {/if}
+
+    <!--
+      The loop, marked on the bar it applies to.
+
+      A loop the user cannot see the ends of is one they have to discover by
+      listening, and the whole gesture is "press at the start, press at the
+      end" — so the marks are the feedback that the presses landed.
+    -->
+    {#if loopFrom !== null && loopTo !== null}
+        <div
+            class="bg-primary/20 border-primary/70 pointer-events-none absolute inset-y-0 border-x"
+            style="left: {loopFrom}%; width: {Math.max(loopTo - loopFrom, 0.4)}%"
         ></div>
-    </div>
+    {:else if loopMark !== null}
+        <div
+            class="bg-primary pointer-events-none absolute inset-y-0 w-[2px]"
+            style="left: {loopMark}%"
+        ></div>
+    {/if}
 
     <!-- The handle only exists while it is useful. A permanent dot on a 1px
          track is the single easiest way to make a player look cluttered. -->

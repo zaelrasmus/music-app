@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "svelte-sonner";
+import { sleepStore } from "$lib/sleep.svelte";
+import { abLoop } from "$lib/ab-loop.svelte";
+import { waveform } from "$lib/waveform.svelte";
 import { readSetting, writeSetting } from "$lib/settings.svelte";
 import { cacheStore } from "$lib/cache.svelte";
 import { loudnessStore } from "$lib/loudness.svelte";
@@ -44,6 +47,12 @@ export type PlayerStatus = {
    */
   trackGainDb: number | null;
   /** Whether an unheard stream is measured before it starts playing. */
+  /** Seconds until the sleep timer pauses, at the moment this was sent. */
+  sleepInSecs: number | null;
+  /** The timer is waiting for the track to end rather than for a clock. */
+  sleepAfterTrack: boolean;
+  /** The A-B loop, in seconds from the start of the track. */
+  loopPoints: [number, number] | null;
 };
 
 export type PlayerProgress = {
@@ -144,6 +153,10 @@ class PlayerStore {
       this.trimSilence = s.trimSilence;
       this.trackGainDb = s.trackGainDb;
       this.stalled = s.stalled;
+      // Both are owned by the coordinator and only mirrored here, so what is
+      // drawn is always what will actually happen.
+      sleepStore.sync(s.sleepInSecs, s.sleepAfterTrack);
+      abLoop.sync(s.loopPoints);
 
       // Leaving a track is when one most often becomes cached, so this is the
       // moment the badges elsewhere go stale.
@@ -161,6 +174,7 @@ class PlayerStore {
         // longer playing, and leaving the flag set would freeze the bar.
         this.scrubbing = false;
         void cacheStore.refreshCached();
+        void waveform.load(s.trackId);
         // The background pass may have measured things since the last track.
         void loudnessStore.refresh();
         // The track just left may have become a history entry; the backend

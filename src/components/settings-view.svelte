@@ -7,6 +7,7 @@
     import EqualizerSettings from "$components/equalizer-settings.svelte";
     import GaplessSettings from "$components/gapless-settings.svelte";
     import SilenceSettings from "$components/silence-settings.svelte";
+    import ExtrasSettings from "$components/extras-settings.svelte";
     import ExtractorSettings from "$components/extractor-settings.svelte";
     import TagManager from "$components/tag-manager.svelte";
     import { library } from "$lib/library.svelte";
@@ -279,6 +280,7 @@
         <EqualizerSettings />
         <GaplessSettings />
         <SilenceSettings />
+        <ExtrasSettings />
 
         <CacheSettings />
 

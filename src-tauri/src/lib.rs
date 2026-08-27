@@ -37,6 +37,7 @@ mod tags;
 mod transcode;
 mod tracks;
 mod updater;
+mod waveform;
 mod youtube;
 
 use tauri::Manager;
@@ -357,6 +358,9 @@ pub fn run() {
             player::set_normalize,
             player::set_gapless,
             player::set_trim_silence,
+            player::set_sleep_timer,
+            player::set_loop_points,
+            waveform::track_waveform,
             player::set_target_lufs,
             player::set_equalizer_enabled,
             player::set_equalizer_bands,

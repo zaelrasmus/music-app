@@ -36,6 +36,13 @@ const RESTART_THRESHOLD: Duration = Duration::from_secs(3);
 /// covered by counting a natural end regardless.
 const PLAY_COUNTS_AFTER: Duration = Duration::from_secs(30);
 
+/// The shortest useful A-B loop.
+///
+/// Below this the jump back arrives before the phrase does and the loop is a
+/// stutter rather than a section. It also rules out a zero-length loop, whose
+/// deadline would be met the instant it was armed, forever.
+const MIN_LOOP: Duration = Duration::from_millis(500);
+
 /// How much of a track must have played before an abandoned listen is worth
 /// fetching a complete copy of.
 ///
@@ -230,6 +237,18 @@ pub struct PlayerStatus {
     /// keeping up. Distinct from loading, which is a track that has not
     /// started yet.
     pub stalled: bool,
+    /// Seconds until the sleep timer pauses playback, at the moment this was
+    /// sent. `None` when no timer is set.
+    ///
+    /// A snapshot rather than a running count: state is emitted on change, and
+    /// sending one of these a second to move a number would be exactly the
+    /// churn `PlayerProgress` exists to avoid. The UI counts down from it.
+    pub sleep_in_secs: Option<f64>,
+    /// Set when the timer is waiting for the current track to finish rather
+    /// than for a clock.
+    pub sleep_after_track: bool,
+    /// The A-B loop, in seconds from the start of the track.
+    pub loop_points: Option<(f64, f64)>,
 }
 
 /// Sent frequently while playing, so it is deliberately small and separate
@@ -279,6 +298,21 @@ pub struct QueueState {
     pub context_name: Option<String>,
     /// Context tracks beyond the preview, so the UI can say "and N more".
     pub context_remaining: usize,
+}
+
+/// When the sleep timer should act.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "secs")]
+pub enum Sleep {
+    /// After this many seconds from now.
+    In(f64),
+    /// When the track playing when it was set finishes.
+    ///
+    /// Its own variant rather than "however long is left", because those are
+    /// different promises: a track can be paused, seeked or skipped, and a
+    /// duration computed once would then stop the music in the middle of
+    /// something.
+    EndOfTrack,
 }
 
 #[derive(Debug)]
@@ -339,6 +373,15 @@ pub enum PlayerCommand {
     SetNormalize(bool),
     SetGapless(bool),
     SetTrimSilence(bool),
+    /// Pause after a delay, or at the end of the track. `None` cancels.
+    SetSleepTimer(Option<Sleep>),
+    /// Repeat a section of the current track. `None` clears it.
+    ///
+    /// Seconds from the start, `a` before `b`. Belongs to the track it was set
+    /// on and is dropped when that track is left -- carrying "loop 30s to 45s"
+    /// into a song where those seconds mean something else would be a
+    /// surprising thing to inherit.
+    SetLoopPoints(Option<(f64, f64)>),
     /// Whether the equaliser is in circuit at all.
     SetEqualizerEnabled(bool),
     /// Every band at once, in dB, low to high.
@@ -514,6 +557,21 @@ struct Coordinator<E: PlayerEvents> {
     /// contains, and cutting it short would be playing less of the file than
     /// the file holds.
     heard_audio: bool,
+    /// When the sleep timer fires, as an instant rather than a duration, so
+    /// re-arming it on every progress tick is impossible by construction.
+    sleep_at: Option<tokio::time::Instant>,
+    /// The sleep timer is waiting for this track to end.
+    sleep_after_track: bool,
+    /// The A-B loop for the track playing, in seconds.
+    loop_points: Option<(f64, f64)>,
+    /// When playback should jump back to A.
+    ///
+    /// Recomputed from every progress tick rather than set once, so it
+    /// self-corrects and a seek out of the loop simply stops renewing it. The
+    /// alternative -- acting on the tick that first reports a position past B
+    /// -- overshoots by however long the gap between ticks is, which is 200 ms
+    /// of the next phrase every time round a practice loop.
+    loop_at: Option<tokio::time::Instant>,
     /// How long the track playing runs for, when it is known.
     ///
     /// Only to decide *when* to queue the next one. Early enough that ffmpeg
@@ -626,6 +684,10 @@ pub fn spawn<E: PlayerEvents>(
             trim_silence: true,
             enqueued: None,
             heard_audio: false,
+            sleep_at: None,
+            sleep_after_track: false,
+            loop_points: None,
+            loop_at: None,
             loaded_duration: None,
             engine: Arc::new(engine),
             loads: loads_tx,
@@ -673,9 +735,92 @@ impl<E: PlayerEvents> Coordinator<E> {
                 Some(outcome) = loads.recv() => self.handle_load(outcome).await,
                 Some(ready) = prepares.recv() => self.keep_prepared(ready),
                 Some(level) = levels.recv() => self.apply_measured_level(level).await,
+                // Two deadlines, both absolute.
+                //
+                // `wait_until` parks forever on `None`, which is what lets a
+                // branch that is usually inactive sit in a `select!` without a
+                // busy loop -- and because the instants are absolute, rebuilding
+                // these futures on every pass through the loop costs nothing and
+                // cannot drift.
+                () = wait_until(self.loop_at) => self.jump_to_loop_start().await,
+                () = wait_until(self.sleep_at) => self.fall_asleep().await,
                 else => break,
             }
         }
+    }
+
+    /// The B end of an A-B loop.
+    async fn jump_to_loop_start(&mut self) {
+        self.loop_at = None;
+
+        // Armed from a progress tick, and ticks stop arriving when playback
+        // does -- but a timer already in flight when the user hits pause would
+        // otherwise fire and yank the position back under them.
+        let Some((start, _)) = self.loop_points else {
+            return;
+        };
+        if self.state != PlaybackState::Playing {
+            return;
+        }
+
+        // Through the ordinary seek path rather than a private shortcut: it is
+        // the one place that renames the decode, drops whatever was queued
+        // behind the track and tells the UI. A loop that seeked any other way
+        // would be a second implementation of all of that, silently drifting
+        // from the real one.
+        self.handle_command(PlayerCommand::Seek(start)).await;
+    }
+
+    /// The sleep timer.
+    ///
+    /// Pauses rather than stops: the point is to fall asleep to music, and
+    /// waking up to a player that has forgotten where it was is a worse
+    /// morning than one that simply resumes.
+    async fn fall_asleep(&mut self) {
+        self.sleep_at = None;
+        self.sleep_after_track = false;
+
+        if self.state == PlaybackState::Playing && self.report(self.engine.pause()) {
+            self.state = PlaybackState::Paused;
+        }
+        self.emit_state();
+    }
+
+    /// Keeps the loop's deadline in step with where playback actually is.
+    ///
+    /// Called from every progress tick. Inside the loop it re-arms; outside it
+    /// -- because the user seeked away, or the points were cleared -- it
+    /// disarms, which is what stops a stale deadline dragging playback back
+    /// into a section nobody is listening to any more.
+    fn arm_loop(&mut self, position: f64) {
+        let Some((start, end)) = self.loop_points else {
+            self.loop_at = None;
+            return;
+        };
+
+        // Past B, but only just.
+        //
+        // The deadline and the progress tick that reports passing B are
+        // scheduled for almost the same moment, and the timer normally wins.
+        // When it does not -- a stalled runtime, a machine under load -- this
+        // sees a position past the end and would read it as the user having
+        // seeked away, silently ending a loop nobody asked to end. Closing it
+        // immediately instead costs a few milliseconds of overshoot on a rare
+        // schedule and never loses the loop.
+        if position >= end && position - end < MIN_LOOP.as_secs_f64() {
+            self.loop_at = Some(tokio::time::Instant::now());
+            return;
+        }
+
+        // Genuinely outside it: the user has left. Jumping them back in would
+        // be the loop grabbing them rather than holding them.
+        if position < start || position >= end {
+            self.loop_at = None;
+            return;
+        }
+
+        let remaining = Duration::from_secs_f64((end - position).max(0.0));
+        self.loop_at = Some(tokio::time::Instant::now() + remaining);
     }
 
     /// Files a decoder that finished preparing.
@@ -853,6 +998,35 @@ impl<E: PlayerEvents> Coordinator<E> {
             // No decode restart and no gap: the change lands on the next frame.
             PlayerCommand::SetTrimSilence(on) => self.trim_silence = on,
 
+            PlayerCommand::SetSleepTimer(sleep) => {
+                match sleep {
+                    Some(Sleep::In(secs)) => {
+                        self.sleep_at = Some(
+                            tokio::time::Instant::now()
+                                + Duration::from_secs_f64(secs.max(0.0)),
+                        );
+                        self.sleep_after_track = false;
+                    }
+                    Some(Sleep::EndOfTrack) => {
+                        self.sleep_at = None;
+                        self.sleep_after_track = true;
+                    }
+                    None => {
+                        self.sleep_at = None;
+                        self.sleep_after_track = false;
+                    }
+                }
+                self.emit_state();
+            }
+
+            PlayerCommand::SetLoopPoints(points) => {
+                // Ordered and non-empty, or it is not a loop. A zero-length
+                // one would fire its own deadline forever.
+                self.loop_points = points.filter(|(a, b)| b - a >= MIN_LOOP.as_secs_f64());
+                self.arm_loop(self.last_position.as_secs_f64());
+                self.emit_state();
+            }
+
             PlayerCommand::SetGapless(on) => {
                 self.gapless = on;
                 // Nothing is un-queued. Whatever is already appended plays as
@@ -990,6 +1164,20 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // Reaching the end counts however short the track was.
                 self.record_play();
 
+                // "Stop at the end of this track" means this one, and it has
+                // just ended. Checked before the handover below, because a
+                // gapless handover has *already* started the next track --
+                // waiting until after it would be one track too late.
+                if self.sleep_after_track {
+                    self.sleep_after_track = false;
+                    self.loop_points = None;
+                    self.loop_at = None;
+                    self.halt();
+                    self.emit_state();
+                    self.emit_queue().await;
+                    return;
+                }
+
                 // A track that was seeked in reaches its end having written
                 // nothing: the decode never covered it from the start. That is
                 // not an abandonment, so only this notices.
@@ -1041,6 +1229,10 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // one about *this* track from before the last seek.
                 if progress_applies(epoch, generation, self.epoch, self.decode) {
                     self.last_position = position;
+                    // Re-armed from the authoritative position on every tick,
+                    // so the deadline tracks reality rather than accumulating
+                    // whatever it was set to once.
+                    self.arm_loop(position.as_secs_f64());
                     if position >= PLAY_COUNTS_AFTER {
                         self.record_play();
                     }
@@ -1206,6 +1398,12 @@ impl<E: PlayerEvents> Coordinator<E> {
         self.enqueued = None;
         self.heard_audio = false;
         self.loaded_duration = None;
+        // An A-B loop belongs to the track it was drawn on. Thirty to forty-five
+        // seconds is a chorus in one song and a verse in the next, so carrying
+        // it across would be a surprising thing to inherit -- and, in a track
+        // shorter than B, an inescapable one.
+        self.loop_points = None;
+        self.loop_at = None;
         self.epoch = self.next_epoch();
         // A fresh track is its own first decode, which is what the engine
         // gives it. Anything reported against a later generation belonged to
@@ -2217,6 +2415,11 @@ impl<E: PlayerEvents> Coordinator<E> {
             trim_silence: self.trim_silence,
             track_gain_db: self.track_gain_db,
             stalled: self.stalled,
+            sleep_in_secs: self
+                .sleep_at
+                .map(|at| at.duration_since(tokio::time::Instant::now()).as_secs_f64()),
+            sleep_after_track: self.sleep_after_track,
+            loop_points: self.loop_points,
         });
     }
 
@@ -2344,6 +2547,19 @@ struct LevelOutcome {
 /// is precisely why an epoch-only guard let the scrubber jump backwards.
 fn progress_applies(epoch: u64, generation: u64, current_epoch: u64, current_decode: u64) -> bool {
     epoch == current_epoch && generation == current_decode
+}
+
+/// Sleeps until an instant, or forever if there is not one.
+///
+/// `pending()` rather than a very long sleep: a branch that never completes is
+/// simply never chosen, where a far-future deadline is one more wakeup that
+/// has to be got right. The instants are absolute, so rebuilding this on every
+/// pass through the select loop costs nothing and cannot drift.
+async fn wait_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 fn reading_applies_now(loaded: Option<i64>, measured_for: i64, normalize: bool) -> bool {
@@ -2819,6 +3035,27 @@ pub async fn set_trim_silence(on: bool, player: State<'_, PlayerHandle>) -> Resu
 #[tauri::command]
 pub async fn set_shuffle(shuffle: bool, player: State<'_, PlayerHandle>) -> Result<(), String> {
     player.send(PlayerCommand::SetShuffle(shuffle))
+}
+
+/// Sets or cancels the sleep timer.
+#[tauri::command]
+pub async fn set_sleep_timer(
+    sleep: Option<Sleep>,
+    player: State<'_, PlayerHandle>,
+) -> Result<(), String> {
+    player.send(PlayerCommand::SetSleepTimer(sleep))
+}
+
+/// Sets or clears the A-B loop, in seconds from the start of the track.
+#[tauri::command]
+pub async fn set_loop_points(
+    points: Option<(f64, f64)>,
+    player: State<'_, PlayerHandle>,
+) -> Result<(), String> {
+    // Ordered here so the coordinator never has to wonder: a user who marked B
+    // before A meant a section, not a mistake.
+    let points = points.map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
+    player.send(PlayerCommand::SetLoopPoints(points))
 }
 
 #[tauri::command]
