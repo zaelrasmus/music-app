@@ -3,7 +3,6 @@
     import { autoScrollTowards, stopAutoScroll } from "$lib/autoscroll.svelte";
     import { scrollContainer } from "$lib/scroll-container.svelte";
     import { selection } from "$lib/selection.svelte";
-    import { Button } from "$components/ui/button";
     import TrackMenu from "$components/track-menu.svelte";
     import SourceBadge from "$components/source-badge.svelte";
     import TagChip from "$components/tag-chip.svelte";
@@ -14,14 +13,14 @@
     import { loudnessStore } from "$lib/loudness.svelte";
     import LoaderIcon from "@lucide/svelte/icons/loader-circle";
     import { player } from "$lib/player.svelte";
-    import { trackStore, type Track } from "$lib/tracks.svelte";
+    import type { Track } from "$lib/tracks.svelte";
+    import { metadataEditor } from "$lib/metadata.svelte";
     import { tagStore } from "$lib/tags.svelte";
     import { libraryView } from "$lib/library-view.svelte";
     import { historyStore } from "$lib/history.svelte";
     import PlayIcon from "@lucide/svelte/icons/play";
     import PauseIcon from "@lucide/svelte/icons/pause";
     import CheckIcon from "@lucide/svelte/icons/check";
-    import XIcon from "@lucide/svelte/icons/x";
     import GripVerticalIcon from "@lucide/svelte/icons/grip-vertical";
     import type { Snippet } from "svelte";
 
@@ -134,10 +133,6 @@
     /** This row's menu, so a right-click anywhere on it can raise it. */
     let menuOpen = $state(false);
 
-    let editing = $state(false);
-    let editTitle = $state("");
-    let editArtist = $state("");
-
     let tagging = $state(false);
     let newTag = $state("");
     let tagInput = $state<HTMLInputElement | null>(null);
@@ -153,17 +148,7 @@
     }
 
     function startEdit() {
-        editTitle = track.title;
-        editArtist = track.artist ?? "";
-        editing = true;
-    }
-
-    async function saveEdit() {
-        // An empty artist means "unknown", stored as NULL.
-        const artist = editArtist.trim() === "" ? null : editArtist;
-        if (await trackStore.updateMetadata(track.id, editTitle, artist)) {
-            editing = false;
-        }
+        void metadataEditor.edit(track);
     }
 
     function startTagging() {
@@ -355,40 +340,7 @@
             </span>
         {/if}
 
-        {#if editing}
-            <div class="flex min-w-0 flex-1 items-center gap-2 py-3">
-                <Input
-                    bind:value={editTitle}
-                    placeholder="Title"
-                    class="h-8"
-                    onkeydown={(e) => {
-                        if (e.key === "Enter") saveEdit();
-                        if (e.key === "Escape") editing = false;
-                    }}
-                />
-                <Input
-                    bind:value={editArtist}
-                    placeholder="Artist"
-                    class="h-8"
-                    onkeydown={(e) => {
-                        if (e.key === "Enter") saveEdit();
-                        if (e.key === "Escape") editing = false;
-                    }}
-                />
-                <Button variant="ghost" size="icon" aria-label="Save" onclick={saveEdit}>
-                    <CheckIcon />
-                </Button>
-                <Button
-                    variant="ghost"
-                    size="icon"
-                    aria-label="Cancel"
-                    onclick={() => (editing = false)}
-                >
-                    <XIcon />
-                </Button>
-            </div>
-        {:else}
-            <!--
+        <!--
               The whole title block is the play control. A real button, so it
               is reachable by keyboard and announces itself, rather than a
               click handler on the row that a screen reader never finds.
@@ -543,7 +495,6 @@
                     />
                 </span>
             </span>
-        {/if}
     </div>
 
     {#if tagging}

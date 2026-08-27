@@ -325,6 +325,29 @@ class LyricsStore {
     this.status = this.lyrics ? "ready" : "empty";
   }
 
+  /**
+   * Ask again for the track already loaded, because the question changed.
+   *
+   * Lyrics are keyed by a normalised (artist, title) pair rather than by track
+   * id — that is what lets one local file, a YouTube upload and a SoundCloud
+   * re-upload of the same song share one answer. So renaming a track asks a
+   * *different* question, and the answer on screen belongs to the old one.
+   *
+   * Usually this is the whole point of the rename: a track the app could not
+   * identify becomes one it can. Without this, the fix would appear to have
+   * done nothing until the song came round again.
+   *
+   * Same shape as `waveform.reload` and for the same reason — [`load`]
+   * short-circuits on the track it already answered for.
+   */
+  async reload() {
+    const trackId = this.#loadedFor;
+    if (trackId === null || !this.open) return;
+    this.#loadedFor = null;
+    this.#inFlight = null;
+    await this.load(trackId);
+  }
+
   /** Called when the playing track changes, from the component that mounts. */
   trackChanged(trackId: number | null) {
     if (trackId === this.#loadedFor) return;

@@ -1,0 +1,64 @@
+-- What the file's tags say, kept separately from what the user says.
+--
+-- This is the local-side mirror of the split 0007 made for remote tracks.
+-- There, `remote_title`/`remote_uploader` record what the provider said while
+-- `title`/`artist` are the editable display copy. Local rows never got the
+-- same treatment, so for them the file's tags and the user's edits were the
+-- same three columns -- and the scanner overwrites those columns from the file
+-- on every reparse:
+--
+--     ON CONFLICT(local_path) DO UPDATE SET title = excluded.title, ...
+--
+-- Unconditional. So a rename made in the app survives only until the file's
+-- mtime or size changes, at which point it is silently replaced by whatever
+-- the tag says. Nothing reports this; the row simply reverts.
+--
+-- Today that is dormant, because a library of files nobody retags never
+-- changes on disk. It stops being dormant the moment anything writes to the
+-- files -- an external tagger, a re-copy, or this app itself once the metadata
+-- editor can write tags back.
+--
+-- With these columns the scanner can tell the two apart: the display copy
+-- follows the file only while the two still agree, and a value the user
+-- changed is left alone for good. `scanner.rs` holds that rule.
+--
+-- NULL means "the file's tags have never been recorded", which is every
+-- existing row until it is next read. `file_title` is the one that decides,
+-- because it is the only one of the three that cannot legitimately be NULL --
+-- the scanner falls back to the file name, so a parsed file always has one.
+-- A NULL `file_artist` is a real answer ("this file has no artist tag") and
+-- could not be used as the sentinel.
+ALTER TABLE tracks ADD COLUMN file_title  TEXT;
+ALTER TABLE tracks ADD COLUMN file_artist TEXT;
+ALTER TABLE tracks ADD COLUMN file_album  TEXT;
+
+-- Deliberately NOT added to the FTS triggers in 0007. Searching is over what
+-- the user sees, and widening `AFTER UPDATE OF` would reindex the whole
+-- library on every rescan -- which is exactly the cost 0006 says in capitals
+-- that the column list exists to avoid.
+
+-- --- forcing the backfill ----------------------------------------------
+-- The columns have to be filled from a real read of each file, and the moment
+-- to do it is now, while `title`/`artist`/`album` are still known to have come
+-- from the file. Later is worse: once someone starts editing, there is no way
+-- to tell an edited row from an untouched one, and guessing wrong in either
+-- direction is a bug. Guessing "not edited" reverts their work; guessing
+-- "edited" freezes the row so a genuine retag can never take.
+--
+-- Copying the display copy across in SQL would be the cheap version of exactly
+-- that first guess. There are already local rows carrying an artist the files
+-- do not have -- `set_many_artists` exists precisely to put one there -- and
+-- asserting those came from the file is how this migration would ship with an
+-- instance of the bug it removes.
+--
+-- So the file is read instead. `file_mtime = -1` cannot match what `stat`
+-- reports, which puts every local row on the scanner's reparse path once; the
+-- upsert then writes the real mtime back and they are skipped as before. Same
+-- shape as 0012, which cleared `cover_checked` to re-examine MP4 artwork.
+--
+-- The cost is one lofty parse per local file on the next scan -- about a
+-- thousand here -- paid once, on a scan the user asked for.
+--
+-- Rows whose file is gone (`state = 'missing'`) simply stay at -1. They are
+-- not on disk to read, and if one ever comes back it reparses, which is right.
+UPDATE tracks SET file_mtime = -1 WHERE source = 'local';

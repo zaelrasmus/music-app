@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { toast } from "svelte-sonner";
 import { downloads } from "$lib/downloads.svelte";
 import { libraryView } from "$lib/library-view.svelte";
+import { lyricsStore } from "$lib/lyrics.svelte";
 
 export type Track = {
   id: number;
@@ -172,13 +173,24 @@ class TrackStore {
   }
 
   /**
-   * Renames a track for display. The original YouTube title and channel are
-   * kept separately by the backend and are not touched.
+   * Renames a track for display. What the provider said, and what the file's
+   * own tags say, are kept separately by the backend and are not touched.
+   *
+   * The lyrics reload is here rather than at the call site because this is the
+   * choke point: lyrics are keyed by (artist, title), so *any* rename changes
+   * which lyrics belong to the track, and a future caller that forgot would
+   * leave the panel showing the previous song's words.
    */
-  async updateMetadata(trackId: number, title: string, artist: string | null) {
+  async updateMetadata(
+    trackId: number,
+    title: string,
+    artist: string | null,
+    album: string | null,
+  ) {
     try {
-      await invoke("update_track_metadata", { trackId, title, artist });
+      await invoke("update_track_metadata", { trackId, title, artist, album });
       await this.load();
+      await lyricsStore.reload();
       return true;
     } catch (e) {
       toast.error(String(e));

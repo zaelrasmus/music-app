@@ -419,15 +419,57 @@ async fn scan_folder(
             // is what turns a hard error into simply leaving the row alone.
             sqlx::query(
                 "INSERT INTO tracks (
-                     source, title, artist, album, duration_secs,
+                     source, title, artist, album,
+                     file_title, file_artist, file_album,
+                     duration_secs,
                      local_path, file_mtime, file_size, folder_id,
                      last_seen_scan, state, cover_key, cover_checked
                  )
-                 VALUES ('local', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'present', ?, ?)
+                 VALUES ('local', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'present', ?, ?)
                  ON CONFLICT(local_path) DO UPDATE SET
-                     title          = excluded.title,
-                     artist         = excluded.artist,
-                     album          = excluded.album,
+                     -- The display copy follows the file only while the two
+                     -- still agree. Once they differ the user has edited it,
+                     -- and a reparse must leave it alone -- otherwise the
+                     -- edit is silently reverted the next time anything
+                     -- touches the file. See 0024.
+                     --
+                     -- `tracks.*` is the row as it stands: SQLite evaluates
+                     -- every SET expression against the pre-update values, so
+                     -- the `file_*` assignments below cannot affect these
+                     -- comparisons no matter what order they are written in.
+                     --
+                     -- `IS`, not `=`: artist and album are nullable, and
+                     -- `NULL = NULL` is NULL, which would read as \"diverged\"
+                     -- for every file with no artist tag -- 1003 of them here.
+                     --
+                     -- The NULL `file_title` arm is the backfill. A row whose
+                     -- tags have never been recorded keeps whatever it has and
+                     -- simply learns what the file says, because at that point
+                     -- there is nothing to compare against yet.
+                     title          = CASE
+                         WHEN tracks.file_title IS NULL          THEN tracks.title
+                         WHEN tracks.title IS tracks.file_title  THEN excluded.file_title
+                         ELSE tracks.title
+                     END,
+                     artist         = CASE
+                         WHEN tracks.file_title IS NULL           THEN tracks.artist
+                         WHEN tracks.artist IS tracks.file_artist THEN excluded.file_artist
+                         ELSE tracks.artist
+                     END,
+                     album          = CASE
+                         WHEN tracks.file_title IS NULL         THEN tracks.album
+                         WHEN tracks.album IS tracks.file_album THEN excluded.file_album
+                         ELSE tracks.album
+                     END,
+                     -- Unconditional, and the reason the arms above can be:
+                     -- what the file says is recorded even when the display
+                     -- copy ignores it, so the next scan compares against the
+                     -- tag that is actually in the file rather than a stale one.
+                     file_title     = excluded.file_title,
+                     file_artist    = excluded.file_artist,
+                     file_album     = excluded.file_album,
+                     -- Not guarded: duration is a property of the audio, not
+                     -- a thing anyone types.
                      duration_secs  = excluded.duration_secs,
                      -- COALESCE, not a plain assignment: a rescan that cannot
                      -- read the artwork this time (no store, unreadable image)
@@ -443,6 +485,12 @@ async fn scan_folder(
                      state          = 'present'
                  WHERE tracks.source = 'local'",
             )
+            // Bound twice: on an insert the display copy and the recorded tag
+            // start out as the same thing, which is what makes a brand new row
+            // count as "not diverged".
+            .bind(&metadata.title)
+            .bind(&metadata.artist)
+            .bind(&metadata.album)
             .bind(&metadata.title)
             .bind(&metadata.artist)
             .bind(&metadata.album)
@@ -782,6 +830,38 @@ mod tests {
         std::fs::write(path, bytes).expect("should write test wav");
     }
 
+    /// Gives a file real tags, so a test can change what the file *says*
+    /// rather than only when it was written.
+    ///
+    /// Values of differing lengths across two calls are what guarantee the
+    /// rescan: the scanner compares mtime *and* size, and a same-length
+    /// retag on a fast clock can leave both looking untouched.
+    ///
+    /// The audio is rewritten from scratch every time rather than retagged in
+    /// place, because **lofty 0.25 corrupts a WAV on the third ID3v2 rewrite**
+    /// -- measured: writes one and two read back correctly, and after the
+    /// third the file has no ID3 chunk at all and the scanner falls back to
+    /// the file name. MP3 survives repeated rewrites unharmed, which is why
+    /// this is a test-fixture problem here rather than a product one; it is a
+    /// hard constraint on writing tags back to files, which is phase 4.
+    fn write_tags(path: &Path, title: &str, artist: &str, album: &str) {
+        use lofty::config::WriteOptions;
+        use lofty::tag::{ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
+
+        write_wav(path);
+
+        let mut tag = Tag::new(TagType::Id3v2);
+        for (key, value) in [
+            (ItemKey::TrackTitle, title),
+            (ItemKey::TrackArtist, artist),
+            (ItemKey::AlbumTitle, album),
+        ] {
+            tag.insert(TagItem::new(key, ItemValue::Text(value.to_string())));
+        }
+        tag.save_to_path(path, WriteOptions::default())
+            .expect("should write id3v2 tags");
+    }
+
     /// Fresh database plus an empty music folder registered in it.
     async fn fixture(name: &str) -> (crate::db::Db, std::path::PathBuf, std::path::PathBuf) {
         let base = std::env::temp_dir().join(format!("music-app-scan-{name}"));
@@ -1042,6 +1122,226 @@ mod tests {
         let mut bytes = std::fs::read(path).unwrap();
         bytes.push(0);
         std::fs::write(path, bytes).unwrap();
+    }
+
+    // --- the display copy against the file's tags -------------------------
+
+    async fn shown(pool: &SqlitePool) -> (String, Option<String>, Option<String>) {
+        sqlx::query_as("SELECT title, artist, album FROM tracks")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn recorded(pool: &SqlitePool) -> (Option<String>, Option<String>, Option<String>) {
+        sqlx::query_as("SELECT file_title, file_artist, file_album FROM tracks")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The bug 0024 exists to remove.
+    ///
+    /// The scanner used to assign `title = excluded.title` unconditionally, so
+    /// a rename made in the app lasted exactly until the file's mtime or size
+    /// changed -- an external tagger, a re-copy, or this app writing tags back
+    /// -- and then reverted with nothing said. Restore that assignment and this
+    /// test fails on every one of the three columns.
+    #[tokio::test]
+    async fn an_edit_survives_a_reparse_of_the_file() {
+        let (db, music, base) = fixture("edit-survives").await;
+        let file = music.join("Song.wav");
+        write_wav(&file);
+        write_tags(&file, "File Title", "File Artist", "File Album");
+
+        scan_all(&db.pool, &ScanLock::new(), None, &None).await.unwrap().unwrap();
+
+        // What the metadata editor does.
+        sqlx::query("UPDATE tracks SET title = 'My Title', artist = 'My Artist', album = 'My Album'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // The file changes underneath, and disagrees on all three.
+        write_tags(
+            &file,
+            "Retagged Title By Somebody Else",
+            "Retagged Artist By Somebody Else",
+            "Retagged Album By Somebody Else",
+        );
+
+        let summary = scan_all(&db.pool, &ScanLock::new(), None, &None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.updated, 1, "the file must actually have been reparsed");
+
+        let (title, artist, album) = shown(&db.pool).await;
+        assert_eq!(title, "My Title");
+        assert_eq!(artist.as_deref(), Some("My Artist"));
+        assert_eq!(album.as_deref(), Some("My Album"));
+
+        // The file's word is still recorded, even though the display copy
+        // ignored it -- otherwise the next scan would compare against a stale
+        // tag and conclude the row had stopped diverging.
+        let (file_title, file_artist, _) = recorded(&db.pool).await;
+        assert_eq!(file_title.as_deref(), Some("Retagged Title By Somebody Else"));
+        assert_eq!(
+            file_artist.as_deref(),
+            Some("Retagged Artist By Somebody Else")
+        );
+
+        db.pool.close().await;
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The other half, and the reason the guard is a comparison rather than a
+    /// flag: a row nobody edited must still track its file. Freezing every
+    /// reparsed row would pass the test above and break retagging entirely.
+    #[tokio::test]
+    async fn a_row_nobody_edited_still_follows_the_file() {
+        let (db, music, base) = fixture("follows-file").await;
+        let file = music.join("Song.wav");
+        write_wav(&file);
+        write_tags(&file, "First Title", "First Artist", "First Album");
+
+        scan_all(&db.pool, &ScanLock::new(), None, &None).await.unwrap().unwrap();
+
+        write_tags(
+            &file,
+            "Corrected Title From The Tag",
+            "Corrected Artist From The Tag",
+            "Corrected Album From The Tag",
+        );
+
+        let summary = scan_all(&db.pool, &ScanLock::new(), None, &None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.updated, 1);
+
+        let (title, artist, album) = shown(&db.pool).await;
+        assert_eq!(title, "Corrected Title From The Tag");
+        assert_eq!(artist.as_deref(), Some("Corrected Artist From The Tag"));
+        assert_eq!(album.as_deref(), Some("Corrected Album From The Tag"));
+
+        db.pool.close().await;
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Reverting is a normal edit, and that is the whole trick.
+    ///
+    /// "Go back to the file's tags" writes the recorded `file_*` values
+    /// through the same `update_track_metadata` path as anything typed by
+    /// hand. There is no flag to clear, because divergence is not a flag: it
+    /// is the two copies differing. Writing the file's own values back makes
+    /// them equal again, so the row silently resumes following its file.
+    ///
+    /// This is the test that phase 1 and phase 2 compose. Without it, a revert
+    /// that merely *looked* right -- the fields showing the correct text --
+    /// could still leave the row pinned forever.
+    #[tokio::test]
+    async fn reverting_to_the_file_tags_lets_the_row_follow_its_file_again() {
+        let (db, music, base) = fixture("revert-recouples").await;
+        let file = music.join("Song.wav");
+        write_wav(&file);
+        write_tags(&file, "First Title", "First Artist", "First Album");
+
+        scan_all(&db.pool, &ScanLock::new(), None, &None).await.unwrap().unwrap();
+
+        sqlx::query("UPDATE tracks SET artist = 'Mine'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Diverged: the file changes and is ignored.
+        write_tags(&file, "Second Title Is Longer", "Second Artist Is Longer", "Second Album Is Longer");
+        scan_all(&db.pool, &ScanLock::new(), None, &None).await.unwrap().unwrap();
+        let (_, artist, _) = shown(&db.pool).await;
+        assert_eq!(artist.as_deref(), Some("Mine"), "the edit should still hold");
+
+        // The revert, written exactly as the command writes it: the recorded
+        // values read out first, then sent back in as an ordinary edit.
+        let (file_title, file_artist, file_album) = recorded(&db.pool).await;
+        sqlx::query("UPDATE tracks SET title = ?, artist = ?, album = ?")
+            .bind(file_title.as_deref().unwrap())
+            .bind(&file_artist)
+            .bind(&file_album)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // And now the file's word counts again.
+        write_tags(
+            &file,
+            "Third Title Is Longer Again",
+            "Third Artist Is Longer Again",
+            "Third Album Is Longer Again",
+        );
+        let summary = scan_all(&db.pool, &ScanLock::new(), None, &None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.updated, 1);
+
+        let (title, artist, album) = shown(&db.pool).await;
+        assert_eq!(title, "Third Title Is Longer Again");
+        assert_eq!(artist.as_deref(), Some("Third Artist Is Longer Again"));
+        assert_eq!(album.as_deref(), Some("Third Album Is Longer Again"));
+
+        db.pool.close().await;
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A row from before 0024, which is every row in an existing library.
+    ///
+    /// `file_*` is NULL, so there is nothing to compare against and no way to
+    /// know whether the row was edited. The scanner records what the file says
+    /// and changes nothing -- the conservative arm, chosen because guessing
+    /// "not edited" is what reverts somebody's work.
+    ///
+    /// This is what the `file_mtime = -1` line in the migration triggers.
+    #[tokio::test]
+    async fn a_row_from_before_the_split_learns_the_tags_without_losing_an_edit() {
+        let (db, music, base) = fixture("backfill").await;
+        let file = music.join("Song.wav");
+        write_wav(&file);
+        write_tags(&file, "First Title", "First Artist", "First Album");
+
+        scan_all(&db.pool, &ScanLock::new(), None, &None).await.unwrap().unwrap();
+
+        // Wind the row back to how an upgraded library looks: tags never
+        // recorded, and an artist the user put there by hand.
+        sqlx::query(
+            "UPDATE tracks SET file_title = NULL, file_artist = NULL, file_album = NULL, \
+             artist = 'Named By Hand', file_mtime = -1",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let summary = scan_all(&db.pool, &ScanLock::new(), None, &None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            summary.updated, 1,
+            "file_mtime = -1 is what forces the reparse"
+        );
+
+        let (_, artist, _) = shown(&db.pool).await;
+        assert_eq!(artist.as_deref(), Some("Named By Hand"), "the edit is kept");
+
+        let (file_title, file_artist, _) = recorded(&db.pool).await;
+        assert_eq!(file_title.as_deref(), Some("First Title"));
+        assert_eq!(
+            file_artist.as_deref(),
+            Some("First Artist"),
+            "and the file's own tag is now on record"
+        );
+
+        db.pool.close().await;
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]

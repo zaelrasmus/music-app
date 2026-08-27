@@ -1004,6 +1004,32 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// A title with `artist` taken off the front and the upload noise removed,
+/// using the artist **exactly as given**.
+///
+/// [`identify`] cleans the artist first, which is right when the name came
+/// from an uploader and wrong when it came from a folder: `clean_artist`
+/// strips "Music" as channel decoration, so a folder called `Epic Music`
+/// becomes an artist called `Epic`. A directory somebody made is not a channel
+/// handle, so `infer` needs the name left alone and the title cleaned anyway.
+pub(crate) fn title_without(artist: &str, title: &str) -> String {
+    clean_title(strip_artist_prefix(title, Some(artist)))
+}
+
+/// Whether a phrase says only *which version this is* and nothing else.
+///
+/// Exposed for `infer`, which splits `"Artist - Title"` filenames and must not
+/// split `"Song - Remix"`: the dash there separates a song from its version,
+/// not an artist from a song, and treating "Remix" as a title would leave the
+/// row named after a word.
+///
+/// Shares this module's vocabulary on purpose. A second list would drift, and
+/// the two uses want exactly the same words.
+pub(crate) fn is_only_version_marker(text: &str) -> bool {
+    let words = words(text);
+    !words.is_empty() && words.iter().all(|w| VERSION_MARKERS.contains(&w.as_str()))
+}
+
 /// Whether two titles name the same recording.
 ///
 /// Equal word-for-word, or one is the other plus *catalogue context* -- an

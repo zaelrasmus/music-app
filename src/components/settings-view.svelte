@@ -10,6 +10,7 @@
     import ExtrasSettings from "$components/extras-settings.svelte";
     import ExtractorSettings from "$components/extractor-settings.svelte";
     import TagManager from "$components/tag-manager.svelte";
+    import DetailsSettings from "$components/details-settings.svelte";
     import { library } from "$lib/library.svelte";
     import { trackStore } from "$lib/tracks.svelte";
     import { sidebar, type SidebarMode } from "$lib/sidebar.svelte";
@@ -275,6 +276,8 @@
                 </div>
             </div>
         </SettingsSection>
+
+        <DetailsSettings />
 
         <LoudnessSettings />
         <EqualizerSettings />

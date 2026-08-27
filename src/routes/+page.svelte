@@ -25,6 +25,7 @@
     import PlaylistsPanel from "$components/playlists-panel.svelte";
     import HistoryPanel from "$components/history-panel.svelte";
     import SettingsView from "$components/settings-view.svelte";
+    import DetailsView from "$components/details-view.svelte";
 
     onMount(() => {
         library.load();
@@ -94,6 +95,8 @@
     <PlaylistsPanel />
 {:else if nav.view === "history"}
     <HistoryPanel />
+{:else if nav.view === "details"}
+    <DetailsView />
 {:else}
     <SettingsView />
 {/if}

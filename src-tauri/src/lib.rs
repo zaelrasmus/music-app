@@ -19,6 +19,7 @@ mod now_playing;
 mod library;
 mod loudness;
 mod lrclib;
+mod infer;
 mod lyrics;
 mod loudness_sample;
 #[cfg(test)]
@@ -293,6 +294,10 @@ pub fn run() {
             tracks::track_details,
             tracks::rescan_library,
             tracks::update_track_metadata,
+            tracks::track_file_tags,
+            infer::untagged_folders,
+            infer::folder_proposals,
+            infer::apply_track_details,
             tracks::set_in_library,
             tracks::set_many_in_library,
             tracks::filed_remote_ids,

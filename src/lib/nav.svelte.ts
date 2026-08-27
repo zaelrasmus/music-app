@@ -9,7 +9,15 @@ import { selection } from "$lib/selection.svelte";
  * navigation or force every store to re-fetch to rebuild it. Nothing in this
  * app is linkable or back-buttonable, so routing would buy nothing in return.
  */
-export type View = "library" | "search" | "playlists" | "history" | "settings";
+export type View =
+  | "library"
+  | "search"
+  | "playlists"
+  | "history"
+  | "settings"
+  /** Reviewing what the app can work out about untagged tracks. Reached from
+   *  settings rather than the sidebar: it is a job, not a place. */
+  | "details";
 
 class NavStore {
   view = $state<View>("library");

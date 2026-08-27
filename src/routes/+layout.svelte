@@ -9,6 +9,7 @@
 	import QueuePanel from "$components/queue-panel.svelte";
 	import LyricsView from "$components/lyrics-view.svelte";
 	import PromptDialog from "$components/prompt-dialog.svelte";
+	import MetadataDialog from "$components/metadata-dialog.svelte";
 	import { chrome } from "$lib/chrome.svelte";
 	import { sidebar } from "$lib/sidebar.svelte";
 	import { queueStore } from "$lib/queue.svelte";
@@ -120,6 +121,7 @@
 
 <Toaster position="bottom-center" />
 <PromptDialog />
+<MetadataDialog />
 
 <!--
   The shell.

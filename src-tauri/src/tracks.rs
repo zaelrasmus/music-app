@@ -208,18 +208,58 @@ pub async fn rescan_library(
     Ok(summary)
 }
 
+/// What the file's own tags say, for a local track.
+///
+/// Recorded by the scanner. `None` from [`track_file_tags`] covers three cases
+/// that are one case to the caller: the row is remote and has no file, the row
+/// is gone, or the file has not been read since `0024` added these columns.
+/// All three mean the same thing to the UI -- there is nothing to compare
+/// against and nothing to revert to.
+#[derive(Debug, Clone, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTags {
+    pub title: String,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+}
+
+/// The file's tags, so the editor can show them and offer to go back to them.
+///
+/// There is deliberately no `revert_track_metadata` command. Reverting is
+/// [`update_track_metadata`] with these three values, which means it travels
+/// the one path that already validates a title and is the same write the user
+/// could have typed by hand. It also lands the row back in the state the
+/// scanner reads as "not diverged" -- see the CASE arms in `scanner.rs` -- so
+/// the track resumes following its file with nothing to reset.
+#[tauri::command]
+pub async fn track_file_tags(db: State<'_, Db>, track_id: i64) -> Result<Option<FileTags>, String> {
+    sqlx::query_as(
+        "SELECT file_title AS title, file_artist AS artist, file_album AS album \
+         FROM tracks WHERE id = ? AND file_title IS NOT NULL",
+    )
+    .bind(track_id)
+    .fetch_optional(&db.pool)
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Renames a track for display, leaving its provenance untouched.
 ///
-/// YouTube metadata is dirty by nature -- a slowed+reverb upload has no clean
-/// artist tag -- so `title`/`artist` are the editable copy while
-/// `yt_original_title`/`yt_channel` keep what was actually uploaded. Those are
+/// Remote metadata is dirty by nature -- a slowed+reverb upload has no clean
+/// artist tag -- so `title`/`artist`/`album` are the editable copy while
+/// `remote_title`/`remote_uploader` keep what was actually uploaded. Those are
 /// deliberately not writable here.
+///
+/// Since `0024` the same split exists for local rows: `file_title` and friends
+/// hold what the file's tags say, and writing here is exactly what makes a row
+/// diverge from its file so a rescan stops overwriting it.
 #[tauri::command]
 pub async fn update_track_metadata(
     db: State<'_, Db>,
     track_id: i64,
     title: String,
     artist: Option<String>,
+    album: Option<String>,
 ) -> Result<(), String> {
     let title = title.trim();
     if title.is_empty() {
@@ -228,14 +268,15 @@ pub async fn update_track_metadata(
         return Err("A title is required.".to_string());
     }
 
-    // An empty artist box means "unknown", which is NULL rather than "".
-    let artist = artist
-        .map(|a| a.trim().to_string())
-        .filter(|a| !a.is_empty());
+    // An empty box means "unknown", which is NULL rather than "".
+    let blank_is_none = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let artist = blank_is_none(artist);
+    let album = blank_is_none(album);
 
-    let affected = sqlx::query("UPDATE tracks SET title = ?, artist = ? WHERE id = ?")
+    let affected = sqlx::query("UPDATE tracks SET title = ?, artist = ?, album = ? WHERE id = ?")
         .bind(title)
         .bind(&artist)
+        .bind(&album)
         .bind(track_id)
         .execute(&db.pool)
         .await
@@ -772,5 +813,117 @@ mod filed_tests {
 
         assert_eq!(chunked.len(), ids.len());
         assert!(ids.chunks(FILED_CHUNK).all(|c| c.len() <= FILED_CHUNK));
+    }
+}
+
+/// The metadata editor's writes.
+///
+/// Its own module because these are about what the user types, while
+/// `filed_tests` above is about library membership -- two unrelated
+/// questions that happen to touch the same table.
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    async fn editor_fixture(name: &str) -> (crate::db::Db, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("music-app-editor-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::init(&dir).await.unwrap();
+        (db, dir)
+    }
+
+    /// The three columns the editor writes, read back the way a list would.
+    async fn shown(pool: &SqlitePool, id: i64) -> (String, Option<String>, Option<String>) {
+        sqlx::query_as("SELECT title, artist, album FROM tracks WHERE id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Empty is not a value. A row carrying `''` would sort apart from the
+    /// rows carrying NULL, group into its own nameless artist, and read as
+    /// "there is an album called nothing" everywhere it is displayed.
+    #[tokio::test]
+    async fn a_cleared_box_is_stored_as_null_rather_than_an_empty_string() {
+        let (db, dir) = editor_fixture("blank").await;
+
+        let id = sqlx::query(
+            "INSERT INTO tracks (source, title, artist, album, local_path, state) \
+             VALUES ('local', 'Song', 'Somebody', 'Some Album', '/tmp/a.mp3', 'present')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        sqlx::query("UPDATE tracks SET title = ?, artist = ?, album = ? WHERE id = ?")
+            .bind("Song")
+            .bind(None::<String>)
+            .bind(None::<String>)
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let (_, artist, album) = shown(&db.pool, id).await;
+        assert_eq!(artist, None);
+        assert_eq!(album, None);
+
+        db.pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A remote row has no file, so there is nothing to show and nothing to
+    /// revert to. The editor uses this to decide whether to offer either.
+    #[tokio::test]
+    async fn a_remote_track_has_no_file_tags_to_offer() {
+        let (db, dir) = editor_fixture("remote-tags").await;
+
+        let remote = sqlx::query(
+            "INSERT INTO tracks (source, title, remote_id, remote_url, state, in_library) \
+             VALUES ('youtube', 'Upload', 'abc123', 'https://example.invalid/x', 'saved', 1)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        let local = sqlx::query(
+            "INSERT INTO tracks (source, title, local_path, state, file_title, file_artist) \
+             VALUES ('local', 'Renamed', '/tmp/b.mp3', 'present', 'Tagged', 'Tagged Artist')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap()
+        .last_insert_rowid();
+
+        async fn ask(pool: &SqlitePool, id: i64) -> Option<FileTags> {
+            sqlx::query_as(
+                "SELECT file_title AS title, file_artist AS artist, file_album AS album \
+                 FROM tracks WHERE id = ? AND file_title IS NOT NULL",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        }
+
+        assert!(
+            ask(&db.pool, remote).await.is_none(),
+            "a stream has no file to read"
+        );
+
+        // Asserted too, so this cannot pass because the query broke outright.
+        let found = ask(&db.pool, local)
+            .await
+            .expect("a scanned local file has tags");
+        assert_eq!(found.title, "Tagged");
+        assert_eq!(found.artist.as_deref(), Some("Tagged Artist"));
+
+        db.pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
