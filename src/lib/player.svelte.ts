@@ -33,6 +33,10 @@ export type PlayerStatus = {
   stalled: boolean;
   /** Whether per-track loudness correction is on. */
   normalize: boolean;
+  /** Whether one track hands over to the next without a gap. */
+  gapless: boolean;
+  /** Whether a track ends when its music does rather than when its file does. */
+  trimSilence: boolean;
   /**
    * What the current track is being corrected by, in dB. `null` means it has
    * not been measured yet — the honest state for a stream nobody has finished
@@ -73,6 +77,23 @@ class PlayerStore {
   /** The loudness every track is corrected towards. */
   targetLufs = $state(-14);
   normalize = $state(false);
+  /**
+   * Whether one track hands over to the next without a gap.
+   *
+   * On by default. Every explicit action -- Next, a seek, reordering the queue
+   * -- still goes through the ordinary path, so what this changes is only what
+   * happens when a track is simply allowed to end.
+   */
+  gapless = $state(true);
+  /**
+   * Whether a track ends when its music does rather than when its file does.
+   *
+   * A different problem from gapless, and so a different setting. Gapless is
+   * about this player putting a gap between two tracks; this is about the gap
+   * already inside the recording -- a great many uploads run on for seconds
+   * after the last note.
+   */
+  trimSilence = $state(true);
   trackGainDb = $state<number | null>(null);
   stalled = $state(false);
 
@@ -119,6 +140,8 @@ class PlayerStore {
       this.volumeCeilingDb = s.volumeCeilingDb;
       this.targetLufs = s.targetLufs;
       this.normalize = s.normalize;
+      this.gapless = s.gapless;
+      this.trimSilence = s.trimSilence;
       this.trackGainDb = s.trackGainDb;
       this.stalled = s.stalled;
 
@@ -222,8 +245,17 @@ class PlayerStore {
 
   /** Restores persisted preferences and pushes them to the backend. */
   async restorePreferences() {
-    const [volume, muted, repeat, shuffle, ceiling, normalize, target] =
-      await Promise.all([
+    const [
+      volume,
+      muted,
+      repeat,
+      shuffle,
+      ceiling,
+      normalize,
+      target,
+      gapless,
+      trimSilence,
+    ] = await Promise.all([
       readSetting("volume", 1),
       readSetting("muted", false),
       readSetting<RepeatMode>("repeat", "off"),
@@ -238,6 +270,12 @@ class PlayerStore {
       // What levelling aims at. -14 LUFS is where YouTube and Spotify sit, so
       // it is the level this library was mostly mastered near.
       readSetting("targetLufs", -14),
+      // On by default: an album that was recorded to run together should, and
+      // anything an explicit action touches takes the ordinary path anyway.
+      readSetting("gapless", true),
+      // On by default for the same reason: the silence at the end of an upload
+      // is not part of the record, and nobody chose to hear it.
+      readSetting("trimSilence", true),
     ]);
 
     await Promise.all([
@@ -248,6 +286,8 @@ class PlayerStore {
       invoke("set_volume_ceiling", { db: ceiling }),
       invoke("set_normalize", { on: normalize }),
       invoke("set_target_lufs", { lufs: target }),
+      invoke("set_gapless", { on: gapless }),
+      invoke("set_trim_silence", { on: trimSilence }),
     ]);
   }
 
@@ -328,6 +368,29 @@ class PlayerStore {
   async setNormalize(on: boolean) {
     await this.run("set_normalize", { on });
     await writeSetting("normalizeLoudness", on);
+  }
+
+  /**
+   * Turns gapless handover on or off.
+   *
+   * Applies from the next handover. A track already queued behind the one
+   * playing stays queued -- pulling it back out would mean tearing down the
+   * running player, which is a gap, to switch off gaps.
+   */
+  async setGapless(on: boolean) {
+    await this.run("set_gapless", { on });
+    await writeSetting("gapless", on);
+  }
+
+  /**
+   * Turns trailing-silence trimming on or off.
+   *
+   * Applies to the track already playing: the check runs on every progress
+   * tick, so switching it on part-way through still catches that track's tail.
+   */
+  async setTrimSilence(on: boolean) {
+    await this.run("set_trim_silence", { on });
+    await writeSetting("trimSilence", on);
   }
 
   async setVolume(volume: number) {

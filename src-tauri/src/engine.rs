@@ -62,7 +62,17 @@ pub const SUPERSEDED: &str = "__superseded__";
 #[derive(Debug)]
 pub enum EngineEvent {
     /// The track for `epoch` played to its end. Not sent on an explicit stop.
-    Finished { epoch: u64 },
+    Finished {
+        epoch: u64,
+        /// The epoch now playing, when one was queued behind this track and
+        /// took over without a gap.
+        ///
+        /// `None` is the ordinary end: nothing follows, and it is the
+        /// coordinator's business to decide what does. `Some` means the
+        /// handover has *already happened* -- the mixer never stopped -- and
+        /// starting anything here would cut off a track that is audible.
+        handed_to: Option<u64>,
+    },
     /// Where the current track is up to. Emitted on the existing poll tick
     /// while actually playing -- never while paused or stopped, so the UI
     /// stops updating on its own without needing to be told.
@@ -112,6 +122,15 @@ enum Command {
         /// two can be in flight at once and the *older* one must not win by
         /// finishing last.
         epoch: u64,
+        /// The level this track is to play at, as a linear multiplier.
+        ///
+        /// Carried with the track rather than pushed separately afterwards,
+        /// so it is right from the first sample. Unity when the coordinator
+        /// does not know yet -- a cold load reads the figure from the database
+        /// while the track is already starting, and corrects it a moment later
+        /// through `SetTrackGain`, which is what shipped before this and is
+        /// inaudible at one poll interval.
+        track_gain: f32,
         reply: oneshot::Sender<Result<(), String>>,
     },
     Pause,
@@ -122,12 +141,59 @@ enum Command {
         epoch: u64,
     },
     /// Linear amplitude, already curved by the caller.
+    ///
+    /// The listener's slider alone. The track's own correction used to be
+    /// multiplied in before it got here, which meant it landed on whatever was
+    /// playing at that moment rather than on the track it was measured from.
     SetVolume(f32),
+    /// The correction for the track playing now, as a linear multiplier.
+    ///
+    /// For a reading that arrives mid-track, and for the settings that change
+    /// what a reading means -- toggling normalisation, moving the target. The
+    /// level a track *starts* at travels with `Play` instead, so it is right
+    /// from the first sample.
+    SetTrackGain(f32),
     Position {
         reply: oneshot::Sender<Duration>,
     },
     Seek {
         position: Duration,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Ends the track playing now, letting whatever follows begin.
+    ///
+    /// For a track whose music has finished but whose file has not. Skipping
+    /// the source rather than stopping the player is what keeps the handover
+    /// seamless: a track queued behind it simply becomes the current one, and
+    /// with nothing queued the player empties and the end is reported as
+    /// usual.
+    SkipTail,
+    /// Gives up the queued track, if there is one.
+    ///
+    /// For when what comes next has changed. An appended source cannot be
+    /// pulled back out -- rodio can clear a player's whole queue but not its
+    /// tail -- so this drops it the only way there is, by rebuilding the
+    /// player from where the current track has reached.
+    ///
+    /// That costs a short break mid-track. It is the price of reordering the
+    /// queue during the last seconds of a song, and the alternative is the
+    /// wrong track playing.
+    CancelQueued,
+    /// Queues a track to follow the one playing, with no gap between them.
+    ///
+    /// The difference from `Play` is the whole feature. `Play` builds a new
+    /// player and drops the old one -- a teardown, a setup, and the silence
+    /// between them. This appends to the player already running, so the mixer
+    /// is never handed an empty queue and never stops.
+    ///
+    /// Refused unless the decode already matches the device: rebuilding one
+    /// here would block the audio thread for the whole of ffmpeg's prefill,
+    /// which is exactly the wait this exists to remove.
+    Enqueue {
+        source: PlayableSource,
+        decoded: BuiltSource,
+        epoch: u64,
+        track_gain: f32,
         reply: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -157,6 +223,11 @@ type DeviceReport = Option<crate::device_watch::DeviceIdentity>;
 /// behaves.
 pub struct AudioEngine {
     tx: Mutex<Sender<Command>>,
+    /// Consecutive silent frames at the output, written by the audio chain.
+    ///
+    /// Read rather than sent, for the same reason the equaliser is: it changes
+    /// forty-eight thousand times a second and nobody needs a message about it.
+    silence: Arc<AtomicU32>,
     /// Live equaliser settings, shared with whatever is playing.
     ///
     /// Not routed through the command channel: every field is an atomic, so
@@ -181,6 +252,17 @@ impl AudioEngine {
     /// What ffmpeg should be told to produce.
     pub fn output_rate(&self) -> u32 {
         self.output_rate.load(Ordering::Acquire)
+    }
+
+    /// How long the audio coming out has been silent.
+    ///
+    /// The end of the *music*, as opposed to the end of the *file*. Reported
+    /// rather than acted on: whether a silent tail is worth skipping is a
+    /// policy question, and the coordinator owns those.
+    pub fn silent_for(&self) -> Duration {
+        let frames = self.silence.load(Ordering::Relaxed);
+        let rate = self.output_rate().max(1);
+        Duration::from_secs_f64(f64::from(frames) / f64::from(rate))
     }
 
     /// The live equaliser settings.
@@ -210,6 +292,7 @@ impl AudioEngine {
         decoded: Option<BuiltSource>,
         start_at: Duration,
         epoch: u64,
+        track_gain: f32,
     ) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
         self.send(Command::Play {
@@ -217,10 +300,49 @@ impl AudioEngine {
             decoded,
             start_at,
             epoch,
+            track_gain,
             reply,
         })?;
 
         await_reply(response, "The audio thread did not respond.").await
+    }
+
+    /// Queues `source` to follow the track playing, with no gap.
+    ///
+    /// Fails when there is nothing playing to follow, when something is
+    /// already queued, or when the prepared decode no longer suits the device.
+    /// Every one of those is a reason to fall back to [`Self::play`], which is
+    /// what the caller does -- so a failure here costs a gap, never a track.
+    pub async fn enqueue(
+        &self,
+        source: PlayableSource,
+        decoded: BuiltSource,
+        epoch: u64,
+        track_gain: f32,
+    ) -> Result<(), String> {
+        let (reply, response) = oneshot::channel();
+        self.send(Command::Enqueue {
+            source,
+            decoded,
+            epoch,
+            track_gain,
+            reply,
+        })?;
+
+        await_reply(response, "The audio thread did not respond.").await
+    }
+
+    /// Ends the current track early. See [`Command::SkipTail`].
+    pub fn skip_tail(&self) -> Result<(), String> {
+        self.send(Command::SkipTail)
+    }
+
+    /// Gives up whatever is queued behind the current track.
+    ///
+    /// Fire and forget: there is nothing useful to say back. Either something
+    /// was queued and is not any more, or nothing was.
+    pub fn cancel_queued(&self) -> Result<(), String> {
+        self.send(Command::CancelQueued)
     }
 
     pub fn pause(&self) -> Result<(), String> {
@@ -237,6 +359,17 @@ impl AudioEngine {
 
     pub fn set_volume(&self, linear: f32) -> Result<(), String> {
         self.send(Command::SetVolume(linear))
+    }
+
+    /// Corrects the level of the track playing now.
+    ///
+    /// Separate from the slider because they answer different questions and
+    /// change at different times: the slider is where the listener put it, and
+    /// this is what the track was measured at. Multiplying them before they
+    /// reach the audio thread -- which is what this replaces -- meant the
+    /// correction belonged to a moment rather than to a track.
+    pub fn set_track_gain(&self, linear: f32) -> Result<(), String> {
+        self.send(Command::SetTrackGain(linear))
     }
 
     /// Jumps to `position` in the current track.
@@ -286,6 +419,9 @@ pub fn spawn(events: UnboundedSender<EngineEvent>, ffmpeg: Option<PathBuf>) -> A
     let eq = Arc::new(EqSettings::default());
     let audio_eq = Arc::clone(&eq);
 
+    let silence = Arc::new(AtomicU32::new(0));
+    let audio_silence = Arc::clone(&silence);
+
     // Watching starts with the engine and ends with it. The send fails once
     // the audio thread has gone, which is what stops the watcher -- so nothing
     // has to remember to shut it down, and a dropped engine does not leave a
@@ -295,13 +431,14 @@ pub fn spawn(events: UnboundedSender<EngineEvent>, ffmpeg: Option<PathBuf>) -> A
 
     std::thread::Builder::new()
         .name("audio".to_string())
-        .spawn(move || run(rx, device_rx, events, ffmpeg, published, audio_eq))
+        .spawn(move || run(rx, device_rx, events, ffmpeg, published, audio_eq, audio_silence))
         .expect("audio thread should spawn");
 
     AudioEngine {
         tx: Mutex::new(tx),
         output_rate,
         eq,
+        silence,
     }
 }
 
@@ -314,6 +451,12 @@ pub fn spawn(events: UnboundedSender<EngineEvent>, ffmpeg: Option<PathBuf>) -> A
 struct Chain {
     /// Read per frame by `Levelled`, so the slider moves what is playing.
     volume: Arc<AtomicU32>,
+    /// Consecutive silent frames at the output, written by `Levelled`.
+    ///
+    /// What lets the end of the *music* be told from the end of the *file*. A
+    /// great many uploads run on for several seconds after the last note, and
+    /// playing that faithfully is a gap however seamless the handover after it.
+    silence: Arc<AtomicU32>,
     /// Read per frame by `Equalised`, for the same reason.
     eq: Arc<EqSettings>,
 }
@@ -520,7 +663,7 @@ fn reopen(
         None => Ok(()),
         Some(current) => match build_source(&current.source, ffmpeg, rate, position) {
             Ok(built) => {
-                let replacement = start(&output.sink, built.decoded, chain);
+                let replacement = start(&output.sink, built.decoded, chain, &current.gain);
                 // Switching devices while paused must not start playback.
                 if was_paused {
                     replacement.pause();
@@ -548,6 +691,7 @@ fn run(
     ffmpeg: Option<PathBuf>,
     output_rate: Arc<AtomicU32>,
     eq: Arc<EqSettings>,
+    silence: Arc<AtomicU32>,
 ) {
     // If there is no device we keep the error and fail every play with it,
     // rather than killing the thread and making every later command report
@@ -572,10 +716,20 @@ fn run(
 
     let chain = Chain {
         volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+        silence,
         eq,
     };
     // What is loaded, kept so a seek can rebuild the decode from a new offset.
     let mut loaded: Option<Loaded> = None;
+    // The track queued behind the one playing, if any, and the epoch it will
+    // become. Exactly one may wait: a second would need a queue of its own and
+    // buys nothing, since the handover it exists for is one track away.
+    //
+    // Dropped by everything that replaces the player -- a play, a stop, a seek,
+    // a device change -- because the appended source goes with the player it
+    // was appended to, and a record of a track that is no longer queued would
+    // have the engine announce a handover that never happened.
+    let mut queued: Option<(u64, Loaded)> = None;
     // The newest epoch this thread has acted on.
     //
     // Loads run concurrently now, so a slow one can finish after a newer one
@@ -627,6 +781,9 @@ fn run(
             // nothing but the asking.
             if reason == Reopen::Switched || now >= retry_output_at {
                 retry_output_at = now + REOPEN_RETRY;
+                // The reopen rebuilds the player from the current position,
+                // and an appended track cannot survive that.
+                queued = None;
 
                 let outcome = reopen(
                     &mut device,
@@ -649,6 +806,7 @@ fn run(
                 decoded,
                 start_at,
                 epoch: new_epoch,
+                track_gain,
                 reply,
             }) => {
                 if new_epoch < highest_epoch {
@@ -660,6 +818,11 @@ fn run(
                 }
                 highest_epoch = new_epoch;
 
+                // The track's own, created here and owned by `Loaded`, so a
+                // later rebuild hands the same cell to the replacement source
+                // and the correction is not lost with the decoder.
+                let gain = Arc::new(AtomicU32::new(track_gain.to_bits()));
+
                 let mut starved = None;
                 let result = match &device {
                     Ok(output) => {
@@ -668,13 +831,13 @@ fn run(
                             // hand it to the mixer.
                             Some(ready) => {
                                 starved = ready.starved;
-                                Ok(start(&output.sink, ready.decoded, &chain))
+                                Ok(start(&output.sink, ready.decoded, &chain, &gain))
                             }
                             None => {
                                 build_source(&source, ffmpeg.as_deref(), output.rate(), start_at)
                                     .map(|built| {
                                         starved = built.starved;
-                                        start(&output.sink, built.decoded, &chain)
+                                        start(&output.sink, built.decoded, &chain, &gain)
                                     })
                             }
                         }
@@ -687,10 +850,17 @@ fn run(
                         // Dropping the previous player marks it stopped, which
                         // is what makes "replace what is playing" work --
                         // `append` alone would queue the new track behind it.
+                        //
+                        // Anything queued behind the old player goes with it.
+                        // That is the cost of pressing Next while a gapless
+                        // handover was already set up, and it is exactly the
+                        // work every track used to cost.
+                        queued = None;
                         player = Some(new_player);
                         epoch = Some(new_epoch);
                         loaded = Some(Loaded {
                             source,
+                            gain,
                             starved,
                             // The decode began here, so this is what the
                             // player's own position has to be added to.
@@ -722,6 +892,7 @@ fn run(
                 epoch = None;
                 player = None;
                 loaded = None;
+                queued = None;
                 // Anything still resolving is now stale.
                 highest_epoch = highest_epoch.max(new_epoch);
             }
@@ -732,11 +903,23 @@ fn run(
                 chain.volume.store(linear.to_bits(), Ordering::Relaxed);
             }
 
+            Ok(Command::SetTrackGain(linear)) => {
+                // The same, for the other half of the level -- and addressed
+                // to the loaded track rather than to the engine, which is the
+                // whole point of the cell living on `Loaded`. Nothing loaded
+                // means nothing to correct.
+                if let Some(current) = &loaded {
+                    current.gain.store(linear.to_bits(), Ordering::Relaxed);
+                }
+            }
+
             Ok(Command::Position { reply }) => {
                 let _ = reply.send(position_of(&player, &loaded));
             }
 
             Ok(Command::Seek { position, reply }) => {
+                // The rebuild drops the player, and the queued track with it.
+                queued = None;
                 let result = seek(
                     device.as_ref().map(|output| &output.sink),
                     &mut player,
@@ -748,14 +931,105 @@ fn run(
                 let _ = reply.send(result);
             }
 
+            Ok(Command::SkipTail) => {
+                if let Some(current) = &player {
+                    // `skip_one`, not `stop`: the queue behind it is the whole
+                    // point, and stopping would take that with it. The poll
+                    // below sees the count drop and reports the handover
+                    // exactly as it would have at the real end.
+                    current.skip_one();
+                }
+            }
+
+            Ok(Command::CancelQueued) => {
+                if queued.take().is_some() {
+                    // The only way to remove an appended source is to replace
+                    // the player it was appended to.
+                    let reached = position_of(&player, &loaded);
+                    let _ = seek(
+                        device.as_ref().map(|output| &output.sink),
+                        &mut player,
+                        &mut loaded,
+                        reached,
+                        &chain,
+                        ffmpeg.as_deref(),
+                    );
+                }
+            }
+
+            Ok(Command::Enqueue {
+                source,
+                decoded,
+                epoch: next_epoch,
+                track_gain,
+                reply,
+            }) => {
+                let result = match (&device, &player) {
+                    // Nothing playing to follow. The caller plays it outright.
+                    (_, None) => Err("Nothing is playing.".to_string()),
+                    (Err(e), _) => Err(e.clone()),
+                    (Ok(output), Some(current)) if queued.is_none() => {
+                        match still_matches(Some(decoded), output.rate()) {
+                            Some(ready) => {
+                                let gain = Arc::new(AtomicU32::new(track_gain.to_bits()));
+                                append(current, ready.decoded, &chain, &gain);
+                                queued = Some((
+                                    next_epoch,
+                                    Loaded {
+                                        source,
+                                        gain,
+                                        starved: ready.starved,
+                                        // A prepared decode always begins at
+                                        // zero, and rodio tracks each queued
+                                        // source's position separately -- so
+                                        // nothing has to be added to it.
+                                        offset: Duration::ZERO,
+                                    },
+                                ));
+                                Ok(())
+                            }
+                            None => Err("That decode no longer suits the device.".to_string()),
+                        }
+                    }
+                    _ => Err("Something is already queued.".to_string()),
+                };
+
+                let _ = reply.send(result);
+            }
+
             Err(RecvTimeoutError::Timeout) => {
                 // `append` bumps the queue count synchronously, so an empty
                 // player here means the track genuinely reached its end.
                 if let (Some(p), Some(current)) = (&player, epoch) {
-                    if p.empty() {
+                    // A queued track took over. The count drops as the first
+                    // one ends, and it is the only sign: the mixer was never
+                    // handed an empty queue, so nothing else about this looks
+                    // like the end of a track.
+                    //
+                    // Checked before `empty`, because a very short queued track
+                    // could in principle end within the same poll and leave the
+                    // count at zero -- and the handover still happened.
+                    if queued.is_some() && p.len() <= 1 {
+                        let (next_epoch, next_loaded) =
+                            queued.take().expect("just checked it is there");
+                        epoch = Some(next_epoch);
+                        loaded = Some(next_loaded);
+                        // Starvation belongs to a decoder, and this is a
+                        // different one.
+                        starving_since = None;
+                        reported_stall = false;
+
+                        let _ = events.send(EngineEvent::Finished {
+                            epoch: current,
+                            handed_to: Some(next_epoch),
+                        });
+                    } else if p.empty() {
                         player = None;
                         epoch = None;
-                        let _ = events.send(EngineEvent::Finished { epoch: current });
+                        let _ = events.send(EngineEvent::Finished {
+                            epoch: current,
+                            handed_to: None,
+                        });
                     } else if !p.is_paused() {
                         ticks = ticks.wrapping_add(1);
 
@@ -765,6 +1039,15 @@ fn run(
                             .is_some_and(|flag| flag.load(Ordering::Relaxed));
 
                         if starving {
+                            // Starvation silence is not the end of the music,
+                            // it is the network failing to keep up -- and
+                            // `FfmpegSource` covers the shortfall with silence,
+                            // which is indistinguishable at the output from a
+                            // track that has stopped. Zeroing the count here is
+                            // what stops a stalled stream being mistaken for a
+                            // finished one and skipped.
+                            chain.silence.store(0, Ordering::Relaxed);
+
                             let since = *starving_since.get_or_insert_with(std::time::Instant::now);
 
                             // Repeated while it lasts, so the coordinator can
@@ -811,6 +1094,13 @@ fn run(
 /// What the thread is currently playing, retained so a seek can rebuild it.
 struct Loaded {
     source: PlayableSource,
+    /// This track's loudness correction, as a linear multiplier.
+    ///
+    /// Held here rather than in `Chain` because it belongs to the track, not
+    /// to the engine: a rebuild -- a seek, a device change -- hands the same
+    /// cell to the new source, so the correction survives without being
+    /// recomputed, and a second track queued behind this one gets its own.
+    gain: Arc<AtomicU32>,
     /// Set while this decoder is starving. `None` when it cannot.
     starved: Option<Arc<AtomicBool>>,
     /// Where the current decode was started from.
@@ -885,7 +1175,7 @@ fn seek(
     let rebuilt = build_source(&l.source, ffmpeg, sink.config().sample_rate().get(), position)
         .map(|built| {
         let starved = built.starved;
-        (start(sink, built.decoded, chain), starved)
+        (start(sink, built.decoded, chain, &l.gain), starved)
     });
 
     match rebuilt {
@@ -1079,7 +1369,29 @@ impl Limiter {
 /// slider moved between them.
 struct Levelled<S> {
     inner: S,
+    /// The listener's slider, shared by everything the engine plays.
     gain: Arc<AtomicU32>,
+    /// How many frames in a row have been silent, published for the engine.
+    ///
+    /// Shared rather than per-source, which is safe because only one source is
+    /// ever being pulled: whichever that is, it is the one whose tail matters.
+    silence: Arc<AtomicU32>,
+    /// The same count, kept locally so the atomic is written in blocks.
+    quiet_frames: u32,
+    /// This track's own loudness correction, and nothing else's.
+    ///
+    /// Split from the slider rather than multiplied into it, which is how it
+    /// used to reach here. The product was computed by the coordinator and
+    /// pushed into one cell, so the correction only ever applied to whatever
+    /// happened to be playing when it was pushed -- fine while every track
+    /// began with a `Play` command, and wrong the moment one starts because
+    /// the track before it ended.
+    ///
+    /// Two cells multiplied per frame instead. The slider stays the listener's
+    /// one decision about loudness, the correction travels with the track it
+    /// belongs to, and a track queued behind another can carry its own level
+    /// before it is audible.
+    track: Arc<AtomicU32>,
     limiter: Limiter,
     /// What the gain actually is, as opposed to what has been asked for.
     current_gain: f32,
@@ -1091,7 +1403,26 @@ impl<S> Levelled<S>
 where
     S: Source,
 {
+    /// At the slider only, with no correction of its own.
+    ///
+    /// For everything that is not a track: the tests below, and any caller
+    /// that wants the stage without a loudness reading attached to it.
+    #[cfg(test)]
     fn new(inner: S, gain: Arc<AtomicU32>) -> Self {
+        Self::with_track(
+            inner,
+            gain,
+            Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            Arc::new(AtomicU32::new(0)),
+        )
+    }
+
+    fn with_track(
+        inner: S,
+        gain: Arc<AtomicU32>,
+        track: Arc<AtomicU32>,
+        silence: Arc<AtomicU32>,
+    ) -> Self {
         let rate = inner.sample_rate().get();
         let limiter = Limiter::new(inner.channels().get() as usize, rate);
         // One-pole coefficient for a 30 ms time constant at this rate.
@@ -1099,9 +1430,14 @@ where
         Self {
             inner,
             // Starts *at* the requested gain rather than gliding up from zero:
-            // a track should begin at its level, not fade in.
-            current_gain: f32::from_bits(gain.load(Ordering::Relaxed)),
+            // a track should begin at its level, not fade in. Both cells, since
+            // the level a track begins at is the product of the two.
+            current_gain: f32::from_bits(gain.load(Ordering::Relaxed))
+                * f32::from_bits(track.load(Ordering::Relaxed)),
             gain,
+            track,
+            silence,
+            quiet_frames: 0,
             limiter,
             glide,
         }
@@ -1131,7 +1467,12 @@ where
     /// arrives, and a gain of 0.99999 forever would cost the bit-exactness that
     /// unity gain is supposed to guarantee.
     fn pull_frame(&mut self) -> Option<Vec<rodio::Sample>> {
-        let target = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        // Two independent decisions, multiplied here rather than before they
+        // arrive: where the listener put the slider, and what this particular
+        // track has to be corrected by. The glide below smooths the product,
+        // so a change to either is equally free of clicks.
+        let target = f32::from_bits(self.gain.load(Ordering::Relaxed))
+            * f32::from_bits(self.track.load(Ordering::Relaxed));
 
         // Reached at the top rather than after the move, so a settled gain
         // costs one comparison and multiplies by exactly the number asked for.
@@ -1159,16 +1500,46 @@ where
 
         let channels = self.limiter.channels;
         let mut frame = Vec::with_capacity(channels);
+        let mut quiet = true;
         for index in 0..channels {
             match self.inner.next() {
-                Some(sample) => frame.push(sample * gain),
+                Some(sample) => {
+                    // Measured *before* the gain, and that is not fussiness:
+                    // after it, a muted player looks exactly like a track that
+                    // has ended, and every track would be cut short.
+                    quiet &= sample.abs() < SILENCE_FLOOR;
+                    frame.push(sample * gain);
+                }
                 None if index == 0 => return None,
                 None => frame.push(0.0),
             }
         }
+
+        // Counted locally and published in blocks, so the common case is an
+        // increment on a register rather than an atomic per frame.
+        if quiet {
+            self.quiet_frames = self.quiet_frames.saturating_add(1);
+            if self.quiet_frames.is_multiple_of(SILENCE_BLOCK) {
+                self.silence.store(self.quiet_frames, Ordering::Relaxed);
+            }
+        } else if self.quiet_frames != 0 {
+            self.quiet_frames = 0;
+            self.silence.store(0, Ordering::Relaxed);
+        }
+
         Some(frame)
     }
 }
+
+/// Below this a sample counts as silence, for finding the end of the music.
+///
+/// -60 dBFS. Inaudible against anything, and comfortably above the noise floor
+/// of a lossy encode -- so a fade-out reaches it only once it has genuinely
+/// finished fading.
+const SILENCE_FLOOR: f32 = 0.001;
+
+/// How many frames between publishing the silent-frame count.
+const SILENCE_BLOCK: u32 = 64;
 
 /// Below this the glide is finished and the target is taken exactly.
 ///
@@ -1255,6 +1626,7 @@ fn start(
     sink: &rodio::MixerDeviceSink,
     decoded: Box<dyn Source + Send>,
     chain: &Chain,
+    track_gain: &Arc<AtomicU32>,
 ) -> Player {
     // Appended *before* the queue reaches the mixer, which is not fussiness.
     //
@@ -1275,12 +1647,28 @@ fn start(
     let (player, queue) = Player::new();
     // Left at unity deliberately: `Levelled` owns the gain, because the
     // limiter has to see the sample the device will actually receive.
-    player.append(Levelled::new(
-        Equalised::new(decoded, Arc::clone(&chain.eq)),
-        Arc::clone(&chain.volume),
-    ));
+    append(&player, decoded, chain, track_gain);
     sink.mixer().add(queue);
     player
+}
+
+/// Puts a decode through the level and equaliser stages and into `player`.
+///
+/// The one place a source is dressed for playback, so a track appended behind
+/// another is dressed identically to one that started on its own -- equaliser,
+/// slider, limiter, and its own loudness correction.
+fn append(
+    player: &Player,
+    decoded: Box<dyn Source + Send>,
+    chain: &Chain,
+    track_gain: &Arc<AtomicU32>,
+) {
+    player.append(Levelled::with_track(
+        Equalised::new(decoded, Arc::clone(&chain.eq)),
+        Arc::clone(&chain.volume),
+        Arc::clone(track_gain),
+        Arc::clone(&chain.silence),
+    ));
 }
 
 /// Builds the decoder for a source, ready to be appended.
@@ -1420,7 +1808,7 @@ mod tests {
         let engine = spawn(tx, ffmpeg);
 
         let played = engine
-            .play(PlayableSource::LocalFile(wav), None, Duration::ZERO, 1)
+            .play(PlayableSource::LocalFile(wav), None, Duration::ZERO, 1, 1.0)
             .await;
         if let Err(e) = &played {
             // Only a missing audio device is a legitimate skip now.
@@ -2542,6 +2930,7 @@ mod loopback_probe {
                 None,
                 Duration::from_secs_f64(start_at),
                 1,
+                1.0,
             )
             .await
             .expect("the engine refused to play the file");
@@ -3001,6 +3390,7 @@ mod reopen_device_tests {
 
         let chain = Chain {
             volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            silence: Arc::new(AtomicU32::new(0)),
             eq: Arc::new(EqSettings::default()),
         };
 
@@ -3008,13 +3398,15 @@ mod reopen_device_tests {
         let built = build_source(&source, Some(&ffmpeg), device.rate(), Duration::ZERO)
             .expect("the fixture would not decode");
         let starved = built.starved.clone();
-        let player = start(&device.sink, built.decoded, &chain);
+        let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let player = start(&device.sink, built.decoded, &chain, &gain);
 
         (
             Ok(device),
             Some(player),
             Some(Loaded {
                 source,
+                gain,
                 starved,
                 offset: Duration::ZERO,
             }),
@@ -3132,6 +3524,7 @@ mod reopen_device_tests {
         let mut loaded = None;
         let chain = Chain {
             volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            silence: Arc::new(AtomicU32::new(0)),
             eq: Arc::new(EqSettings::default()),
         };
         let output_rate = Arc::new(AtomicU32::new(0));
@@ -3414,6 +3807,7 @@ mod reopen_audio_tests {
         // Distinctive on purpose: a reset would be flat and unity.
         let chain = Chain {
             volume: Arc::new(AtomicU32::new(0.375f32.to_bits())),
+            silence: Arc::new(AtomicU32::new(0)),
             eq: Arc::new(EqSettings::default()),
         };
         chain.eq.set_enabled(true);
@@ -3422,13 +3816,16 @@ mod reopen_audio_tests {
         let rate = device.as_ref().unwrap().rate();
         let built = build_source(&source, Some(&ffmpeg), rate, Duration::ZERO).unwrap();
         let starved = built.starved.clone();
+        let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let mut player = Some(start(
             &device.as_ref().unwrap().sink,
             built.decoded,
             &chain,
+            &gain,
         ));
         let mut loaded = Some(Loaded {
             source,
+            gain,
             starved,
             offset: Duration::ZERO,
         });
@@ -3480,19 +3877,23 @@ mod reopen_audio_tests {
         let output_rate = Arc::new(AtomicU32::new(device.as_ref().unwrap().rate()));
         let chain = Chain {
             volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            silence: Arc::new(AtomicU32::new(0)),
             eq: Arc::new(EqSettings::default()),
         };
 
         let rate = device.as_ref().unwrap().rate();
         let built = build_source(&source, Some(&ffmpeg), rate, Duration::ZERO).unwrap();
         let starved = built.starved.clone();
+        let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let mut player = Some(start(
             &device.as_ref().unwrap().sink,
             built.decoded,
             &chain,
+            &gain,
         ));
         let mut loaded = Some(Loaded {
             source,
+            gain,
             starved,
             offset: Duration::ZERO,
         });
@@ -3532,5 +3933,1125 @@ mod reopen_audio_tests {
             landed >= Duration::from_secs(3) && landed < Duration::from_millis(3_500),
             "the seek landed at {landed:?} rather than 3s"
         );
+    }
+}
+
+/// Does the device watcher disturb ordinary playback?
+///
+/// The question a user asked after it landed: the music sounds different.
+/// Structurally nothing in the sample path changed, and the stream this opens
+/// has the same rate, channel count, format and buffer size as the one it
+/// opened before -- but "should be identical" is not a measurement, and the
+/// two things that *would* be audible are both observable from here.
+///
+/// A reopen is a gap and a decoder restart. A stall is the decoder running dry,
+/// which the engine covers with silence. Either, happening repeatedly, is
+/// exactly what "weird and dirtier" sounds like.
+#[cfg(test)]
+mod steady_state_tests {
+    use super::*;
+
+    /// Long enough to cross a liveness tick, which is the one new thing that
+    /// speaks to the engine on a timer.
+    const WATCH_FOR: Duration = Duration::from_secs(70);
+
+    fn write_silence(path: &Path, seconds: u32) {
+        use std::io::Write;
+
+        const RATE: u32 = 44_100;
+        let samples: u32 = RATE * seconds;
+        let data_len = samples * 2;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&RATE.to_le_bytes());
+        b.extend_from_slice(&(RATE * 2).to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        b.extend_from_slice(&vec![0u8; data_len as usize]);
+
+        std::fs::File::create(path).unwrap().write_all(&b).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real output device and runs for over a minute"]
+    async fn nothing_disturbs_a_track_that_is_simply_playing() {
+        let ffmpeg = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg);
+        assert!(ffmpeg.is_some(), "the staged ffmpeg sidecar is missing");
+
+        let dir = std::env::temp_dir().join("music-app-steady-state");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("long.wav");
+        write_silence(&wav, 120);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = spawn(tx, ffmpeg);
+
+        engine
+            .play(PlayableSource::LocalFile(wav), None, Duration::ZERO, 1, 1.0)
+            .await
+            .expect("the engine refused to play the fixture");
+
+        let mut reopens = 0;
+        let mut stalls = 0;
+        let mut finished = 0;
+        let mut progress: Vec<Duration> = Vec::new();
+
+        let deadline = tokio::time::Instant::now() + WATCH_FOR;
+        while let Ok(Some(event)) =
+            tokio::time::timeout_at(deadline, rx.recv()).await
+        {
+            match event {
+                EngineEvent::Output { name, error } => {
+                    reopens += 1;
+                    eprintln!("  REOPEN name={name:?} error={error:?}");
+                }
+                EngineEvent::Stalled { stalled, .. } => {
+                    if stalled {
+                        stalls += 1;
+                        eprintln!("  STALL");
+                    }
+                }
+                EngineEvent::Finished { .. } => finished += 1,
+                EngineEvent::Progress { position, .. } => progress.push(position),
+            }
+        }
+
+        // The gaps between progress reports say whether the engine's loop kept
+        // its cadence. It reports every 4th poll, so ~200 ms; a loop held up by
+        // device work would show as gaps well past that.
+        let mut worst_gap = Duration::ZERO;
+        for pair in progress.windows(2) {
+            worst_gap = worst_gap.max(pair[1].saturating_sub(pair[0]));
+        }
+
+        eprintln!(
+            "over {WATCH_FOR:?}: {reopens} reopens, {stalls} stalls, {finished} finished, \
+             {} progress reports, worst gap {worst_gap:?}",
+            progress.len()
+        );
+
+        assert_eq!(
+            reopens, 0,
+            "the output was reopened during ordinary playback -- every one of \
+             those is a gap and a decoder restart"
+        );
+        assert_eq!(
+            stalls, 0,
+            "the decoder ran dry during ordinary playback, which the engine \
+             covers with inserted silence"
+        );
+        assert!(
+            progress.len() > 250,
+            "only {} progress reports in {WATCH_FOR:?}; the engine loop is not \
+             keeping its cadence",
+            progress.len()
+        );
+        assert!(
+            worst_gap < Duration::from_millis(600),
+            "the engine loop stopped reporting for {worst_gap:?} -- something is \
+             blocking the thread that feeds the mixer"
+        );
+
+        drop(engine);
+    }
+}
+
+/// Listening to what this app actually puts out, and measuring it.
+///
+/// The three checks above -- the sample path is byte-identical to before, the
+/// stream config is identical, nothing reopens or stalls -- are all arguments
+/// that the audio *should* be unchanged. This is the one that hears it.
+///
+/// A tone is played through the real engine to the real sound card, recorded
+/// back off the endpoint by WASAPI loopback, and measured. Distortion has
+/// nowhere to hide in a sine: everything that is not the fundamental is
+/// something the chain added.
+#[cfg(test)]
+mod output_quality_tests {
+    use super::*;
+    use rodio::cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+    const TONE_HZ: f32 = 997.0;
+    const CAPTURE_SECS: f32 = 4.0;
+
+    /// 997 Hz, not 1000: at 48 kHz an exact 1 kHz lands on a bin boundary and
+    /// every harmonic lands on one too, which flatters the measurement. A prime
+    /// frequency spreads them the way real music does.
+    fn write_tone(path: &Path, seconds: u32) {
+        use std::io::Write;
+
+        const RATE: u32 = 48_000;
+        let samples: u32 = RATE * seconds;
+        let data_len = samples * 4; // stereo, 16-bit
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&RATE.to_le_bytes());
+        b.extend_from_slice(&(RATE * 4).to_le_bytes());
+        b.extend_from_slice(&4u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+
+        for n in 0..samples {
+            let t = n as f32 / RATE as f32;
+            // -6 dBFS, so the limiter has nothing to do and what comes back is
+            // the chain rather than the limiter's opinion of it.
+            let v = (std::f32::consts::TAU * TONE_HZ * t).sin() * 0.5;
+            let s = (v * 32_767.0) as i16;
+            b.extend_from_slice(&s.to_le_bytes());
+            b.extend_from_slice(&s.to_le_bytes());
+        }
+
+        std::fs::File::create(path).unwrap().write_all(&b).unwrap();
+    }
+
+    /// Goertzel: the energy at one frequency, without a whole FFT.
+    fn energy_at(samples: &[f32], rate: f32, freq: f32) -> f32 {
+        let k = std::f32::consts::TAU * freq / rate;
+        let coeff = 2.0 * k.cos();
+        let (mut s1, mut s2) = (0.0f32, 0.0f32);
+
+        for &x in samples {
+            let s0 = x + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+
+        (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0).sqrt() / samples.len() as f32
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real output device, records the endpoint, runs in real time"]
+    async fn the_output_is_a_clean_tone() {
+        let ffmpeg = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg);
+        assert!(ffmpeg.is_some(), "the staged ffmpeg sidecar is missing");
+
+        let dir = std::env::temp_dir().join("music-app-output-quality");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        write_tone(&wav, 20);
+
+        // Loopback capture of the endpoint, started before anything plays.
+        let host = rodio::cpal::default_host();
+        let device = host
+            .default_output_device()
+            .expect("no default output device");
+        let supported = device
+            .default_output_config()
+            .expect("the device reports no config");
+        let rate = supported.sample_rate() as f32;
+        let channels = supported.channels() as usize;
+
+        let captured = Arc::new(Mutex::new(Vec::<f32>::new()));
+        let sink = Arc::clone(&captured);
+        let stream = device
+            .build_input_stream(
+                &supported.into(),
+                move |data: &[f32], _: &rodio::cpal::InputCallbackInfo| {
+                    if let Ok(mut buf) = sink.lock() {
+                        buf.extend_from_slice(data);
+                    }
+                },
+                |e| eprintln!("capture error: {e}"),
+                None,
+            )
+            .expect("could not open loopback capture");
+        stream.play().expect("could not start capture");
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = spawn(tx, ffmpeg);
+        engine.set_volume(1.0).expect("set volume");
+        engine
+            .play(PlayableSource::LocalFile(wav), None, Duration::ZERO, 1, 1.0)
+            .await
+            .expect("the engine refused to play the tone");
+
+        tokio::time::sleep(Duration::from_secs_f32(CAPTURE_SECS + 1.0)).await;
+        drop(stream);
+        drop(engine);
+
+        let all = captured.lock().unwrap().clone();
+        // Skip the first second: the stream ramping up and the decoder
+        // prefilling are not what is being measured.
+        let skip = (rate as usize) * channels;
+        let mono: Vec<f32> = all
+            .iter()
+            .skip(skip)
+            .step_by(channels)
+            .copied()
+            .take(rate as usize * 2)
+            .collect();
+
+        assert!(
+            mono.len() > rate as usize,
+            "captured only {} frames -- loopback recorded nothing",
+            mono.len()
+        );
+
+        let peak = mono.iter().fold(0.0f32, |w, s| w.max(s.abs()));
+        assert!(
+            peak > 0.1,
+            "the endpoint was silent (peak {peak}); nothing was playing, so \
+             this measures nothing"
+        );
+
+        let fundamental = energy_at(&mono, rate, TONE_HZ);
+        let harmonics: Vec<f32> = (2..=6)
+            .map(|n| energy_at(&mono, rate, TONE_HZ * n as f32))
+            .collect();
+
+        let thd = (harmonics.iter().map(|h| h * h).sum::<f32>()).sqrt() / fundamental;
+        let db = |x: f32| 20.0 * (x.max(1e-12) / fundamental).log10();
+
+        eprintln!("captured {} frames at {rate} Hz, peak {peak:.4}", mono.len());
+        eprintln!("fundamental {TONE_HZ} Hz");
+        for (n, h) in harmonics.iter().enumerate() {
+            eprintln!("  H{}  {:>8.2} dB", n + 2, db(*h));
+        }
+        eprintln!("THD {:.4}% ({:.1} dB)", thd * 100.0, 20.0 * thd.log10());
+
+        // Whether anything else was on the endpoint while this recorded. A
+        // lone -6 dBFS sine has an RMS of 0.3536; music mixed in alongside it
+        // would raise this without touching the harmonic bins, and would make
+        // the THD above look better than the chain deserves.
+        let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len() as f32).sqrt();
+        eprintln!("RMS {rms:.4} (a lone -6 dBFS sine is 0.3536)");
+        for probe in [311.0f32, 3121.0, 7433.0, 13007.0] {
+            eprintln!("  {probe:>7.0} Hz  {:>8.2} dB", db(energy_at(&mono, rate, probe)));
+        }
+
+        assert!(
+            thd < 0.01,
+            "the endpoint carried {:.3}% distortion on a -6 dBFS tone, which is \
+             the chain adding something audible",
+            thd * 100.0
+        );
+    }
+}
+
+
+/// Where the level of a track comes from.
+///
+/// The slider and the track's own correction used to be one number, multiplied
+/// by the coordinator and pushed into one cell. That is indistinguishable from
+/// this while every track begins with a `Play` command -- and it is the thing
+/// that breaks when a track can begin because the one before it ended, since
+/// the correction would then be applied a poll interval *into* the song.
+#[cfg(test)]
+mod level_tests {
+    use super::*;
+
+    const RATE: u32 = 48_000;
+
+    fn cell(value: f32) -> Arc<AtomicU32> {
+        Arc::new(AtomicU32::new(value.to_bits()))
+    }
+
+    /// A steady full-scale-ish signal, long enough that the 30 ms glide has
+    /// finished well before the end.
+    fn steady(samples: usize) -> rodio::buffer::SamplesBuffer {
+        rodio::buffer::SamplesBuffer::new(
+            rodio::ChannelCount::new(2).unwrap(),
+            rodio::SampleRate::new(RATE).unwrap(),
+            vec![0.5f32; samples],
+        )
+    }
+
+    /// What comes out once the glide has settled.
+    fn settled(slider: f32, track: f32) -> f32 {
+        let out: Vec<f32> = Levelled::with_track(steady(RATE as usize), cell(slider), cell(track), cell(0.0))
+            .collect();
+        // The last frame, by which point any glide is long over.
+        *out.last().expect("the stage produced nothing")
+    }
+
+    /// The two cells multiply. This is the arithmetic the coordinator used to
+    /// do before the numbers reached the audio thread.
+    #[test]
+    fn the_slider_and_the_correction_multiply() {
+        let out = settled(0.5, 0.5);
+
+        assert!(
+            (out - 0.125).abs() < 1e-4,
+            "a 0.5 slider on a 0.5 correction gave {out}, not 0.125"
+        );
+    }
+
+    /// Unity on both is still bit-exact. The stage is in the path of every
+    /// sample this app plays, so "does nothing" has to mean *nothing*.
+    #[test]
+    fn unity_on_both_cells_is_bit_exact() {
+        let out: Vec<f32> = Levelled::with_track(steady(2_048), cell(1.0), cell(1.0), cell(0.0)).collect();
+
+        assert!(
+            out.iter().all(|s| *s == 0.5),
+            "unity gain altered the signal, which no amount of levelling should"
+        );
+    }
+
+    /// The whole point: a track's correction reaches its *first* sample.
+    ///
+    /// `Levelled` starts at the product rather than gliding up to it, so a
+    /// track that needs -6 dB is at -6 dB immediately rather than a few
+    /// milliseconds in. Under the old arrangement the correction arrived
+    /// separately, after the track had already begun.
+    #[test]
+    fn a_track_starts_at_its_own_level_not_the_previous_ones() {
+        let out: Vec<f32> = Levelled::with_track(steady(64), cell(1.0), cell(0.5), cell(0.0)).collect();
+
+        assert_eq!(
+            out[0], 0.25,
+            "the first sample came out at {}, so the track opened at the wrong \
+             level and slid to the right one",
+            out[0]
+        );
+    }
+
+    /// Two tracks queued together each carry their own correction, which is
+    /// what makes a gapless handover level them independently. One shared cell
+    /// could not express this at all.
+    #[test]
+    fn two_tracks_hold_independent_corrections() {
+        let slider = cell(1.0);
+        let first = cell(0.5);
+        let second = cell(0.25);
+
+        let a: Vec<f32> =
+            Levelled::with_track(steady(64), Arc::clone(&slider), Arc::clone(&first), cell(0.0)).collect();
+        let b: Vec<f32> =
+            Levelled::with_track(steady(64), Arc::clone(&slider), Arc::clone(&second), cell(0.0)).collect();
+
+        assert_eq!(a[0], 0.25);
+        assert_eq!(b[0], 0.125);
+
+        // And moving the slider moves both, because that decision is the
+        // listener's and applies to everything.
+        slider.store(0.5f32.to_bits(), Ordering::Relaxed);
+        let a2: Vec<f32> =
+            Levelled::with_track(steady(64), Arc::clone(&slider), Arc::clone(&first), cell(0.0)).collect();
+        assert_eq!(a2[0], 0.125);
+    }
+
+    /// A correction that changes mid-track glides rather than stepping.
+    ///
+    /// This is the path a reading arriving mid-song takes, and a jump here is
+    /// a click -- the reason the glide exists at all.
+    #[test]
+    fn a_correction_that_changes_mid_track_glides() {
+        let track = cell(1.0);
+        let mut stage = Levelled::with_track(steady(RATE as usize), cell(1.0), Arc::clone(&track), cell(0.0));
+
+        // Settle at unity.
+        let opening: Vec<f32> = (&mut stage).take(256).collect();
+        assert_eq!(opening[255], 0.5);
+
+        // A -6 dB correction lands.
+        track.store(0.5f32.to_bits(), Ordering::Relaxed);
+        let after: Vec<f32> = (&mut stage).take(256).collect();
+
+        let step = (after[0] - opening[255]).abs();
+        assert!(
+            step < 0.01,
+            "the correction moved the signal by {step} between two adjacent \
+             samples, which is a click"
+        );
+        assert!(
+            after.last().unwrap() < &0.5,
+            "the correction never took effect"
+        );
+    }
+}
+
+/// The handover itself.
+///
+/// What makes gapless *gapless* is that the mixer is never handed an empty
+/// queue: the next track is appended to the player already running, so there
+/// is no teardown and no setup between the two. Everything below is about the
+/// consequences of that -- the engine has to notice a boundary it no longer
+/// causes, and it has to give up the queued track whenever anything else
+/// replaces the player.
+#[cfg(test)]
+mod gapless_tests {
+    use super::*;
+
+    /// A real PCM WAV of `seconds`, silent so the suite makes no noise.
+    fn write_wav(path: &Path, seconds: f32) {
+        use std::io::Write;
+
+        const RATE: u32 = 44_100;
+        let samples = (RATE as f32 * seconds) as u32;
+        let data_len = samples * 2;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&RATE.to_le_bytes());
+        b.extend_from_slice(&(RATE * 2).to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        b.extend_from_slice(&vec![0u8; data_len as usize]);
+
+        std::fs::File::create(path).unwrap().write_all(&b).unwrap();
+    }
+
+    fn fixture(name: &str, seconds: f32) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("music-app-gapless-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        write_wav(&wav, seconds);
+        wav
+    }
+
+    fn ffmpeg() -> PathBuf {
+        crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg)
+            .expect("the staged ffmpeg sidecar is missing")
+    }
+
+    fn decode(ffmpeg: &Path, source: &PlayableSource, rate: u32) -> BuiltSource {
+        build_source(source, Some(ffmpeg), rate, Duration::ZERO).expect("the fixture would not decode")
+    }
+
+    /// The claim: one track ends, the next is already playing, and the engine
+    /// says so in the same breath rather than reporting a bare end that would
+    /// have the coordinator start something.
+    #[tokio::test]
+    #[ignore = "needs a real output device and runs in real time"]
+    async fn a_queued_track_takes_over_without_the_player_stopping() {
+        let ffmpeg = ffmpeg();
+        let first = PlayableSource::LocalFile(fixture("first", 1.5));
+        let second = PlayableSource::LocalFile(fixture("second", 5.0));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = spawn(tx, Some(ffmpeg.clone()));
+        engine
+            .play(first, None, Duration::ZERO, 1, 1.0)
+            .await
+            .expect("the engine refused the first track");
+
+        let rate = engine.output_rate();
+        let prepared = tokio::task::spawn_blocking({
+            let ffmpeg = ffmpeg.clone();
+            let second = second.clone();
+            move || decode(&ffmpeg, &second, rate)
+        })
+        .await
+        .unwrap();
+
+        engine
+            .enqueue(second, prepared, 2, 1.0)
+            .await
+            .expect("the engine refused to queue the second track");
+
+        // Long enough for the 1.5 s track to end and the handover to be seen.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        let mut handover = None;
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if let EngineEvent::Finished { epoch, handed_to } = event {
+                handover = Some((epoch, handed_to));
+                break;
+            }
+        }
+
+        assert_eq!(
+            handover,
+            Some((1, Some(2))),
+            "the first track did not hand over to the queued one -- a bare \
+             `Finished` here means the audio stopped and the coordinator has \
+             to start the next track, which is the gap this removes"
+        );
+
+        // And it really is still playing: the position belongs to the second
+        // track, counted from its own start rather than continuing the first.
+        let position = engine.position().await;
+        assert!(
+            position < Duration::from_secs(3),
+            "the position after the handover was {position:?}, which is not the \
+             second track counted from its own beginning"
+        );
+
+        drop(engine);
+    }
+
+    /// Only one may wait. A second would need a queue of its own and buys
+    /// nothing, since the handover it exists for is one track away.
+    #[tokio::test]
+    #[ignore = "needs a real output device and runs in real time"]
+    async fn only_one_track_may_be_queued() {
+        let ffmpeg = ffmpeg();
+        let first = PlayableSource::LocalFile(fixture("one", 10.0));
+        let second = PlayableSource::LocalFile(fixture("two", 5.0));
+        let third = PlayableSource::LocalFile(fixture("three", 5.0));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = spawn(tx, Some(ffmpeg.clone()));
+        engine
+            .play(first, None, Duration::ZERO, 1, 1.0)
+            .await
+            .expect("the engine refused the first track");
+
+        let rate = engine.output_rate();
+        for (source, epoch, should_work) in [(second, 2, true), (third, 3, false)] {
+            let built = tokio::task::spawn_blocking({
+                let ffmpeg = ffmpeg.clone();
+                let source = source.clone();
+                move || decode(&ffmpeg, &source, rate)
+            })
+            .await
+            .unwrap();
+
+            let queued = engine.enqueue(source, built, epoch, 1.0).await;
+            assert_eq!(
+                queued.is_ok(),
+                should_work,
+                "queueing epoch {epoch} returned {queued:?}"
+            );
+        }
+
+        drop(engine);
+    }
+
+    /// Nothing playing is not something to follow.
+    #[tokio::test]
+    #[ignore = "needs a real output device"]
+    async fn queueing_with_nothing_playing_is_refused() {
+        let ffmpeg = ffmpeg();
+        let source = PlayableSource::LocalFile(fixture("alone", 3.0));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = spawn(tx, Some(ffmpeg.clone()));
+
+        let rate = engine.output_rate();
+        let built = tokio::task::spawn_blocking({
+            let ffmpeg = ffmpeg.clone();
+            let source = source.clone();
+            move || decode(&ffmpeg, &source, rate)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            engine.enqueue(source, built, 2, 1.0).await.is_err(),
+            "the engine queued a track behind nothing, which cannot hand over"
+        );
+
+        drop(engine);
+    }
+
+    /// Playing something else throws the queued track away.
+    ///
+    /// It has to: the appended source belongs to the player being replaced.
+    /// A record of a handover that can no longer happen would have the engine
+    /// announce one that never did.
+    #[tokio::test]
+    #[ignore = "needs a real output device and runs in real time"]
+    async fn playing_something_else_gives_up_the_queued_track() {
+        let ffmpeg = ffmpeg();
+        let first = PlayableSource::LocalFile(fixture("a", 10.0));
+        let second = PlayableSource::LocalFile(fixture("b", 5.0));
+        let third = PlayableSource::LocalFile(fixture("c", 5.0));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = spawn(tx, Some(ffmpeg.clone()));
+        engine
+            .play(first, None, Duration::ZERO, 1, 1.0)
+            .await
+            .expect("the engine refused the first track");
+
+        let rate = engine.output_rate();
+        let built = tokio::task::spawn_blocking({
+            let ffmpeg = ffmpeg.clone();
+            let second = second.clone();
+            move || decode(&ffmpeg, &second, rate)
+        })
+        .await
+        .unwrap();
+        engine.enqueue(second, built, 2, 1.0).await.expect("queued");
+
+        // The user presses Next.
+        engine
+            .play(third, None, Duration::ZERO, 3, 1.0)
+            .await
+            .expect("the engine refused the third track");
+
+        // Whatever the third track does, no handover to epoch 2 may be
+        // reported -- that source went with the player it was appended to.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if let EngineEvent::Finished { handed_to, .. } = event {
+                assert_ne!(
+                    handed_to,
+                    Some(2),
+                    "the engine handed over to a track it had already dropped"
+                );
+            }
+        }
+
+        // And the slot is genuinely free again, rather than still held by a
+        // track that no longer exists.
+        let fourth = PlayableSource::LocalFile(fixture("d", 5.0));
+        let built = tokio::task::spawn_blocking({
+            let ffmpeg = ffmpeg.clone();
+            let fourth = fourth.clone();
+            move || decode(&ffmpeg, &fourth, rate)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            engine.enqueue(fourth, built, 4, 1.0).await.is_ok(),
+            "the queue slot was still held by the track the `Play` discarded"
+        );
+
+        drop(engine);
+    }
+
+    /// Seeking gives the queued track up, and the slot with it.
+    ///
+    /// The rebuild is unavoidable -- `FfmpegSource` reads a pipe and cannot
+    /// reposition in place, so every seek restarts the decode, and the
+    /// appended source goes with the player being replaced. What matters is
+    /// that the engine *knows* it went, so the coordinator can queue the track
+    /// again before the end arrives. Seeking into the last few seconds of a
+    /// song is exactly when a listener is watching for the handover.
+    #[tokio::test]
+    #[ignore = "needs a real output device and runs in real time"]
+    async fn seeking_releases_the_queued_track_so_it_can_be_queued_again() {
+        let ffmpeg = ffmpeg();
+        let first = PlayableSource::LocalFile(fixture("seek-a", 10.0));
+        let second = PlayableSource::LocalFile(fixture("seek-b", 5.0));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = spawn(tx, Some(ffmpeg.clone()));
+        engine
+            .play(first, None, Duration::ZERO, 1, 1.0)
+            .await
+            .expect("the engine refused the first track");
+
+        let rate = engine.output_rate();
+        let built = tokio::task::spawn_blocking({
+            let ffmpeg = ffmpeg.clone();
+            let second = second.clone();
+            move || decode(&ffmpeg, &second, rate)
+        })
+        .await
+        .unwrap();
+        engine
+            .enqueue(second.clone(), built, 2, 1.0)
+            .await
+            .expect("the engine refused to queue the second track");
+
+        engine
+            .seek(Duration::from_secs(3))
+            .await
+            .expect("seeking failed");
+
+        // No handover may be announced. The seek built a *new* player holding
+        // one source, and a record of a queued track left standing across that
+        // makes the boundary detector read the rebuild as track one ending --
+        // so the engine would report a handover to a source that no longer
+        // exists, and then believe it was playing it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if let EngineEvent::Finished { handed_to, .. } = event {
+                panic!("the seek was reported as a handover to {handed_to:?}");
+            }
+        }
+
+        // The slot is free, which is the observable half of "the appended
+        // track went with the player". A refusal here would mean the engine
+        // still believed in a handover that can no longer happen.
+        let built = tokio::task::spawn_blocking({
+            let ffmpeg = ffmpeg.clone();
+            let second = second.clone();
+            move || decode(&ffmpeg, &second, rate)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            engine.enqueue(second, built, 3, 1.0).await.is_ok(),
+            "after a seek the engine would not queue anything, so a track \
+             seeked into near its end can never hand over"
+        );
+
+        drop(engine);
+    }
+
+    /// Cancelling drops the queued track and leaves the current one playing.
+    ///
+    /// For when the queue is reordered while a handover is already set up:
+    /// the appended source cannot be pulled back out, so this is the only way
+    /// to stop the wrong track from following.
+    #[tokio::test]
+    #[ignore = "needs a real output device and runs in real time"]
+    async fn cancelling_drops_the_queued_track_and_keeps_playing() {
+        let ffmpeg = ffmpeg();
+        let first = PlayableSource::LocalFile(fixture("cancel-a", 10.0));
+        let second = PlayableSource::LocalFile(fixture("cancel-b", 5.0));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = spawn(tx, Some(ffmpeg.clone()));
+        engine
+            .play(first, None, Duration::ZERO, 1, 1.0)
+            .await
+            .expect("the engine refused the first track");
+
+        let rate = engine.output_rate();
+        let built = tokio::task::spawn_blocking({
+            let ffmpeg = ffmpeg.clone();
+            let second = second.clone();
+            move || decode(&ffmpeg, &second, rate)
+        })
+        .await
+        .unwrap();
+        engine
+            .enqueue(second.clone(), built, 2, 1.0)
+            .await
+            .expect("queued");
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let before = engine.position().await;
+        engine.cancel_queued().expect("cancel");
+        // The rebuild is synchronous on the audio thread; give it a moment.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // The current track is still going, from roughly where it was.
+        let after = engine.position().await;
+        assert!(
+            after >= before,
+            "cancelling rewound the track that was playing: {before:?} -> {after:?}"
+        );
+        assert!(
+            after < before + Duration::from_secs(3),
+            "cancelling jumped the track forward: {before:?} -> {after:?}"
+        );
+
+        // And no handover to the cancelled track may ever be announced.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            if let EngineEvent::Finished { handed_to, .. } = event {
+                assert_ne!(
+                    handed_to,
+                    Some(2),
+                    "the engine handed over to a track that had been cancelled"
+                );
+            }
+        }
+
+        // The slot is free again.
+        let built = tokio::task::spawn_blocking({
+            let ffmpeg = ffmpeg.clone();
+            let second = second.clone();
+            move || decode(&ffmpeg, &second, rate)
+        })
+        .await
+        .unwrap();
+        assert!(
+            engine.enqueue(second, built, 3, 1.0).await.is_ok(),
+            "the queue slot was not released by cancelling"
+        );
+
+        drop(engine);
+    }
+
+    /// Cancelling with nothing queued must not disturb the track playing.
+    ///
+    /// It is called whenever the queue changes, which is far more often than
+    /// anything is actually appended -- so the common case has to be free.
+    #[tokio::test]
+    #[ignore = "needs a real output device and runs in real time"]
+    async fn cancelling_nothing_does_nothing() {
+        let ffmpeg = ffmpeg();
+        let only = PlayableSource::LocalFile(fixture("cancel-none", 10.0));
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = spawn(tx, Some(ffmpeg.clone()));
+        engine
+            .play(only, None, Duration::ZERO, 1, 1.0)
+            .await
+            .expect("the engine refused the track");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let before = engine.position().await;
+        engine.cancel_queued().expect("cancel");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after = engine.position().await;
+
+        assert!(
+            after > before,
+            "the track stopped advancing after a cancel that had nothing to \
+             cancel: {before:?} -> {after:?}"
+        );
+
+        drop(engine);
+    }
+}
+
+/// Does a decode prepared minutes in advance still play?
+///
+/// `prepare_next` builds the next track's decoder as soon as the current one
+/// starts. For a five-minute track that leaves a running ffmpeg process
+/// holding an open connection to YouTube, filling a 30-second buffer and then
+/// blocking on the pipe with nothing to do for four and a half minutes.
+///
+/// This is the question that decides whether "prepared early" is an
+/// optimisation or a trap, and it cannot be answered by reasoning: it depends
+/// on how long the far end tolerates an idle reader.
+#[cfg(test)]
+mod staleness_tests {
+    use super::*;
+
+    /// Seconds to leave the decoder idle before reading from it.
+    fn idle_secs() -> u64 {
+        std::env::var("PROBE_IDLE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90)
+    }
+
+    #[test]
+    #[ignore = "network: opens a real YouTube stream and waits"]
+    fn a_decode_left_waiting_still_produces_audio() {
+        let ffmpeg = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg)
+            .expect("the staged ffmpeg sidecar is missing");
+        let yt_dlp = crate::sidecar::staged_for_tests(crate::sidecar::Tool::YtDlp)
+            .expect("the staged yt-dlp sidecar is missing");
+
+        // The first of the two tracks that were reported as still gapping.
+        let page = "https://www.youtube.com/watch?v=QSBmYN2hsMA";
+        let url = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(crate::youtube::resolve_stream_url(
+                &yt_dlp,
+                page,
+                crate::stream_urls::Encoding::Preferred,
+            ))
+            .expect("could not resolve the stream")
+            .url;
+
+        let built = build_source(
+            &PlayableSource::Stream { url, cache: None },
+            Some(&ffmpeg),
+            48_000,
+            Duration::ZERO,
+        )
+        .expect("the stream would not decode");
+
+        let idle = idle_secs();
+        eprintln!("decoder open; leaving it idle for {idle}s");
+        std::thread::sleep(Duration::from_secs(idle));
+
+        // Read well past the 30-second network buffer. A live producer keeps
+        // filling it; a dead one leaves the source inserting silence, which is
+        // what would be handed over to seamlessly.
+        let channels = built.decoded.channels().get() as usize;
+        let want = 48_000 * channels * 45;
+        let samples: Vec<f32> = built.decoded.take(want).collect();
+
+        eprintln!("read {} of {want} samples", samples.len());
+
+        let window = 48_000 * channels * 5;
+        let tail = &samples[samples.len().saturating_sub(window)..];
+        let rms = (tail.iter().map(|s| s * s).sum::<f32>() / tail.len().max(1) as f32).sqrt();
+        let peak = tail.iter().fold(0.0f32, |w, s| w.max(s.abs()));
+
+        eprintln!("last 5s after the idle: rms {rms:.6}, peak {peak:.6}");
+
+        assert!(
+            peak > 0.01,
+            "after {idle}s idle the decoder is producing silence -- a track \
+             prepared this far ahead would hand over seamlessly into nothing, \
+             which is exactly the long silence that was reported"
+        );
+    }
+}
+
+/// Where does the music actually stop?
+///
+/// Two things can make a perfect handover still sound like a gap, and neither
+/// is in this app:
+///
+/// - **Trailing silence in the upload.** A YouTube track that ends at 4:55 and
+///   runs to 5:04 has nine seconds of nothing at the end, and playing it
+///   faithfully means playing the nothing.
+/// - **A stored duration that overstates the audio.** Queueing is triggered by
+///   how much is *left*, computed against `duration_secs`. If that number is
+///   more than the queueing window too large, the track ends before the
+///   remaining time ever drops far enough, and nothing is ever queued.
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    /// Below this, call it silence. -60 dBFS: inaudible against any music, and
+    /// well above the noise floor of a lossy encode.
+    const SILENT_BELOW: f32 = 0.001;
+
+    fn measure(page: &str, stored_secs: f64) {
+        let ffmpeg = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg)
+            .expect("the staged ffmpeg sidecar is missing");
+        let yt_dlp = crate::sidecar::staged_for_tests(crate::sidecar::Tool::YtDlp)
+            .expect("the staged yt-dlp sidecar is missing");
+
+        let url = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(crate::youtube::resolve_stream_url(
+                &yt_dlp,
+                page,
+                crate::stream_urls::Encoding::Preferred,
+            ))
+            .expect("could not resolve the stream")
+            .url;
+
+        let built = build_source(
+            &PlayableSource::Stream { url, cache: None },
+            Some(&ffmpeg),
+            48_000,
+            Duration::ZERO,
+        )
+        .expect("the stream would not decode");
+
+        let channels = built.decoded.channels().get() as usize;
+        let rate = built.decoded.sample_rate().get() as usize;
+        let frames_per_sec = rate * channels;
+
+        // The whole track. It arrives far faster than real time.
+        let samples: Vec<f32> = built.decoded.collect();
+        let decoded_secs = samples.len() as f64 / frames_per_sec as f64;
+
+        let last_loud = samples
+            .iter()
+            .rposition(|s| s.abs() > SILENT_BELOW)
+            .unwrap_or(0);
+        let music_ends_at = last_loud as f64 / frames_per_sec as f64;
+        let trailing = decoded_secs - music_ends_at;
+
+        eprintln!("--- {page}");
+        eprintln!("  stored duration_secs : {stored_secs:.1}s");
+        eprintln!("  actually decoded     : {decoded_secs:.1}s");
+        eprintln!("  music ends at        : {music_ends_at:.1}s");
+        eprintln!("  trailing silence     : {trailing:.1}s");
+        eprintln!(
+            "  stored minus decoded : {:+.1}s",
+            stored_secs - decoded_secs
+        );
+    }
+
+    #[test]
+    #[ignore = "network: decodes two real YouTube tracks end to end"]
+    fn how_the_reported_tracks_end() {
+        measure("https://www.youtube.com/watch?v=QSBmYN2hsMA", 304.0);
+        measure("https://www.youtube.com/watch?v=MdJGOEEJA4I", 223.0);
+    }
+}
+
+/// What preparing a cold stream actually costs, split by stage.
+///
+/// The question behind it: could the slice-and-sample trick that made cold
+/// loudness cheap also make cold *preparation* cheap? Only a measurement can
+/// say, and the two stages have to be separated -- one is a yt-dlp round trip
+/// and the other is ffmpeg reading the head of a stream, and they would be
+/// optimised in completely different ways.
+#[cfg(test)]
+mod prepare_cost_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "network: resolves and opens a real YouTube stream"]
+    fn what_preparing_a_cold_stream_costs() {
+        let ffmpeg = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg)
+            .expect("the staged ffmpeg sidecar is missing");
+        let yt_dlp = crate::sidecar::staged_for_tests(crate::sidecar::Tool::YtDlp)
+            .expect("the staged yt-dlp sidecar is missing");
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        for page in [
+            "https://www.youtube.com/watch?v=QSBmYN2hsMA",
+            "https://www.youtube.com/watch?v=MdJGOEEJA4I",
+        ] {
+            let started = std::time::Instant::now();
+            let url = runtime
+                .block_on(crate::youtube::resolve_stream_url(
+                    &yt_dlp,
+                    page,
+                    crate::stream_urls::Encoding::Preferred,
+                ))
+                .expect("could not resolve the stream")
+                .url;
+            let resolve = started.elapsed();
+
+            // What `prepare_next` does: open the decoder and wait for it to
+            // buffer enough to hand over. Nothing is downloaded -- this is a
+            // range read of the head of the file.
+            let opened = std::time::Instant::now();
+            let built = build_source(
+                &PlayableSource::Stream { url, cache: None },
+                Some(&ffmpeg),
+                48_000,
+                Duration::ZERO,
+            )
+            .expect("the stream would not decode");
+            let prefill = opened.elapsed();
+
+            eprintln!("--- {page}");
+            eprintln!("  yt-dlp resolve   : {resolve:>10.3?}");
+            eprintln!("  ffmpeg prefill   : {prefill:>10.3?}");
+            eprintln!("  total to prepare : {:>10.3?}", started.elapsed());
+
+            drop(built);
+        }
+    }
+
+    /// And the same resolve a second time, which is what actually happens.
+    ///
+    /// `prepare_next` goes through the URL cache, and playback of the current
+    /// track has usually already put the next one's URL in it. A measurement
+    /// of the cold path alone would overstate what a handover pays.
+    #[test]
+    #[ignore = "network"]
+    fn a_cached_url_costs_nothing_to_resolve_again() {
+        let yt_dlp = crate::sidecar::staged_for_tests(crate::sidecar::Tool::YtDlp)
+            .expect("the staged yt-dlp sidecar is missing");
+        let page = "https://www.youtube.com/watch?v=MdJGOEEJA4I";
+        let cache = crate::stream_urls::StreamUrlCache::default();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let first = std::time::Instant::now();
+        let _ = runtime
+            .block_on(cache.resolve(&yt_dlp, page, crate::stream_urls::Encoding::Preferred))
+            .expect("resolve failed");
+        let cold = first.elapsed();
+
+        let second = std::time::Instant::now();
+        let _ = runtime
+            .block_on(cache.resolve(&yt_dlp, page, crate::stream_urls::Encoding::Preferred))
+            .expect("resolve failed");
+        let warm = second.elapsed();
+
+        eprintln!("resolve cold: {cold:?}");
+        eprintln!("resolve warm: {warm:?}");
     }
 }

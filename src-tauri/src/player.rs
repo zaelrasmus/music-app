@@ -217,6 +217,10 @@ pub struct PlayerStatus {
     pub target_lufs: f32,
     /// Whether per-track loudness correction is on.
     pub normalize: bool,
+    /// Whether one track hands over to the next without a gap.
+    pub gapless: bool,
+    /// Whether a track ends when its music does rather than when its file does.
+    pub trim_silence: bool,
     /// Whether an unmeasured stream is measured before it starts playing.
     /// What the current track is being corrected by, in dB. `null` means it has
     /// not been measured yet, which is distinct from a measured correction of
@@ -333,6 +337,8 @@ pub enum PlayerCommand {
     SetTargetLufs(f32),
     /// Whether to correct each track towards a common loudness.
     SetNormalize(bool),
+    SetGapless(bool),
+    SetTrimSilence(bool),
     /// Whether the equaliser is in circuit at all.
     SetEqualizerEnabled(bool),
     /// Every band at once, in dB, low to high.
@@ -456,9 +462,51 @@ struct Coordinator<E: PlayerEvents> {
     /// `Some(0.0)`, which is a track measured and found to already sit at the
     /// target -- the UI needs to tell "not measured" from "no correction".
     track_gain_db: Option<f32>,
-    /// Incremented on every start. The engine echoes it back so a `Finished`
-    /// for a track we already moved past can be discarded.
+    /// The epoch of the track *playing*. The engine echoes it back so a
+    /// `Finished` for a track we already moved past can be discarded.
     epoch: u64,
+    /// The last epoch handed out, playing or merely queued.
+    ///
+    /// Separate from `epoch` because a queued track needs an identity before
+    /// it starts, and every guard here compares against what is playing.
+    /// Reserving one by bumping `epoch` made the engine's reports about the
+    /// track still playing look stale -- so progress stopped a few seconds
+    /// from the end, and the handover, when it came, was discarded too.
+    issued: u64,
+    /// Whether one track may be handed to the next without a gap.
+    ///
+    /// A device preference like volume, and off is bit-identical to the
+    /// behaviour before any of this existed: nothing is ever queued, so every
+    /// track begins with a `Play` exactly as it always did.
+    gapless: bool,
+    /// Whether a track ends when its music does rather than when its file does.
+    ///
+    /// Separate from `gapless`, because they fix different things. Gapless is
+    /// about this player: it stops *us* putting a gap between two tracks. This
+    /// is about the file -- a great many uploads run on for seconds after the
+    /// last note, and that silence is in the recording whatever the player
+    /// does. Wanting either without the other is coherent; some listeners want
+    /// every file played to its last sample.
+    trim_silence: bool,
+    /// The track appended behind the one playing, and the epoch it will become.
+    ///
+    /// Cleared by everything that makes the engine drop its player, because
+    /// the appended source goes with it -- and a record of a handover that
+    /// cannot happen is worse than none.
+    enqueued: Option<(u64, i64)>,
+    /// Whether anything audible has been heard from the track playing.
+    ///
+    /// Trimming a silent *tail* presupposes a head. A track that has been
+    /// quiet since it started has no tail to trim -- silence is simply what it
+    /// contains, and cutting it short would be playing less of the file than
+    /// the file holds.
+    heard_audio: bool,
+    /// How long the track playing runs for, when it is known.
+    ///
+    /// Only to decide *when* to queue the next one. Early enough that ffmpeg
+    /// has buffered, late enough that the queue is unlikely to change under
+    /// it -- and a track of unknown length simply never qualifies.
+    loaded_duration: Option<Duration>,
     /// Shared: a load runs on its own task and reaches the engine from there.
     engine: Arc<AudioEngine>,
     /// Where those tasks report back.
@@ -555,6 +603,16 @@ pub fn spawn<E: PlayerEvents>(
             track_gain_db: None,
             muted: false,
             epoch: 0,
+            issued: 0,
+            // The same default the frontend restores, so the two agree even if
+            // the restore never arrives. They used to differ -- off here, on
+            // there -- which meant a failed or late restore left the setting
+            // reading one way and behaving the other.
+            gapless: true,
+            trim_silence: true,
+            enqueued: None,
+            heard_audio: false,
+            loaded_duration: None,
             engine: Arc::new(engine),
             loads: loads_tx,
             levels: levels_tx,
@@ -774,11 +832,19 @@ impl<E: PlayerEvents> Coordinator<E> {
                 if let Some(track_id) = self.loaded {
                     self.track_gain_db = self.track_gain_for(track_id).await;
                 }
-                self.apply_volume();
+                self.apply_track_gain();
             }
 
             // Straight through to the shared atomics the audio thread reads.
             // No decode restart and no gap: the change lands on the next frame.
+            PlayerCommand::SetTrimSilence(on) => self.trim_silence = on,
+
+            PlayerCommand::SetGapless(on) => {
+                self.gapless = on;
+                // Nothing is un-queued. Whatever is already appended plays as
+                // it was going to; the setting decides the *next* handover.
+            }
+
             PlayerCommand::SetEqualizerEnabled(on) => {
                 self.engine.equaliser().set_enabled(on);
             }
@@ -810,7 +876,7 @@ impl<E: PlayerEvents> Coordinator<E> {
                 if let Some(track_id) = self.loaded {
                     self.track_gain_db = self.track_gain_for(track_id).await;
                 }
-                self.apply_volume();
+                self.apply_track_gain();
             }
 
             PlayerCommand::SetKeepAbandoned(enabled) => self.keep_abandoned = enabled,
@@ -837,6 +903,16 @@ impl<E: PlayerEvents> Coordinator<E> {
                             self.covered_from_zero = false;
                             self.last_position = position;
                             self.emit_progress(position);
+
+                            // A seek rebuilds the decode, and anything queued
+                            // behind it went with the player it was appended
+                            // to. Say so, and start preparing again: seeking
+                            // into the last few seconds of a track is exactly
+                            // when the handover matters, and it would be a
+                            // strange feature that worked everywhere except
+                            // where the user was looking.
+                            self.enqueued = None;
+                            self.prefetch_next();
                         }
                         // The decode could not be rebuilt from here, which is
                         // how the AAC failure shows up mid-listen: the track
@@ -876,7 +952,7 @@ impl<E: PlayerEvents> Coordinator<E> {
 
     async fn handle_engine_event(&mut self, event: EngineEvent) {
         match event {
-            EngineEvent::Finished { epoch } => {
+            EngineEvent::Finished { epoch, handed_to } => {
                 // A report about a track we already moved past -- the user
                 // pressed Next just as it ended. Ignoring it is what prevents
                 // a double advance.
@@ -892,6 +968,11 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // not an abandonment, so only this notices.
                 if !self.covered_from_zero {
                     self.consider_offline_copy();
+                }
+
+                if let Some(next_epoch) = handed_to {
+                    self.adopt_handover(next_epoch).await;
+                    return;
                 }
 
                 // The engine dropped its player, so nothing is decoded any
@@ -929,6 +1010,14 @@ impl<E: PlayerEvents> Coordinator<E> {
                         self.record_play();
                     }
                     self.emit_progress(position);
+                    // The one place that knows how close the end is, which is
+                    // the only thing deciding when to queue the next track --
+                    // and when the track has, for listening purposes, ended.
+                    if self.engine.silent_for().is_zero() {
+                        self.heard_audio = true;
+                    }
+                    self.enqueue_next().await;
+                    self.trim_silent_tail();
                 }
             }
 
@@ -1061,6 +1150,12 @@ impl<E: PlayerEvents> Coordinator<E> {
         self.begin_load(first, 0);
     }
 
+    /// Reserves an epoch nothing else will be given.
+    fn next_epoch(&mut self) -> u64 {
+        self.issued += 1;
+        self.issued
+    }
+
     fn begin_load(&mut self, candidate: Option<i64>, attempt: usize) {
         let Some(track_id) = candidate else {
             self.halt();
@@ -1068,8 +1163,13 @@ impl<E: PlayerEvents> Coordinator<E> {
             return;
         };
 
-        // Claims this load, which makes anything already in flight stale.
-        self.epoch += 1;
+        // Claims this load, which makes anything already in flight stale --
+        // including a track appended behind the one playing, which the engine
+        // drops with the player it was appended to.
+        self.enqueued = None;
+        self.heard_audio = false;
+        self.loaded_duration = None;
+        self.epoch = self.next_epoch();
         let epoch = self.epoch;
 
         // Consumed here: a resume applies to the track being resumed, and
@@ -1090,10 +1190,26 @@ impl<E: PlayerEvents> Coordinator<E> {
         {
             let engine = Arc::clone(&self.engine);
             let loads = self.loads.clone();
+            // Turned into a level here rather than when it was prepared: the
+            // target may have moved, or normalisation been switched off, in
+            // the minutes since. This is the last moment the answer can be
+            // right, and it is still before the first sample.
+            let track_gain = match (self.normalize, ready.measured) {
+                (true, Some(measured)) => {
+                    rodio::math::db_to_linear(crate::loudness::gain_db(measured, self.target_lufs))
+                }
+                _ => 1.0,
+            };
 
             tauri::async_runtime::spawn(async move {
                 let result = engine
-                    .play(ready.source, Some(ready.decoded), Duration::ZERO, epoch)
+                    .play(
+                        ready.source,
+                        Some(ready.decoded),
+                        Duration::ZERO,
+                        epoch,
+                        track_gain,
+                    )
                     .await;
 
                 let _ = loads.send(LoadOutcome {
@@ -1165,7 +1281,8 @@ impl<E: PlayerEvents> Coordinator<E> {
                 // Before `apply_volume`, so the track starts at its own level
                 // rather than at the previous track's for a poll interval.
                 self.track_gain_db = self.track_gain_for(outcome.track_id).await;
-                self.apply_volume();
+                self.apply_track_gain();
+                self.loaded_duration = self.duration_of(outcome.track_id).await;
                 // Only after the gain is known, so a track that already has a
                 // reading is never sampled. This is the cold-stream case and
                 // nothing else.
@@ -1228,6 +1345,238 @@ impl<E: PlayerEvents> Coordinator<E> {
         }
     }
 
+
+    /// How close to the end of a track the next one is queued.
+    ///
+    /// Late, deliberately. Once appended a source cannot be un-appended --
+    /// rodio can clear a player's whole queue but not its tail -- so anything
+    /// that changes what plays next has to throw away the running player and
+    /// rebuild it. That is exactly the work every track used to cost, so it is
+    /// never *wrong*, only wasteful; queueing late is what makes it rare.
+    ///
+    /// Far enough out that ffmpeg's prefill is long finished, since the decode
+    /// was prepared earlier still.
+    const ENQUEUE_WITHIN: Duration = Duration::from_secs(8);
+
+    /// How long the output must be silent before the track is called finished.
+    ///
+    /// Three seconds of true digital silence. A dramatic pause inside a song
+    /// carries a reverb tail and a noise floor well above -60 dBFS, so this is
+    /// reached by a track that has actually stopped rather than one being
+    /// quiet -- and three seconds is longer than the pause before almost every
+    /// false ending, which is the failure that would actually cost music.
+    const SILENT_TAIL: Duration = Duration::from_secs(3);
+
+    /// How near the end a silent tail may be trimmed.
+    ///
+    /// Twenty seconds. Wide enough for the tails actually seen -- the track
+    /// that prompted this runs on for fourteen and a half seconds after its
+    /// last note -- and narrow enough that a false ending further back than
+    /// that is out of reach entirely.
+    ///
+    /// The pair of thresholds is the whole safety argument: to lose music, a
+    /// song would need more than three seconds of *digital* silence starting
+    /// within twenty seconds of its end, and then more music after it.
+    const TRIM_WITHIN: Duration = Duration::from_secs(20);
+
+    /// Ends a track whose music has stopped but whose file has not.
+    ///
+    /// The gap this removes is not one this app creates. A great many uploads
+    /// run on after the last note -- fourteen seconds, in the track that
+    /// prompted this -- and playing that faithfully is a silence between songs
+    /// however seamless the handover after it is.
+    ///
+    /// Tied to the gapless setting, because it is the same promise: the record
+    /// should run the way it was meant to. Switching that off plays every file
+    /// to its last sample, silence included.
+    fn trim_silent_tail(&mut self) {
+        if !self.trim_silence {
+            return;
+        }
+
+        let Some(duration) = self.loaded_duration else {
+            return;
+        };
+        if duration.saturating_sub(self.last_position) > Self::TRIM_WITHIN {
+            return;
+        }
+
+        // Nothing audible yet means nothing to trim: see `heard_audio`.
+        if !self.heard_audio {
+            return;
+        }
+
+        // A stalled decoder emits silence to cover the shortfall, which at the
+        // output is indistinguishable from a track that has ended. The engine
+        // zeroes the count while starving; this is the second line of the same
+        // defence, for the window before a stall is confirmed.
+        if self.stalled {
+            return;
+        }
+
+        if self.engine.silent_for() >= Self::SILENT_TAIL {
+            // Best effort: if it fails the track simply plays out, which is
+            // what it did before any of this.
+            let _ = self.engine.skip_tail();
+        }
+    }
+
+    /// Hands the prepared next track to the engine, to follow this one.
+    ///
+    /// Best effort in the strongest sense: every failure leaves the ordinary
+    /// path untouched, and the ordinary path is what shipped before gapless
+    /// existed. The cost of a refusal is a gap, never a track.
+    async fn enqueue_next(&mut self) {
+        if !self.gapless || self.enqueued.is_some() {
+            return;
+        }
+
+        // Only when the end is close. See `ENQUEUE_WITHIN`.
+        let Some(duration) = self.loaded_duration else {
+            return;
+        };
+        if duration.saturating_sub(self.last_position) > Self::ENQUEUE_WITHIN {
+            return;
+        }
+
+        // Repeat-one replays the track that is playing, and `peek_next` does
+        // not describe that: it reports the next track in the *list*. Queueing
+        // that would hand over to a track the end-of-track path then refuses,
+        // and the resynchronisation costs a full cold load -- a longer silence
+        // than there would have been with no gapless at all.
+        //
+        // Looping one track into itself seamlessly would need a second decode
+        // of the same track, which is a different feature.
+        if self.queue.repeat() == crate::queue::RepeatMode::One {
+            return;
+        }
+
+        // What the queue says comes next has to still be what was prepared.
+        let Some(next_id) = self.queue.peek_next() else {
+            return;
+        };
+        let Some(ready) = self.prepared.take().filter(|r| r.track_id == next_id) else {
+            return;
+        };
+
+        // Turned into a level here, with the settings in force now -- the same
+        // reasoning as the handover path in `begin_load`, and the last moment
+        // the answer can be right while still preceding the first sample.
+        let track_gain = match (self.normalize, ready.measured) {
+            (true, Some(measured)) => {
+                rodio::math::db_to_linear(crate::loudness::gain_db(measured, self.target_lufs))
+            }
+            _ => 1.0,
+        };
+
+        // Claimed before the engine is asked, so the epoch the engine echoes
+        // back in `Finished` is one this already knows about.
+        let next_epoch = self.next_epoch();
+
+        if self
+            .engine
+            .enqueue(ready.source, ready.decoded, next_epoch, track_gain)
+            .await
+            .is_ok()
+        {
+            // Deliberately *not* assigned to `self.epoch`: the track playing
+            // still owns that, and its progress and its eventual end are both
+            // reported under it.
+            self.enqueued = Some((next_epoch, next_id));
+        } else {
+            // Refused: nothing playing to follow, something already queued, or
+            // a decode that no longer suits the device. The decode went with
+            // the attempt, so prepare another -- without this, a single
+            // refusal leaves the next track to load from cold, which is a
+            // longer gap than there would have been with no gapless at all.
+            self.prefetch_next();
+        }
+    }
+
+    /// Takes over from a handover the engine has already performed.
+    ///
+    /// The track is *already sounding* by the time this runs. So this may not
+    /// start anything -- the queue pointer and the coordinator's idea of what
+    /// is playing have to catch up to audio that is ahead of them, which is
+    /// the exact inverse of every other path here.
+    async fn adopt_handover(&mut self, next_epoch: u64) {
+        let claimed = self
+            .enqueued
+            .take()
+            .filter(|(epoch, _)| *epoch == next_epoch)
+            .map(|(_, track_id)| track_id);
+
+        // Advances the queue the same way an ordinary end does, so the two
+        // cannot disagree about what "next" meant.
+        let advanced = self
+            .queue
+            .on_finished()
+            .or_else(|| self.queue.promote_loop_to_repeat());
+
+        let Some(track_id) = claimed.filter(|id| Some(*id) == advanced) else {
+            // The engine handed over to something this no longer agrees with.
+            // Stopping and starting the queue's own answer costs a gap and
+            // resynchronises, which beats leaving the two out of step.
+            self.enqueued = None;
+            self.loaded = None;
+            match advanced {
+                Some(track_id) => self.start(Some(track_id)),
+                None => self.halt(),
+            }
+            self.emit_state();
+            self.emit_queue().await;
+            self.prefetch_next();
+            return;
+        };
+
+        self.epoch = next_epoch;
+        self.loaded = Some(track_id);
+        self.state = PlaybackState::Playing;
+        self.stalled = false;
+        self.stalled_since = None;
+        // It began at zero and has been decoded from there, which is what
+        // makes it worth keeping a copy of.
+        self.covered_from_zero = true;
+        self.recorded_play = false;
+        self.heard_audio = false;
+        self.last_position = Duration::ZERO;
+        self.resume_at = None;
+
+        // The engine already levelled it from the reading carried with the
+        // decode. This re-reads it so the *settings panel* agrees, and so a
+        // reading that landed since preparation is picked up.
+        self.track_gain_db = self.track_gain_for(track_id).await;
+        self.apply_track_gain();
+        self.loaded_duration = self.duration_of(track_id).await;
+
+        self.measure_while_playing(track_id);
+        self.emit_progress(Duration::ZERO);
+        self.emit_state();
+        self.emit_queue().await;
+        self.prefetch_next();
+    }
+
+    /// How long a track runs for, as the database has it.
+    ///
+    /// `&mut self` for the same reason every other query here takes it: a
+    /// shared borrow held across an await makes the whole coordinator have to
+    /// be `Sync`, and the prepared decoder it holds is `Send` but not `Sync`.
+    async fn duration_of(&mut self, track_id: i64) -> Option<Duration> {
+        // `i64`, because that is what the column is. Asking sqlx for an `f64`
+        // from an INTEGER column is a decode error, not a conversion -- and
+        // the error goes into `.ok()` and disappears, leaving every track
+        // looking like one of unknown length. Which is exactly what happened:
+        // gapless never fired, because the one thing deciding *when* to queue
+        // the next track could never answer.
+        let secs: Option<i64> = sqlx::query_scalar("SELECT duration_secs FROM tracks WHERE id = ?")
+            .bind(track_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+
+        secs.filter(|s| *s > 0).map(|s| Duration::from_secs(s as u64))
+    }
     /// Resolves the next track's stream while the current one is still
     /// playing.
     ///
@@ -1240,7 +1589,23 @@ impl<E: PlayerEvents> Coordinator<E> {
     /// resolves normally and reports anything that genuinely matters. The
     /// worst case is that a track starts exactly as slowly as it used to.
     fn prefetch_next(&mut self) {
-        let Some(track_id) = self.queue.peek_next() else {
+        let next = self.queue.peek_next();
+
+        // Something is already appended behind the current track, and it is
+        // not what comes next any more -- the queue was reordered, or the
+        // track was removed from it. It cannot be pulled back out, so the
+        // engine drops it by rebuilding, which costs a short break. Rare, and
+        // the alternative is hearing the wrong track.
+        if self
+            .enqueued
+            .as_ref()
+            .is_some_and(|(_, id)| Some(*id) != next)
+        {
+            self.enqueued = None;
+            let _ = self.engine.cancel_queued();
+        }
+
+        let Some(track_id) = next else {
             // Nothing follows: release whatever was held for a track that is
             // no longer next, so its ffmpeg does not linger.
             self.prepared = None;
@@ -1249,6 +1614,16 @@ impl<E: PlayerEvents> Coordinator<E> {
 
         // What is held no longer matches what is coming.
         if self.prepared.as_ref().is_some_and(|r| r.track_id != track_id) {
+            self.prepared = None;
+        }
+
+        // Or matches the track but not the device. Preparing is triggered by
+        // queueing, which can happen before the output device has finished
+        // opening -- and a decode built against the fallback rate is one the
+        // engine will refuse, rebuild on its own thread, and charge the gap
+        // for. Dropping it here is what gets it built again, correctly.
+        let rate = self.engine.output_rate();
+        if self.prepared.as_ref().is_some_and(|r| r.rate != rate) {
             self.prepared = None;
         }
 
@@ -1590,16 +1965,14 @@ impl<E: PlayerEvents> Coordinator<E> {
             // Blocking: building a decoder waits for ffmpeg to produce its
             // first half second. On a worker thread that is fine; on the
             // runtime it would stall every other task.
+            // Read once, so what is recorded on `Prepared` is exactly what the
+            // decode was built for.
+            let rate = engine_for_build.output_rate();
             let source_for_build = source.clone();
             let built = tauri::async_runtime::spawn_blocking(move || {
                 // The device rate, so the decode comes back at the rate rodio
                 // is already mixing at and never has to be resampled.
-                engine::build_source(
-                    &source_for_build,
-                    ffmpeg.as_deref(),
-                    engine_for_build.output_rate(),
-                    Duration::ZERO,
-                )
+                engine::build_source(&source_for_build, ffmpeg.as_deref(), rate, Duration::ZERO)
             })
             .await;
 
@@ -1608,6 +1981,8 @@ impl<E: PlayerEvents> Coordinator<E> {
                     track_id,
                     source,
                     decoded,
+                    measured: crate::loudness::stored(&pool, track_id).await,
+                    rate,
                 });
             }
         });
@@ -1616,9 +1991,11 @@ impl<E: PlayerEvents> Coordinator<E> {
     fn halt(&mut self) {
         self.stalled = false;
         self.stalled_since = None;
+        self.enqueued = None;
+        self.loaded_duration = None;
         // Bump the epoch so any in-flight `Finished` for the stopped track is
         // discarded rather than triggering an advance.
-        self.epoch += 1;
+        self.epoch = self.next_epoch();
         self.state = PlaybackState::Stopped;
         self.loaded = None;
         self.report(self.engine.stop(self.epoch));
@@ -1631,14 +2008,34 @@ impl<E: PlayerEvents> Coordinator<E> {
     /// the correction belongs to the track. Anything that would clip is caught
     /// by the look-ahead limiter in `engine.rs`, which is what makes a *boost*
     /// safe to apply at all.
+    /// Two independent decisions, sent as two independent numbers.
+    ///
+    /// They used to be multiplied here and pushed into one cell, which quietly
+    /// made the correction a property of *when it was sent* rather than of the
+    /// track it was measured from. That was invisible while every track began
+    /// with a `Play` command -- and it is exactly what breaks when a track can
+    /// start because the one before it ended.
     fn apply_volume(&self) {
         let slider = slider_to_linear(self.volume, self.muted, self.ceiling_db);
-        let correction = if self.normalize {
+        self.report(self.engine.set_volume(slider));
+    }
+
+    /// The correction for the track playing now.
+    ///
+    /// Sent whenever the answer changes underneath a track already playing: a
+    /// reading arriving mid-song, normalisation being toggled, the target
+    /// moving. The level a track *starts* at travels with it instead.
+    fn apply_track_gain(&self) {
+        self.report(self.engine.set_track_gain(self.track_gain_linear()));
+    }
+
+    /// What the current reading is worth, as a linear multiplier.
+    fn track_gain_linear(&self) -> f32 {
+        if self.normalize {
             rodio::math::db_to_linear(self.track_gain_db.unwrap_or(0.0))
         } else {
             1.0
-        };
-        self.report(self.engine.set_volume(slider * correction));
+        }
     }
 
     /// Starts measuring a track that is already playing, if it needs it.
@@ -1721,7 +2118,7 @@ impl<E: PlayerEvents> Coordinator<E> {
         }
 
         self.track_gain_db = Some(crate::loudness::gain_db(measured, self.target_lufs));
-        self.apply_volume();
+        self.apply_track_gain();
         // So the settings panel stops saying the track has not been measured.
         self.emit_state();
     }
@@ -1772,6 +2169,8 @@ impl<E: PlayerEvents> Coordinator<E> {
             volume_ceiling_db: self.ceiling_db,
             target_lufs: self.target_lufs,
             normalize: self.normalize,
+            gapless: self.gapless,
+            trim_silence: self.trim_silence,
             track_gain_db: self.track_gain_db,
             stalled: self.stalled,
         });
@@ -1901,6 +2300,29 @@ pub struct Prepared {
     track_id: i64,
     source: PlayableSource,
     decoded: engine::BuiltSource,
+    /// What this track was measured at, in LUFS, if it has been.
+    ///
+    /// Read here rather than after the handover, because the handover is
+    /// exactly where there is no time to read it: the track starts the moment
+    /// the engine is handed this, and a correction applied afterwards is a
+    /// correction the first sample did not get.
+    ///
+    /// The *reading*, not a gain. What that reading is worth depends on the
+    /// target and on whether normalisation is on at all, and both can change
+    /// between preparing a track and playing it.
+    measured: Option<crate::loudness::Loudness>,
+    /// The device rate this was decoded for.
+    ///
+    /// Kept because it can go stale, and because the failure is silent when it
+    /// does: the engine quietly refuses a decode built for another rate and
+    /// rebuilds it, so the preparation is simply wasted and the gap it exists
+    /// to remove comes back.
+    ///
+    /// It goes stale most often within the first second of the app's life.
+    /// Queueing tracks is what triggers preparation, and that can happen
+    /// before the output device has finished opening -- at which point the
+    /// engine is still reporting the fallback rate rather than the real one.
+    rate: u32,
 }
 
 impl std::fmt::Debug for Prepared {
@@ -1966,7 +2388,11 @@ async fn load_track(
             _ => None,
         };
 
-        match engine.play(source, None, start_at, epoch).await {
+        // Unity: this path has no reading in hand, and the coordinator sends
+        // the real correction the moment the load reports back. That is the
+        // behaviour that shipped before any of this, and it is inaudible --
+        // the level stage glides, and the window is one poll interval.
+        match engine.play(source, None, start_at, epoch, 1.0).await {
             Ok(()) => return Ok(()),
             // Another load won while this one was resolving. Retrying would
             // only lose again, and the caller must not treat it as a fault.
@@ -2314,6 +2740,22 @@ pub async fn set_volume_ceiling(
 #[tauri::command]
 pub async fn set_normalize(on: bool, player: State<'_, PlayerHandle>) -> Result<(), String> {
     player.send(PlayerCommand::SetNormalize(on))
+}
+
+/// Turns gapless handover on or off.
+///
+/// Takes effect from the next handover: a track already queued behind the one
+/// playing stays queued, because pulling it back out would mean tearing down
+/// the running player to do it -- a gap, to switch off gaps.
+#[tauri::command]
+pub async fn set_gapless(on: bool, player: State<'_, PlayerHandle>) -> Result<(), String> {
+    player.send(PlayerCommand::SetGapless(on))
+}
+
+/// Turns trailing-silence trimming on or off.
+#[tauri::command]
+pub async fn set_trim_silence(on: bool, player: State<'_, PlayerHandle>) -> Result<(), String> {
+    player.send(PlayerCommand::SetTrimSilence(on))
 }
 
 #[tauri::command]

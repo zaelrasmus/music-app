@@ -22,6 +22,15 @@ static NETWORK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 
+/// Serialises the tests that measure *time*.
+///
+/// They share one audio device and one machine, and what they assert is how
+/// long something took -- run in parallel they measure contention rather than
+/// the code under test. Both failures that sent me here were this: each test
+/// passed alone and failed in the suite.
+static TIMING: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// The bundled ffmpeg, which local playback now requires.
 ///
 /// Passing `None` used to be fine here: rodio decoded a plain WAV natively, so
@@ -40,6 +49,10 @@ struct Captured {
     caching: Mutex<Vec<(i64, Option<String>)>>,
     /// Progress again, but keeping which track each tick was about.
     ticks: Mutex<Vec<(Option<i64>, f64)>>,
+    /// When each tick arrived, which is the only way to see a *gap*: the
+    /// positions look identical whether or not the handover was seamless, and
+    /// what differs is the wall-clock silence between them.
+    timed: Mutex<Vec<(std::time::Instant, Option<i64>)>>,
     states: Mutex<Vec<PlayerStatus>>,
     errors: Mutex<Vec<String>>,
     queues: Mutex<Vec<QueueState>>,
@@ -87,6 +100,11 @@ impl PlayerEvents for Recorder {
             .lock()
             .unwrap()
             .push((progress.track_id, progress.position_secs));
+        self.0
+            .timed
+            .lock()
+            .unwrap()
+            .push((std::time::Instant::now(), progress.track_id));
     }
 
     fn error(&self, message: String) {
@@ -2692,6 +2710,1445 @@ async fn without_a_decoder_the_player_stops_and_says_why() {
         !reached.contains(&Some(ids[1])) && !reached.contains(&Some(ids[2])),
         "the queue was walked looking for a track that would play, but none \
          can: {reached:?}",
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Gapless, through the real coordinator rather than the engine alone.
+///
+/// The engine's own tests prove it can hand one track to the next without
+/// stopping. They say nothing about whether the coordinator ever *asks* it to,
+/// and that is a chain of conditions -- the setting, a known duration, a
+/// prepared decode, a stable next track, the right moment -- any one of which
+/// silently means an ordinary gap.
+#[tokio::test]
+async fn one_track_hands_over_to_the_next_without_a_gap() {
+    let _guard = TIMING.lock().await;
+    let base = std::env::temp_dir().join("music-app-coordinator-gapless");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    // Short, so the whole run is a few seconds; `duration_secs` is what the
+    // coordinator reads to decide when the end is close.
+    let first = base.join("first.wav");
+    let second = base.join("second.wav");
+    write_wav_secs(&first, 3);
+    write_wav_secs(&second, 3);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    for (title, path) in [("First", &first), ("Second", &second)] {
+        sqlx::query(
+            "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+             VALUES ('local', ?, ?, 'present', 3)",
+        )
+        .bind(title)
+        .bind(path.to_str().unwrap())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM tracks ORDER BY id")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+
+    handle.send(PlayerCommand::SetGapless(true)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: ids.clone(),
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Both tracks, plus room either side.
+    tokio::time::sleep(Duration::from_millis(8_000)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    if errors.iter().any(|e| e.contains("No audio output device")) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+    eprintln!("errors: {errors:?}");
+
+    // Every (track, position) the UI was told, in order. A gapless handover
+    // shows as the second track's ticks beginning while the first track's last
+    // tick is still recent; a gap shows as a hole between them.
+    let ticks = recorder.0.ticks.lock().unwrap().clone();
+    eprintln!("ticks: {ticks:?}");
+
+    let first_id = ids[0];
+    let second_id = ids[1];
+
+    assert!(
+        ticks.iter().any(|(id, _)| *id == Some(first_id)),
+        "the first track never reported progress"
+    );
+    assert!(
+        ticks.iter().any(|(id, _)| *id == Some(second_id)),
+        "the second track never played at all"
+    );
+
+    // Where the handover shows up: the last position reported for the first
+    // track, against the first reported for the second. The engine polls every
+    // 50 ms and reports every fourth, so ~200 ms of slack is the cadence
+    // itself; a cold load of the next track costs far more than that.
+    let last_first = ticks
+        .iter()
+        .filter(|(id, _)| *id == Some(first_id))
+        .map(|(_, p)| *p)
+        .fold(0.0f64, f64::max);
+
+    eprintln!("first track's last reported position: {last_first:.3}s of 3s");
+
+    assert!(
+        last_first > 2.0,
+        "the first track's progress stopped at {last_first:.3}s of 3s -- the UI \
+         went quiet well before the end, which is what happens when the \
+         coordinator moves its epoch on while the track is still playing"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Plays two tracks back to back and measures the silence between them.
+///
+/// The positions reported look the same either way -- the second track starts
+/// at zero and counts up regardless. What differs is *when* its first tick
+/// arrives, so the only honest measurement is wall-clock.
+async fn handover_gap(name: &str, gapless: bool) -> Option<Duration> {
+    let base = std::env::temp_dir().join(format!("music-app-gapless-{name}"));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let first = base.join("first.wav");
+    let second = base.join("second.wav");
+    write_wav_secs(&first, 3);
+    write_wav_secs(&second, 3);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    for (title, path) in [("First", &first), ("Second", &second)] {
+        sqlx::query(
+            "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+             VALUES ('local', ?, ?, 'present', 3)",
+        )
+        .bind(title)
+        .bind(path.to_str().unwrap())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM tracks ORDER BY id")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+
+    handle.send(PlayerCommand::SetGapless(gapless)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: ids.clone(),
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(7_500)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    if errors.iter().any(|e| e.contains("No audio output device")) {
+        return None;
+    }
+    assert!(errors.is_empty(), "{name}: {errors:?}");
+
+    let timed = recorder.0.timed.lock().unwrap().clone();
+    let (first_id, second_id) = (ids[0], ids[1]);
+
+    let last_of_first = timed
+        .iter()
+        .filter(|(_, id)| *id == Some(first_id))
+        .map(|(at, _)| *at)
+        .next_back()
+        .unwrap_or_else(|| panic!("{name}: the first track never reported"));
+    let first_of_second = timed
+        .iter()
+        .find(|(_, id)| *id == Some(second_id))
+        .map(|(at, _)| *at)
+        .unwrap_or_else(|| panic!("{name}: the second track never played"));
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+
+    Some(first_of_second.saturating_duration_since(last_of_first))
+}
+
+/// Gapless, measured rather than asserted about.
+///
+/// Two runs of the same two tracks, differing only in the setting. The engine
+/// reports progress every fourth 50 ms poll, so ~200-250 ms between
+/// consecutive ticks is the cadence itself and the floor for either run. What
+/// a *gap* adds on top is the whole of loading the next track: spawning
+/// ffmpeg and waiting for it to buffer.
+#[tokio::test]
+async fn gapless_measurably_shortens_the_handover() {
+    let _guard = TIMING.lock().await;
+    let Some(off) = handover_gap("off", false).await else {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    };
+    let on = handover_gap("on", true).await.expect("device vanished");
+
+    eprintln!("handover with gapless off: {off:?}");
+    eprintln!("handover with gapless on:  {on:?}");
+
+    assert!(
+        on < off,
+        "gapless made no difference: {on:?} against {off:?} without it"
+    );
+
+    // The cadence is ~250 ms, so anything near it means the next track was
+    // already sounding when the tick arrived.
+    assert!(
+        on < Duration::from_millis(500),
+        "the handover still took {on:?}, which is a load rather than a join"
+    );
+}
+
+/// Gapless on the two tracks that were reported as still gapping.
+///
+/// Both are cold YouTube streams with no file on disk, which is the case the
+/// local fixtures above cannot reach: preparing one means resolving a URL
+/// through yt-dlp and then waiting for ffmpeg to buffer it, seconds of work
+/// where a local WAV costs milliseconds. If the handover holds here it holds
+/// for the hardest thing this app plays.
+///
+/// The first track is seeked to twelve seconds from its end rather than played
+/// through -- five minutes of real time would make this untestable, and the
+/// seek exercises the path that had to be fixed for gapless to survive one.
+///
+/// `cargo test --test player_progress the_reported_tracks -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "network: resolves two real YouTube tracks and plays them"]
+async fn the_reported_tracks_hand_over_without_a_gap() {
+    let _guard = NETWORK.lock().await;
+
+    const FIRST: (&str, &str, i64) = (
+        "Sonic Forces - Infinite (KITSUN3POWR REMIX V3)",
+        "https://www.youtube.com/watch?v=QSBmYN2hsMA",
+        304,
+    );
+    const SECOND: (&str, &str, i64) = (
+        "Sonic 06 - His World (Zebrahead Ver.)",
+        "https://www.youtube.com/watch?v=MdJGOEEJA4I",
+        223,
+    );
+
+    let base = std::env::temp_dir().join("music-app-gapless-real");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    for (title, url, secs) in [FIRST, SECOND] {
+        sqlx::query(
+            "INSERT INTO tracks (source, title, state, remote_id, remote_url, duration_secs, \
+             in_library) VALUES ('youtube', ?, 'saved', ?, ?, ?, 1)",
+        )
+        .bind(title)
+        .bind(url.rsplit('=').next().unwrap())
+        .bind(url)
+        .bind(secs)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM tracks ORDER BY id")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+
+    let yt_dlp = music_app_lib::sidecar::staged_for_tests(music_app_lib::sidecar::Tool::YtDlp);
+    assert!(yt_dlp.is_some(), "the staged yt-dlp sidecar is missing");
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(
+        recorder.clone(),
+        db.pool.clone(),
+        ffmpeg(),
+        yt_dlp,
+        // No cache: this is about the handover, and a cache copy would make a
+        // rerun measure something different from the first run.
+        None,
+    );
+
+    handle.send(PlayerCommand::SetGapless(true)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: ids.clone(),
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Resolving a cold stream takes seconds; let the first track get going.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    if errors.iter().any(|e| e.contains("No audio output device")) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+    assert!(
+        recorder
+            .0
+            .ticks
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, p)| *id == Some(ids[0]) && *p > 0.0),
+        "the first track never started: {errors:?}"
+    );
+
+    // Seeked, or played through? The seek is the quick version; the whole
+    // track is what a listener actually does, and the difference between them
+    // is how long the prepared decode has been sitting idle.
+    if std::env::var("PROBE_FULL").is_ok() {
+        eprintln!("playing the first track through -- about five minutes");
+        tokio::time::sleep(Duration::from_secs(FIRST.2 as u64 - 20 + 25)).await;
+    } else {
+        handle
+            .send(PlayerCommand::Seek((FIRST.2 - 12) as f64))
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(22)).await;
+    }
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    eprintln!("errors: {errors:?}");
+
+    let timed = recorder.0.timed.lock().unwrap().clone();
+    let (first_id, second_id) = (ids[0], ids[1]);
+
+    let last_of_first = timed
+        .iter()
+        .filter(|(_, id)| *id == Some(first_id))
+        .map(|(at, _)| *at)
+        .next_back()
+        .expect("the first track never reported");
+    let first_of_second = timed
+        .iter()
+        .find(|(_, id)| *id == Some(second_id))
+        .map(|(at, _)| *at)
+        .expect("the second track never played");
+
+    let gap = first_of_second.saturating_duration_since(last_of_first);
+    eprintln!("handover between the two reported tracks: {gap:?}");
+
+    // Without gapless this is a full cold load of a YouTube stream: a yt-dlp
+    // resolve plus ffmpeg's prefill, which is where the "large silence" came
+    // from. With it, the next tick is one cadence away.
+    assert!(
+        gap < Duration::from_millis(600),
+        "the handover took {gap:?} -- the second track was loaded from cold \
+         rather than already appended, which is the gap that was reported"
+    );
+
+    db.pool.close().await;
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+
+/// Sets up two short local tracks and returns the handle plus their ids.
+async fn two_tracks(name: &str) -> (Recorder, player::PlayerHandle, Vec<i64>, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!("music-app-gapless-edge-{name}"));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let first = base.join("first.wav");
+    let second = base.join("second.wav");
+    write_wav_secs(&first, 4);
+    write_wav_secs(&second, 3);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    for (title, path) in [("First", &first), ("Second", &second)] {
+        sqlx::query(
+            "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+             VALUES ('local', ?, ?, 'present', ?)",
+        )
+        .bind(title)
+        .bind(path.to_str().unwrap())
+        .bind(if title == "First" { 4 } else { 3 })
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM tracks ORDER BY id")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+
+    (recorder, handle, ids, base)
+}
+
+fn played(recorder: &Recorder, id: i64) -> bool {
+    recorder
+        .0
+        .ticks
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(t, _)| *t == Some(id))
+}
+
+fn no_device(recorder: &Recorder) -> bool {
+    recorder
+        .0
+        .errors
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e.contains("No audio output device"))
+}
+
+/// Switching it on part-way through a track.
+///
+/// It cannot retroactively queue anything -- there was nothing to queue when
+/// the track started -- but the handover it is switched on *before* has to be
+/// the seamless one, or the setting looks like it does nothing until the app
+/// is restarted.
+#[tokio::test]
+async fn turning_gapless_on_mid_track_applies_to_that_track_s_handover() {
+    let _guard = TIMING.lock().await;
+    let (recorder, handle, ids, base) = two_tracks("on-midway").await;
+
+    handle.send(PlayerCommand::SetGapless(false)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: ids.clone(),
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // A second in, well before the end of a four-second track.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+    handle.send(PlayerCommand::SetGapless(true)).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(5_000)).await;
+
+    let timed = recorder.0.timed.lock().unwrap().clone();
+    let last_first = timed
+        .iter()
+        .filter(|(_, id)| *id == Some(ids[0]))
+        .map(|(at, _)| *at)
+        .next_back()
+        .expect("the first track never reported");
+    let first_second = timed
+        .iter()
+        .find(|(_, id)| *id == Some(ids[1]))
+        .map(|(at, _)| *at)
+        .expect("the second track never played");
+
+    let gap = first_second.saturating_duration_since(last_first);
+    eprintln!("handover after switching gapless on mid-track: {gap:?}");
+    assert!(
+        gap < Duration::from_millis(500),
+        "switching gapless on mid-track did not affect that track's handover \
+         ({gap:?}) -- the setting would look like it needed a restart"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Switching it off once the next track is already appended.
+///
+/// The queued track stays queued: pulling it back out means tearing down the
+/// running player, which is a gap *now* -- in the middle of the song being
+/// listened to -- in order to guarantee a gap later. What must not happen is
+/// anything worse: a lost track, a stall, or a double play.
+#[tokio::test]
+async fn turning_gapless_off_after_queueing_still_plays_both_tracks() {
+    let _guard = TIMING.lock().await;
+    let (recorder, handle, ids, base) = two_tracks("off-late").await;
+
+    handle.send(PlayerCommand::SetGapless(true)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: ids.clone(),
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Inside the queueing window of a four-second track.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+    handle.send(PlayerCommand::SetGapless(false)).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(5_000)).await;
+
+    assert!(played(&recorder, ids[0]), "the first track never played");
+    assert!(
+        played(&recorder, ids[1]),
+        "the second track was lost when gapless was switched off after it had \
+         already been queued"
+    );
+
+    // And it played once, not twice: the coordinator adopting a handover must
+    // not also start the track itself.
+    let ticks = recorder.0.ticks.lock().unwrap().clone();
+    let restarts = ticks
+        .windows(2)
+        .filter(|w| w[0].0 == Some(ids[1]) && w[1].0 == Some(ids[1]) && w[1].1 < w[0].1)
+        .count();
+    assert_eq!(restarts, 0, "the second track restarted: {ticks:?}");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Paused near the end, then resumed.
+///
+/// The engine reports no progress while paused, and progress is what drives
+/// queueing -- so nothing is appended for as long as the pause lasts. The
+/// handover has to survive being set up entirely in the seconds after the
+/// resume.
+#[tokio::test]
+async fn pausing_near_the_end_then_resuming_still_hands_over() {
+    let _guard = TIMING.lock().await;
+    let (recorder, handle, ids, base) = two_tracks("paused").await;
+
+    handle.send(PlayerCommand::SetGapless(true)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: ids.clone(),
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    // Two seconds from the end of a four-second track, then held there.
+    handle.send(PlayerCommand::Seek(2.0)).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    handle.send(PlayerCommand::Pause).unwrap();
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    handle.send(PlayerCommand::Resume).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(5_000)).await;
+
+    let timed = recorder.0.timed.lock().unwrap().clone();
+    let last_first = timed
+        .iter()
+        .filter(|(_, id)| *id == Some(ids[0]))
+        .map(|(at, _)| *at)
+        .next_back()
+        .expect("the first track never reported");
+    let first_second = timed
+        .iter()
+        .find(|(_, id)| *id == Some(ids[1]))
+        .map(|(at, _)| *at)
+        .expect("the second track never played after the pause");
+
+    let gap = first_second.saturating_duration_since(last_first);
+    eprintln!("handover after a pause near the end: {gap:?}");
+    assert!(
+        gap < Duration::from_millis(600),
+        "the handover took {gap:?} after a pause -- queueing never recovered \
+         from the progress reports stopping"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The bar has to describe the track that is sounding.
+///
+/// The handover happens in the engine, and the coordinator finds out up to one
+/// poll later. If the UI were told the new position before it was told the new
+/// track, it would briefly show the second track's position against the
+/// first's length -- a progress bar that jumps backwards and a duration that
+/// belongs to something else.
+#[tokio::test]
+async fn the_ui_never_shows_one_track_s_position_against_another_s() {
+    let _guard = TIMING.lock().await;
+    let (recorder, handle, ids, base) = two_tracks("ui").await;
+
+    handle.send(PlayerCommand::SetGapless(true)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: ids.clone(),
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(8_000)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    let ticks = recorder.0.ticks.lock().unwrap().clone();
+    eprintln!("ticks: {ticks:?}");
+
+    // Every tick names the track it belongs to, and the two tracks are 4s and
+    // 3s -- so a position reported against the wrong one shows up as a
+    // position past that track's length.
+    for (id, position) in &ticks {
+        let length = if *id == Some(ids[0]) { 4.0 } else { 3.0 };
+        assert!(
+            *position <= length + 0.5,
+            "a position of {position}s was reported for track {id:?}, which is \
+             only {length}s long -- the bar was describing the wrong track"
+        );
+    }
+
+    // And the first track's position never goes backwards within itself.
+    let first_positions: Vec<f64> = ticks
+        .iter()
+        .filter(|(id, _)| *id == Some(ids[0]))
+        .map(|(_, p)| *p)
+        .collect();
+    assert!(
+        first_positions.windows(2).all(|w| w[1] >= w[0]),
+        "the bar jumped backwards during the first track: {first_positions:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+
+/// Repeat-one plays the same track again, never the next one.
+///
+/// `peek_next` reports the next track in the *list*; under repeat-one the
+/// end-of-track path replays the current one instead. Queueing what
+/// `peek_next` says hands the audio over to a track the coordinator then has
+/// to undo -- correct in the end, but a wasted decode, and for a stream a
+/// reload measured in seconds.
+///
+/// Honest about what this catches: it passes with or without the guard in
+/// `enqueue_next`, because the wrong track sounds for less than one progress
+/// tick before being replaced. It is here for the louder regression -- the one
+/// where repeat-one starts actually playing the next track.
+#[tokio::test]
+async fn repeat_one_does_not_hand_over_to_the_wrong_track() {
+    let _guard = TIMING.lock().await;
+    let (recorder, handle, ids, base) = two_tracks("repeat-one").await;
+
+    handle.send(PlayerCommand::SetGapless(true)).unwrap();
+    handle
+        .send(PlayerCommand::SetRepeat(music_app_lib::player::RepeatMode::One))
+        .unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: ids.clone(),
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Through the end of the four-second first track and a little beyond.
+    tokio::time::sleep(Duration::from_millis(7_000)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    let ticks = recorder.0.ticks.lock().unwrap().clone();
+    eprintln!("ticks: {ticks:?}");
+
+    assert!(
+        !played(&recorder, ids[1]),
+        "under repeat-one the second track played, so the engine handed over \
+         to a track the queue was never going to advance to: {ticks:?}"
+    );
+    assert!(
+        played(&recorder, ids[0]),
+        "the first track never played at all"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+
+/// A WAV of `tone_secs` of audible tone followed by `silence_secs` of nothing.
+///
+/// Shaped like the track that prompted this: five minutes of music and then
+/// fourteen and a half seconds of digital silence, faithfully encoded.
+fn write_wav_with_tail(path: &std::path::Path, tone_secs: f32, silence_secs: f32) {
+    use std::io::Write;
+
+    const RATE: u32 = 44_100;
+    let tone = (RATE as f32 * tone_secs) as u32;
+    let quiet = (RATE as f32 * silence_secs) as u32;
+    let samples = tone + quiet;
+    let data_len = samples * 2;
+
+    let mut b = Vec::new();
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data_len).to_le_bytes());
+    b.extend_from_slice(b"WAVE");
+    b.extend_from_slice(b"fmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&RATE.to_le_bytes());
+    b.extend_from_slice(&(RATE * 2).to_le_bytes());
+    b.extend_from_slice(&2u16.to_le_bytes());
+    b.extend_from_slice(&16u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data_len.to_le_bytes());
+
+    for n in 0..samples {
+        let value = if n < tone {
+            let t = n as f32 / RATE as f32;
+            (std::f32::consts::TAU * 440.0 * t).sin() * 0.5
+        } else {
+            0.0
+        };
+        b.extend_from_slice(&((value * 32_767.0) as i16).to_le_bytes());
+    }
+
+    std::fs::File::create(path).unwrap().write_all(&b).unwrap();
+}
+
+/// Sets up a track with a silent tail, followed by a normal one.
+async fn tail_fixture(
+    name: &str,
+    tone: f32,
+    tail: f32,
+) -> (Recorder, player::PlayerHandle, Vec<i64>, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!("music-app-tail-{name}"));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let first = base.join("first.wav");
+    let second = base.join("second.wav");
+    write_wav_with_tail(&first, tone, tail);
+    write_wav_secs(&second, 3);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    let total = (tone + tail).round() as i64;
+    for (title, path, secs) in [("First", &first, total), ("Second", &second, 3)] {
+        sqlx::query(
+            "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+             VALUES ('local', ?, ?, 'present', ?)",
+        )
+        .bind(title)
+        .bind(path.to_str().unwrap())
+        .bind(secs)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM tracks ORDER BY id")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+
+    (recorder, handle, ids, base)
+}
+
+/// The gap that is not this app's fault, removed anyway.
+///
+/// The track that prompted this runs for 5:03 and stops making sound at 4:48.
+/// A seamless handover after fourteen and a half seconds of encoded silence is
+/// still fourteen and a half seconds of silence, and no amount of engine work
+/// fixes that -- the silence is in the file.
+///
+/// So the track ends when the *music* does. Here: three seconds of tone and
+/// five of nothing, and the next track has to start at around three.
+#[tokio::test]
+async fn a_track_ends_when_its_music_does_not_when_its_file_does() {
+    let _guard = TIMING.lock().await;
+    let (recorder, handle, ids, base) = tail_fixture("trimmed", 3.0, 5.0).await;
+
+    handle.send(PlayerCommand::SetGapless(true)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: ids.clone(),
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Long enough that an untrimmed track would plainly reach the end of its
+    // eight-second file, so the two outcomes are far apart rather than adjacent.
+    tokio::time::sleep(Duration::from_millis(10_000)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    let ticks = recorder.0.ticks.lock().unwrap().clone();
+    eprintln!("ticks: {ticks:?}");
+
+    let last_first = ticks
+        .iter()
+        .filter(|(id, _)| *id == Some(ids[0]))
+        .map(|(_, p)| *p)
+        .fold(0.0f64, f64::max);
+
+    eprintln!("first track ended at {last_first:.2}s of an 8s file (3s of tone)");
+
+    assert!(
+        played(&recorder, ids[1]),
+        "the second track never played: {ticks:?}"
+    );
+    assert!(
+        last_first < 7.0,
+        "the first track played to {last_first:.2}s -- it sat through its own \
+         silent tail, which is the gap that was reported"
+    );
+    assert!(
+        last_first > 2.5,
+        "the first track was cut at {last_first:.2}s, before its music had \
+         finished at 3s"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// And the promise it must not break: a quiet passage is not an ending.
+///
+/// Two seconds of true digital silence is the threshold, so a track with a
+/// shorter pause in it has to play straight through.
+#[tokio::test]
+async fn a_short_pause_inside_a_track_does_not_end_it() {
+    let _guard = TIMING.lock().await;
+    let base = std::env::temp_dir().join("music-app-tail-pause");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    // Tone, one second of silence, tone again.
+    let path = base.join("paused.wav");
+    {
+        use std::io::Write;
+        const RATE: u32 = 44_100;
+        let samples = RATE * 6;
+        let data_len = samples * 2;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVE");
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&RATE.to_le_bytes());
+        b.extend_from_slice(&(RATE * 2).to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        for n in 0..samples {
+            let t = n as f32 / RATE as f32;
+            let value = if (2.0..3.0).contains(&t) {
+                0.0
+            } else {
+                (std::f32::consts::TAU * 440.0 * t).sin() * 0.5
+            };
+            b.extend_from_slice(&((value * 32_767.0) as i16).to_le_bytes());
+        }
+        std::fs::File::create(&path).unwrap().write_all(&b).unwrap();
+    }
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+         VALUES ('local', 'Paused', ?, 'present', 6)",
+    )
+    .bind(path.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    handle.send(PlayerCommand::SetTrimSilence(true)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(7_500)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    let reached = recorder
+        .0
+        .ticks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, p)| *p)
+        .fold(0.0f64, f64::max);
+
+    eprintln!("a track with a one-second pause reached {reached:.2}s of 6s");
+    assert!(
+        reached > 5.0,
+        "the track was ended at {reached:.2}s by a pause in the middle of it"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A track that is quiet from the start has no tail to trim.
+///
+/// Caught by an existing test rather than by design: the fixtures here are
+/// silent WAVs, and the first version of the trim ended one of them two
+/// seconds in -- which broke a test about abandoning a stream *past halfway*,
+/// because it never got halfway.
+///
+/// Trimming a silent tail presupposes a head. Cutting a quiet track short is
+/// playing less of the file than the file holds.
+#[tokio::test]
+async fn a_silent_track_plays_to_its_end_rather_than_being_trimmed() {
+    let _guard = TIMING.lock().await;
+    let base = std::env::temp_dir().join("music-app-tail-silent");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let path = base.join("silent.wav");
+    write_wav_secs(&path, 5);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs)          VALUES ('local', 'Silent', ?, 'present', 5)",
+    )
+    .bind(path.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    handle.send(PlayerCommand::SetTrimSilence(true)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(6_500)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    let reached = recorder
+        .0
+        .ticks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, p)| *p)
+        .fold(0.0f64, f64::max);
+
+    eprintln!("a wholly silent 5s track reached {reached:.2}s");
+    assert!(
+        reached > 4.0,
+        "a silent track was cut at {reached:.2}s -- it has no tail to trim,          only content"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+
+/// Writes a WAV from a list of (seconds, audible) segments.
+fn write_wav_segments(path: &std::path::Path, segments: &[(f32, bool)]) {
+    use std::io::Write;
+
+    const RATE: u32 = 44_100;
+    let total: u32 = segments
+        .iter()
+        .map(|(secs, _)| (RATE as f32 * secs) as u32)
+        .sum();
+    let data_len = total * 2;
+
+    let mut b = Vec::new();
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data_len).to_le_bytes());
+    b.extend_from_slice(b"WAVE");
+    b.extend_from_slice(b"fmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&RATE.to_le_bytes());
+    b.extend_from_slice(&(RATE * 2).to_le_bytes());
+    b.extend_from_slice(&2u16.to_le_bytes());
+    b.extend_from_slice(&16u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data_len.to_le_bytes());
+
+    let mut n: u32 = 0;
+    for (secs, audible) in segments {
+        for _ in 0..((RATE as f32 * secs) as u32) {
+            let value = if *audible {
+                let t = n as f32 / RATE as f32;
+                (std::f32::consts::TAU * 440.0 * t).sin() * amplitude_for(*secs)
+            } else {
+                0.0
+            };
+            b.extend_from_slice(&((value * 32_767.0) as i16).to_le_bytes());
+            n += 1;
+        }
+    }
+
+    std::fs::File::create(path).unwrap().write_all(&b).unwrap();
+}
+
+/// Half scale for everything; the segment length is not a level.
+fn amplitude_for(_secs: f32) -> f32 {
+    0.5
+}
+
+/// Plays one segmented track and reports how far it got.
+async fn plays_to(
+    name: &str,
+    segments: &[(f32, bool)],
+    settle: u64,
+    setup: Vec<PlayerCommand>,
+) -> Option<f64> {
+    let base = std::env::temp_dir().join(format!("music-app-fp-{name}"));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let path = base.join("track.wav");
+    write_wav_segments(&path, segments);
+    let total: f32 = segments.iter().map(|(s, _)| *s).sum();
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+         VALUES ('local', 'Probe', ?, 'present', ?)",
+    )
+    .bind(path.to_str().unwrap())
+    .bind(total.round() as i64)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    handle.send(PlayerCommand::SetTrimSilence(true)).unwrap();
+    for command in setup {
+        handle.send(command).unwrap();
+    }
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(settle)).await;
+    if no_device(&recorder) {
+        return None;
+    }
+
+    let reached = recorder
+        .0
+        .ticks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, p)| *p)
+        .fold(0.0f64, f64::max);
+
+    let _ = std::fs::remove_dir_all(&base);
+    Some(reached)
+}
+
+/// A false ending: music, a gap, then more music.
+///
+/// The failure that would actually cost someone their song. Three seconds of
+/// silence is longer than the pause before almost every false ending, but this
+/// is the case worth being sure about -- a track cut here loses its outro
+/// permanently, and the listener has no way to tell it was ever there.
+#[tokio::test]
+async fn a_false_ending_does_not_cut_the_outro() {
+    let _guard = TIMING.lock().await;
+    // 3s music, 2s silence, 3s music. The gap is inside the trimming window,
+    // and shorter than the threshold.
+    let Some(reached) = plays_to("false-ending", &[(3.0, true), (2.0, false), (3.0, true)], 9_500, Vec::new()).await
+    else {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    };
+
+    eprintln!("a track with a two-second false ending reached {reached:.2}s of 8s");
+    assert!(
+        reached > 7.0,
+        "the outro was cut: the track stopped at {reached:.2}s of 8s"
+    );
+}
+
+/// Muting part-way through is not a finished track.
+///
+/// The silence is counted before the volume stage precisely so this cannot
+/// happen. Muting *from the start* is caught by `heard_audio` anyway -- nothing
+/// audible was ever heard, so there is no tail -- which is why this mutes two
+/// seconds in, once the track has established that it has music in it.
+#[tokio::test]
+async fn muting_part_way_through_does_not_end_the_track() {
+    let _guard = TIMING.lock().await;
+    let base = std::env::temp_dir().join("music-app-fp-muted-midway");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let path = base.join("track.wav");
+    write_wav_segments(&path, &[(8.0, true)]);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs)          VALUES ('local', 'Loud', ?, 'present', 8)",
+    )
+    .bind(path.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    handle.send(PlayerCommand::SetTrimSilence(true)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Let it establish that it has music, then mute for the rest.
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+    handle.send(PlayerCommand::SetMuted(true)).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(7_500)).await;
+
+    let reached = recorder
+        .0
+        .ticks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, p)| *p)
+        .fold(0.0f64, f64::max);
+
+    eprintln!("an 8s track muted at 2s reached {reached:.2}s");
+    assert!(
+        reached > 7.0,
+        "muting cut the track at {reached:.2}s -- silence is being measured          after the volume stage, so reaching for the mute button ends the song"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// And the same for the volume slider at zero, which is a different path to
+/// the same place.
+#[tokio::test]
+async fn a_track_at_zero_volume_is_not_cut_short() {
+    let _guard = TIMING.lock().await;
+    let Some(reached) = plays_to(
+        "zero-volume",
+        &[(6.0, true)],
+        7_500,
+        vec![PlayerCommand::SetVolume(0.0)],
+    )
+    .await
+    else {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    };
+
+    eprintln!("a 6s track at zero volume reached {reached:.2}s");
+    assert!(reached > 5.0, "zero volume cut the track at {reached:.2}s");
+}
+
+/// Silence far from the end is out of reach entirely.
+///
+/// Two thresholds guard this, and they are independent: the gap has to be
+/// longer than three seconds *and* start within twenty of the end. This is the
+/// second one on its own.
+#[tokio::test]
+async fn a_long_gap_far_from_the_end_is_not_a_tail() {
+    let _guard = TIMING.lock().await;
+    // 2s music, 5s silence, then 25s of music -- so the gap is long enough but
+    // nowhere near the end.
+    let Some(reached) = plays_to("early-gap", &[(2.0, true), (5.0, false), (25.0, true)], 12_000, Vec::new()).await
+    else {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    };
+
+    // Not played to the end -- that would take half a minute. What matters is
+    // that it survived the gap and was still going afterwards.
+    eprintln!("a track with a five-second gap at 2s reached {reached:.2}s");
+    assert!(
+        reached > 9.0,
+        "a gap twenty-five seconds from the end ended the track at {reached:.2}s"
+    );
+}
+
+/// Trimming is not gapless, and neither implies the other.
+#[tokio::test]
+async fn trimming_and_gapless_are_independent_settings() {
+    let _guard = TIMING.lock().await;
+    // Trimming off, gapless on: the tail plays in full.
+    let base = std::env::temp_dir().join("music-app-fp-independent");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let path = base.join("track.wav");
+    write_wav_segments(&path, &[(2.0, true), (5.0, false)]);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+         VALUES ('local', 'Tail', ?, 'present', 7)",
+    )
+    .bind(path.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    handle.send(PlayerCommand::SetGapless(true)).unwrap();
+    handle.send(PlayerCommand::SetTrimSilence(false)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(8_500)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    let reached = recorder
+        .0
+        .ticks
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, p)| *p)
+        .fold(0.0f64, f64::max);
+
+    eprintln!("gapless on, trimming off: reached {reached:.2}s of 7s");
+    assert!(
+        reached > 6.0,
+        "the tail was trimmed at {reached:.2}s with trimming switched off -- \
+         the gapless setting is still driving it"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+
+/// One queue, three kinds of track, handed over seamlessly at both joins.
+///
+/// The question this answers: does any of it care where the audio came from?
+/// A local file, a cold YouTube stream and a local file again, in one queue --
+/// which is what a real library queue looks like.
+///
+/// Nothing in the handover path is source-aware. Every source is decoded by
+/// ffmpeg to the device's rate, and what the engine appends is a decode; where
+/// it was read from stopped mattering at `build_source`. This is here to prove
+/// that rather than to argue it.
+///
+/// `cargo test --test player_progress a_mixed_queue -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "network: resolves a real YouTube track and plays around it"]
+async fn a_mixed_queue_hands_over_seamlessly_at_every_join() {
+    let _guard = NETWORK.lock().await;
+    let _timing = TIMING.lock().await;
+
+    // Long enough that resolving the stream behind it comfortably finishes.
+    const FIRST_SECS: u32 = 20;
+    // His World: 3:42.4 of file, music stopping at 3:36.8.
+    const STREAM_SECS: i64 = 223;
+    const STREAM_URL: &str = "https://www.youtube.com/watch?v=MdJGOEEJA4I";
+
+    let base = std::env::temp_dir().join("music-app-mixed-queue");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+
+    let first = base.join("first.wav");
+    let last = base.join("last.wav");
+    write_wav_segments(&first, &[(FIRST_SECS as f32, true)]);
+    write_wav_segments(&last, &[(6.0, true)]);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs, in_library) \
+         VALUES ('local', 'Local First', ?, 'present', ?, 1)",
+    )
+    .bind(first.to_str().unwrap())
+    .bind(i64::from(FIRST_SECS))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, state, remote_id, remote_url, duration_secs, \
+         in_library) VALUES ('youtube', 'Cold Stream', 'saved', 'MdJGOEEJA4I', ?, ?, 1)",
+    )
+    .bind(STREAM_URL)
+    .bind(STREAM_SECS)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs, in_library) \
+         VALUES ('local', 'Local Last', ?, 'present', 6, 1)",
+    )
+    .bind(last.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM tracks ORDER BY id")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+
+    let yt_dlp = music_app_lib::sidecar::staged_for_tests(music_app_lib::sidecar::Tool::YtDlp);
+    assert!(yt_dlp.is_some(), "the staged yt-dlp sidecar is missing");
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), yt_dlp, None);
+    handle.send(PlayerCommand::SetGapless(true)).unwrap();
+    handle.send(PlayerCommand::SetTrimSilence(true)).unwrap();
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: ids.clone(),
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Through the first local track and into the stream.
+    tokio::time::sleep(Duration::from_secs(u64::from(FIRST_SECS) + 4)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    assert!(
+        played(&recorder, ids[1]),
+        "the cold stream never started: {:?}",
+        recorder.0.errors.lock().unwrap()
+    );
+
+    // Twelve seconds from the end of the stream, so the last track is prepared
+    // and appended after the seek -- the path a seek had to be taught to allow.
+    handle
+        .send(PlayerCommand::Seek((STREAM_SECS - 12) as f64))
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    let errors = recorder.0.errors.lock().unwrap().clone();
+    eprintln!("errors: {errors:?}");
+
+    assert!(
+        played(&recorder, ids[2]),
+        "the queue never reached the last local track: {errors:?}"
+    );
+
+    let timed = recorder.0.timed.lock().unwrap().clone();
+    let gap_between = |a: i64, b: i64| {
+        let last = timed
+            .iter()
+            .filter(|(_, id)| *id == Some(a))
+            .map(|(at, _)| *at)
+            .next_back()
+            .expect("first side never reported");
+        let next = timed
+            .iter()
+            .find(|(_, id)| *id == Some(b))
+            .map(|(at, _)| *at)
+            .expect("second side never reported");
+        next.saturating_duration_since(last)
+    };
+
+    let local_to_stream = gap_between(ids[0], ids[1]);
+    let stream_to_local = gap_between(ids[1], ids[2]);
+
+    eprintln!("local file  -> cold stream : {local_to_stream:?}");
+    eprintln!("cold stream -> local file  : {stream_to_local:?}");
+
+    assert!(
+        local_to_stream < Duration::from_millis(600),
+        "handing a local file over to a cold stream took {local_to_stream:?}"
+    );
+    assert!(
+        stream_to_local < Duration::from_millis(600),
+        "handing a cold stream over to a local file took {stream_to_local:?}"
     );
 
     db.pool.close().await;

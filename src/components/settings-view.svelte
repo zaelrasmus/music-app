@@ -5,6 +5,8 @@
     import CacheSettings from "$components/cache-settings.svelte";
     import LoudnessSettings from "$components/loudness-settings.svelte";
     import EqualizerSettings from "$components/equalizer-settings.svelte";
+    import GaplessSettings from "$components/gapless-settings.svelte";
+    import SilenceSettings from "$components/silence-settings.svelte";
     import ExtractorSettings from "$components/extractor-settings.svelte";
     import TagManager from "$components/tag-manager.svelte";
     import { library } from "$lib/library.svelte";
@@ -275,6 +277,8 @@
 
         <LoudnessSettings />
         <EqualizerSettings />
+        <GaplessSettings />
+        <SilenceSettings />
 
         <CacheSettings />
 

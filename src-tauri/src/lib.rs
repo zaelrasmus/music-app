@@ -346,6 +346,8 @@ pub fn run() {
             player::set_loop_queue,
             player::set_volume_ceiling,
             player::set_normalize,
+            player::set_gapless,
+            player::set_trim_silence,
             player::set_target_lufs,
             player::set_equalizer_enabled,
             player::set_equalizer_bands,
