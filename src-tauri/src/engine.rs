@@ -76,7 +76,12 @@ pub enum EngineEvent {
     /// Where the current track is up to. Emitted on the existing poll tick
     /// while actually playing -- never while paused or stopped, so the UI
     /// stops updating on its own without needing to be told.
-    Progress { epoch: u64, position: Duration },
+    Progress {
+        epoch: u64,
+        /// The decode this position belongs to. See `Loaded::generation`.
+        generation: u64,
+        position: Duration,
+    },
     /// The decoder has run dry without ending, or has recovered.
     ///
     /// Repeated roughly once a second while it lasts, so the coordinator can
@@ -158,6 +163,12 @@ enum Command {
     },
     Seek {
         position: Duration,
+        /// What the decode after this seek is to be called.
+        ///
+        /// Allocated by the caller, because the caller is the one that has to
+        /// recognise the positions coming back -- and it has to stop trusting
+        /// the old ones the moment it asks, not when the answer arrives.
+        generation: u64,
         reply: oneshot::Sender<Result<(), String>>,
     },
     /// Ends the track playing now, letting whatever follows begin.
@@ -378,9 +389,13 @@ impl AudioEngine {
     /// it has to happen on the audio thread rather than in a command handler.
     /// It is also genuinely fallible -- some sources cannot seek at all -- so
     /// the error is propagated rather than swallowed.
-    pub async fn seek(&self, position: Duration) -> Result<(), String> {
+    pub async fn seek(&self, position: Duration, generation: u64) -> Result<(), String> {
         let (reply, response) = oneshot::channel();
-        self.send(Command::Seek { position, reply })?;
+        self.send(Command::Seek {
+            position,
+            generation,
+            reply,
+        })?;
 
         await_reply(response, "The audio thread did not respond to the seek.").await
     }
@@ -860,6 +875,9 @@ fn run(
                         epoch = Some(new_epoch);
                         loaded = Some(Loaded {
                             source,
+                            // A fresh track starts at its first decode. A seek
+                            // is what moves this on.
+                            generation: 0,
                             gain,
                             starved,
                             // The decode began here, so this is what the
@@ -917,7 +935,11 @@ fn run(
                 let _ = reply.send(position_of(&player, &loaded));
             }
 
-            Ok(Command::Seek { position, reply }) => {
+            Ok(Command::Seek {
+                position,
+                generation,
+                reply,
+            }) => {
                 // The rebuild drops the player, and the queued track with it.
                 queued = None;
                 let result = seek(
@@ -925,6 +947,7 @@ fn run(
                     &mut player,
                     &mut loaded,
                     position,
+                    Some(generation),
                     &chain,
                     ffmpeg.as_deref(),
                 );
@@ -951,6 +974,7 @@ fn run(
                         &mut player,
                         &mut loaded,
                         reached,
+                        None,
                         &chain,
                         ffmpeg.as_deref(),
                     );
@@ -977,6 +1001,7 @@ fn run(
                                     next_epoch,
                                     Loaded {
                                         source,
+                                        generation: 0,
                                         gain,
                                         starved: ready.starved,
                                         // A prepared decode always begins at
@@ -1078,6 +1103,7 @@ fn run(
                         if ticks % PROGRESS_EVERY == 0 && !starving {
                             let _ = events.send(EngineEvent::Progress {
                                 epoch: current,
+                                generation: loaded.as_ref().map_or(0, |l| l.generation),
                                 position: position_of(&player, &loaded),
                             });
                         }
@@ -1094,6 +1120,14 @@ fn run(
 /// What the thread is currently playing, retained so a seek can rebuild it.
 struct Loaded {
     source: PlayableSource,
+    /// Which decode of this track is playing.
+    ///
+    /// The track's epoch says *what* is playing; this says *where it was
+    /// started from*, and a seek changes the second without changing the
+    /// first. Reported with every position so a tick that was already in
+    /// flight when the user dragged the scrubber can be told apart from one
+    /// describing where they dragged it to.
+    generation: u64,
     /// This track's loudness correction, as a linear multiplier.
     ///
     /// Held here rather than in `Chain` because it belongs to the track, not
@@ -1140,6 +1174,13 @@ fn seek(
     player: &mut Option<Player>,
     loaded: &mut Option<Loaded>,
     position: Duration,
+    // What to call the decode this produces, when the caller cares.
+    //
+    // `None` for the seeks this module performs on its own behalf -- a device
+    // change, or giving up a queued track -- which put the decode back where
+    // it already was. Nobody outside is waiting to stop trusting the old
+    // positions, because the position did not move.
+    generation: Option<u64>,
     chain: &Chain,
     ffmpeg: Option<&Path>,
 ) -> Result<(), String> {
@@ -1153,6 +1194,9 @@ fn seek(
         if p.try_seek(position).is_ok() {
             if let Some(l) = loaded.as_mut() {
                 l.offset = Duration::ZERO;
+                if let Some(generation) = generation {
+                    l.generation = generation;
+                }
             }
             return Ok(());
         }
@@ -1189,6 +1233,9 @@ fn seek(
             *player = Some(replacement);
             l.offset = position;
             l.starved = starved;
+            if let Some(generation) = generation {
+                l.generation = generation;
+            }
             Ok(())
         }
         Err(e) => {
@@ -3406,6 +3453,7 @@ mod reopen_device_tests {
             Some(player),
             Some(Loaded {
                 source,
+                generation: 0,
                 gain,
                 starved,
                 offset: Duration::ZERO,
@@ -3825,6 +3873,7 @@ mod reopen_audio_tests {
         ));
         let mut loaded = Some(Loaded {
             source,
+            generation: 0,
             gain,
             starved,
             offset: Duration::ZERO,
@@ -3893,6 +3942,7 @@ mod reopen_audio_tests {
         ));
         let mut loaded = Some(Loaded {
             source,
+            generation: 0,
             gain,
             starved,
             offset: Duration::ZERO,
@@ -3923,6 +3973,7 @@ mod reopen_audio_tests {
             &mut player,
             &mut loaded,
             Duration::from_secs(3),
+            Some(1),
             &chain,
             Some(&ffmpeg),
         )
@@ -4664,7 +4715,7 @@ mod gapless_tests {
             .expect("the engine refused to queue the second track");
 
         engine
-            .seek(Duration::from_secs(3))
+            .seek(Duration::from_secs(3), 1)
             .await
             .expect("seeking failed");
 

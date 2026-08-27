@@ -4154,3 +4154,95 @@ async fn a_mixed_queue_hands_over_seamlessly_at_every_join() {
     db.pool.close().await;
     let _ = std::fs::remove_dir_all(&base);
 }
+
+
+
+/// The scrubber must never go backwards after a seek.
+///
+/// The user-visible shape of the seek race: a position tick already in the
+/// coordinator's inbox when the seek is issued is read *after* the bar has
+/// been redrawn at the new place, and puts it back where the track used to be.
+/// Reported as `[100.0, 8.375, 100.21, ...]`.
+///
+/// Honest about what this can prove. The race needs the stale tick to be
+/// queued at the moment the seek is handled, which depends on how busy the
+/// machine is -- that is why the bug was filed as load-dependent and why the
+/// original failing test passed in isolation. The rule itself is pinned
+/// exactly by `progress_guard_tests`; this checks the behaviour those numbers
+/// are supposed to produce, and catches the regression whenever the timing
+/// happens to line up.
+#[tokio::test]
+async fn seeking_backwards_never_reports_the_old_position_again() {
+    let _guard = TIMING.lock().await;
+
+    let base = std::env::temp_dir().join("music-app-seek-monotonic");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let path = base.join("track.wav");
+    write_wav_secs(&path, 60);
+
+    let db = music_app_lib::db::init(&base.join("data")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+         VALUES ('local', 'Long', ?, 'present', 60)",
+    )
+    .bind(path.to_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+    let recorder = Recorder::default();
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    handle
+        .send(PlayerCommand::PlayQueue {
+            track_ids: vec![id],
+            start_index: 0,
+            context_name: None,
+        })
+        .unwrap();
+
+    // Out to a position far from where the seeks land, so a stale tick is
+    // unmistakable rather than within a tick of the right answer.
+    tokio::time::sleep(Duration::from_millis(4_000)).await;
+    if no_device(&recorder) {
+        eprintln!("SKIP: no audio device on this machine");
+        return;
+    }
+
+    // Several seeks, because the window is one tick wide and repeating it is
+    // the only way to widen the chance of landing in it.
+    for target in [30.0, 2.0, 45.0, 3.0, 50.0, 1.0] {
+        handle.send(PlayerCommand::Seek(target)).unwrap();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+
+    let ticks = recorder.0.progress.lock().unwrap().clone();
+    eprintln!("positions: {ticks:?}");
+
+    // A seek is the only thing that may move the position backwards, and each
+    // one is followed by its own echo -- so a backwards step is only a fault
+    // if the position it returns to is one already reported *before* the seek.
+    // Rather than model that, this looks for the signature of the bug: a jump
+    // back to a position higher than anything the track has reached since.
+    let mut faults = Vec::new();
+    for window in ticks.windows(3) {
+        let (before, seeked, after) = (window[0], window[1], window[2]);
+        // Down, then straight back up past where it was: nothing but a stale
+        // tick does that.
+        if seeked < before - 1.0 && after > seeked + 5.0 && (after - before).abs() < 1.0 {
+            faults.push((before, seeked, after));
+        }
+    }
+
+    assert!(
+        faults.is_empty(),
+        "the scrubber jumped back to a position from before the seek: {faults:?} \
+         in {ticks:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}

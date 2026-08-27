@@ -465,6 +465,19 @@ struct Coordinator<E: PlayerEvents> {
     /// The epoch of the track *playing*. The engine echoes it back so a
     /// `Finished` for a track we already moved past can be discarded.
     epoch: u64,
+    /// Which decode of the current track the coordinator is listening to.
+    ///
+    /// The bug this exists for: a position tick is already sitting in this
+    /// side's inbox when the user drags the scrubber. The seek is handled
+    /// first -- it is a command, and the bar is redrawn from the answer -- and
+    /// then the queued tick is read, passes a guard that only checks the
+    /// *track*, and puts the scrubber back where the track used to be.
+    /// Observed as `[100.0, 8.375, 100.21, ...]`.
+    ///
+    /// Bumped when the seek is *issued*, not when it returns, because the
+    /// moment to stop trusting old positions is the moment they stop being
+    /// true.
+    decode: u64,
     /// The last epoch handed out, playing or merely queued.
     ///
     /// Separate from `epoch` because a queued track needs an identity before
@@ -603,6 +616,7 @@ pub fn spawn<E: PlayerEvents>(
             track_gain_db: None,
             muted: false,
             epoch: 0,
+            decode: 0,
             issued: 0,
             // The same default the frontend restores, so the two agree even if
             // the restore never arrives. They used to differ -- off here, on
@@ -896,10 +910,23 @@ impl<E: PlayerEvents> Coordinator<E> {
                     self.emit_state();
                     self.state = resume_to;
 
-                    match self.engine.seek(position).await {
+                    let next = self.next_epoch();
+                    match self.engine.seek(position, next).await {
                         // Echo the new position straight away rather than
                         // leaving the bar stale until the next tick.
                         Ok(()) => {
+                            // Claimed here and not before the await. The
+                            // engine renames the decode only on a *successful*
+                            // seek, so claiming it early would leave the two
+                            // disagreeing after a failure -- and every later
+                            // position discarded, which is a bar that freezes
+                            // rather than one that jumps.
+                            //
+                            // Safe because the run loop is a `select!`: this
+                            // handler holds it for the whole await, so the
+                            // ticks that were in flight are still queued and
+                            // are read *after* this line.
+                            self.decode = next;
                             self.covered_from_zero = false;
                             self.last_position = position;
                             self.emit_progress(position);
@@ -1001,10 +1028,18 @@ impl<E: PlayerEvents> Coordinator<E> {
                 }
             }
 
-            EngineEvent::Progress { epoch, position } => {
+            EngineEvent::Progress {
+                epoch,
+                generation,
+                position,
+            } => {
                 // Progress deliberately does not emit full state: at five ticks
                 // a second that would churn the whole UI.
-                if epoch == self.epoch {
+                //
+                // Both halves of the identity are checked. The epoch rejects a
+                // tick about a track already moved past; the generation rejects
+                // one about *this* track from before the last seek.
+                if progress_applies(epoch, generation, self.epoch, self.decode) {
                     self.last_position = position;
                     if position >= PLAY_COUNTS_AFTER {
                         self.record_play();
@@ -1119,8 +1154,10 @@ impl<E: PlayerEvents> Coordinator<E> {
             target.is_some() && target == self.loaded && self.state != PlaybackState::Stopped;
 
         if already_loaded {
-            match self.engine.seek(Duration::ZERO).await {
+            let next = self.next_epoch();
+            match self.engine.seek(Duration::ZERO, next).await {
                 Ok(()) => {
+                    self.decode = next;
                     self.emit_progress(Duration::ZERO);
                     return;
                 }
@@ -1170,6 +1207,10 @@ impl<E: PlayerEvents> Coordinator<E> {
         self.heard_audio = false;
         self.loaded_duration = None;
         self.epoch = self.next_epoch();
+        // A fresh track is its own first decode, which is what the engine
+        // gives it. Anything reported against a later generation belonged to
+        // the track before this one.
+        self.decode = 0;
         let epoch = self.epoch;
 
         // Consumed here: a resume applies to the track being resumed, and
@@ -1530,6 +1571,8 @@ impl<E: PlayerEvents> Coordinator<E> {
         };
 
         self.epoch = next_epoch;
+        // The queued track was appended as its own first decode.
+        self.decode = 0;
         self.loaded = Some(track_id);
         self.state = PlaybackState::Playing;
         self.stalled = false;
@@ -1996,6 +2039,7 @@ impl<E: PlayerEvents> Coordinator<E> {
         // Bump the epoch so any in-flight `Finished` for the stopped track is
         // discarded rather than triggering an advance.
         self.epoch = self.next_epoch();
+        self.decode = 0;
         self.state = PlaybackState::Stopped;
         self.loaded = None;
         self.report(self.engine.stop(self.epoch));
@@ -2288,6 +2332,20 @@ struct LevelOutcome {
 /// streams, so a test built on local fixtures never produces a `LevelOutcome`
 /// at all, and a guard deleted from here would go on passing. That is exactly
 /// what happened to the first attempt at covering this.
+/// Whether a position tick describes what is playing *now*.
+///
+/// Pulled out to be tested, because the failure is a race: it needs a tick
+/// that was already in flight when a seek was issued, and no test that drives
+/// the coordinator through its public API can reliably arrange that. What can
+/// be checked exactly is the rule.
+///
+/// Two identities, and both must match. The epoch says which track; the
+/// generation says which decode of it. A seek changes only the second, which
+/// is precisely why an epoch-only guard let the scrubber jump backwards.
+fn progress_applies(epoch: u64, generation: u64, current_epoch: u64, current_decode: u64) -> bool {
+    epoch == current_epoch && generation == current_decode
+}
+
 fn reading_applies_now(loaded: Option<i64>, measured_for: i64, normalize: bool) -> bool {
     normalize && loaded == Some(measured_for)
 }
@@ -3068,8 +3126,11 @@ async fn sample_playing_track(
     .await
     .ok()??;
 
-    let duration: Option<f64> = row.try_get("duration_secs").ok().flatten();
-    let duration = duration?;
+    // `i64`, because that is what the column is. Read as `f64` this is a
+    // decode error, `.ok()` swallows it, and the `?` below returns -- which
+    // silently declined to sample *every* cold stream.
+    let duration: Option<i64> = row.try_get("duration_secs").ok().flatten();
+    let duration = duration.filter(|secs| *secs > 0)? as f64;
 
     // On disk in one form or the other: measure it properly.
     let local: Option<String> = row.try_get("local_path").ok().flatten();
@@ -3161,4 +3222,62 @@ mod level_tests {
 #[tauri::command]
 pub async fn set_target_lufs(lufs: f32, player: State<'_, PlayerHandle>) -> Result<(), String> {
     player.send(PlayerCommand::SetTargetLufs(lufs))
+}
+
+/// The rule that decides whether a position tick is still true.
+///
+/// A race is what this guards, and a race is what no test driving the
+/// coordinator through its commands can reliably arrange: the failure needs a
+/// tick already sitting in the inbox at the moment a seek is issued, which
+/// happens on a busy machine and not on a quiet one. Hence a pure function
+/// over the four numbers involved, tested exactly.
+///
+/// The reported symptom was `[100.0, 8.375, 100.21, ...]` -- a seek to 8s,
+/// honoured, and then the scrubber thrown back to where the track had been.
+#[cfg(test)]
+mod progress_guard_tests {
+    use super::progress_applies;
+
+    /// The ordinary case: this is the track, and this is its current decode.
+    #[test]
+    fn a_tick_about_the_current_decode_applies() {
+        assert!(progress_applies(7, 3, 7, 3));
+    }
+
+    /// A tick about a track already moved past. The epoch caught this before
+    /// the generation existed, and still does.
+    #[test]
+    fn a_tick_about_a_previous_track_is_discarded() {
+        assert!(!progress_applies(6, 0, 7, 0));
+    }
+
+    /// The bug. Same track, earlier decode -- a position from before the seek.
+    /// An epoch-only guard accepts this, which is exactly how the scrubber
+    /// jumped backwards.
+    #[test]
+    fn a_tick_from_before_the_seek_is_discarded() {
+        assert!(
+            !progress_applies(7, 3, 7, 4),
+            "a position from the decode before the seek was accepted, which \
+             puts the scrubber back where the track used to be"
+        );
+    }
+
+    /// And the reverse, which cannot happen but must not be accepted if it
+    /// somehow does: a generation the coordinator has not asked for.
+    #[test]
+    fn a_tick_from_a_decode_never_requested_is_discarded() {
+        assert!(!progress_applies(7, 9, 7, 4));
+    }
+
+    /// Every seek gets a number nothing else has, so two seeks in quick
+    /// succession cannot be confused for each other.
+    #[test]
+    fn successive_seeks_do_not_share_a_generation() {
+        // Three seeks, then a tick from the second one.
+        let (first, second, third) = (11_u64, 12, 13);
+        assert!(progress_applies(7, second, 7, second));
+        assert!(!progress_applies(7, second, 7, third));
+        assert!(!progress_applies(7, first, 7, third));
+    }
 }

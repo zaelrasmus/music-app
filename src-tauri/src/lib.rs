@@ -3,6 +3,7 @@ mod collections;
 mod covers;
 pub mod db;
 mod device_watch;
+mod placeholder_art;
 mod download;
 mod downloads;
 #[cfg(test)]

@@ -64,7 +64,12 @@ impl<R: Runtime> NowPlaying<R> {
         let covers = self.covers.clone();
 
         tauri::async_runtime::spawn(async move {
-            let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<f64>, Option<String>)>(
+            // `i64`, because that is what the column is. Asking sqlx for an
+            // `f64` from an INTEGER column is a decode error rather than a
+            // conversion, and the `let Ok(Some(..))` below turns that into a
+            // silent early return -- so nothing was ever sent, and Windows
+            // showed the application identifier where the title belongs.
+            let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<i64>, Option<String>)>(
                 "SELECT title, artist, album, duration_secs, cover_key FROM tracks WHERE id = ?",
             )
             .bind(track_id)
@@ -87,18 +92,29 @@ impl<R: Runtime> NowPlaying<R> {
             // *before* the display updater is committed, so a path that fails
             // takes the title, artist and album down with it -- an empty panel
             // rather than one without artwork.
-            let cover_url = cover_key
+            // Real artwork if the track has any, and the same gradient the
+            // app draws in its own tiles if it has not. Most of a scanned
+            // library carries no embedded art, so without the fallback the
+            // panel is blank for nearly every local file -- and a blank panel
+            // is one Windows has little reason to keep the media keys pointed
+            // at.
+            let cover_path = cover_key
                 .map(|key| covers.join(key))
                 .filter(|path| path.exists())
-                .map(|path| format!("file://{}", path.display()));
+                .or_else(|| {
+                    let seed = crate::placeholder_art::seed_for(&title, artist.as_deref());
+                    crate::placeholder_art::ensure(&covers.join("generated"), &seed)
+                });
+
+            let cover_url = cover_path.map(|path| format!("file://{}", path.display()));
 
             bridge.send(Update::Track {
                 title,
                 artist,
                 album,
                 duration: duration_secs
-                    .filter(|secs| secs.is_finite() && *secs > 0.0)
-                    .map(Duration::from_secs_f64),
+                    .filter(|secs| *secs > 0)
+                    .map(|secs| Duration::from_secs(secs as u64)),
                 cover_url,
             });
         });
@@ -171,5 +187,131 @@ impl<R: Runtime> Clone for NowPlaying<R> {
             shown: Arc::clone(&self.shown),
             position: Arc::clone(&self.position),
         }
+    }
+}
+
+/// The query that feeds the Windows media panel.
+///
+/// The panel showed the app's own identifier where Spotify shows a title, an
+/// artist and a cover. That is what Windows falls back to when a session has
+/// no metadata at all -- so the question was never "why does it look plain",
+/// it was "why is nothing being sent".
+#[cfg(test)]
+mod announce_tests {
+    use super::*;
+
+    async fn pool_with_track(name: &str) -> SqlitePool {
+        let dir = std::env::temp_dir().join(format!("music-app-now-playing-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::init(&dir).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO tracks (source, title, artist, album, local_path, state, \
+             duration_secs, cover_key, in_library) \
+             VALUES ('local', 'Unravel', 'ALESTI', 'Singles', '/tmp/x.wav', 'present', \
+                     241, 'abc.jpg', 1)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        db.pool
+    }
+
+    /// `duration_secs` is an INTEGER column. Asking sqlx for an `f64` is a
+    /// decode error, not a conversion -- and the caller's `let Ok(Some(..))`
+    /// turns that error into a silent early return, so the panel is never told
+    /// anything at all.
+    #[tokio::test]
+    async fn the_track_the_panel_announces_decodes() {
+        let pool = pool_with_track("i64").await;
+        let id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<i64>, Option<String>)>(
+            "SELECT title, artist, album, duration_secs, cover_key FROM tracks WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&pool)
+        .await;
+
+        let row = row.expect("the announce query failed to decode");
+        let (title, artist, album, duration, cover) = row.expect("no row");
+
+        assert_eq!(title, "Unravel");
+        assert_eq!(artist.as_deref(), Some("ALESTI"));
+        assert_eq!(album.as_deref(), Some("Singles"));
+        assert_eq!(duration, Some(241));
+        assert_eq!(cover.as_deref(), Some("abc.jpg"));
+    }
+
+    /// And the shape that was there, kept as the evidence: it does not decode,
+    /// which is the whole of why the panel was blank.
+    #[tokio::test]
+    async fn the_previous_shape_could_never_have_worked() {
+        let pool = pool_with_track("f64").await;
+        let id: i64 = sqlx::query_scalar("SELECT id FROM tracks")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<f64>, Option<String>)>(
+            "SELECT title, artist, album, duration_secs, cover_key FROM tracks WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&pool)
+        .await;
+
+        assert!(
+            row.is_err(),
+            "an INTEGER column decoded as f64 succeeded, so this was not the \
+             reason the media panel had no metadata -- look again"
+        );
+    }
+}
+
+/// The same decode question, for `Row::try_get` rather than `query_as`.
+///
+/// `sample_playing_track` reads `duration_secs` this way and turns a failure
+/// into `None` with `.ok().flatten()`, then returns early -- so if this errors,
+/// cold-stream loudness sampling never runs at all.
+#[cfg(test)]
+mod try_get_tests {
+    use sqlx::Row;
+
+    #[tokio::test]
+    async fn duration_secs_read_by_try_get() {
+        let dir = std::env::temp_dir().join("music-app-try-get");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::init(&dir).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO tracks (source, title, local_path, state, duration_secs) \
+             VALUES ('local', 'T', '/tmp/t.wav', 'present', 304)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        let row = sqlx::query("SELECT duration_secs FROM tracks")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+
+        let as_f64 = row.try_get::<Option<f64>, _>("duration_secs");
+        let as_i64 = row.try_get::<Option<i64>, _>("duration_secs");
+
+        eprintln!("try_get as f64: {as_f64:?}");
+        eprintln!("try_get as i64: {as_i64:?}");
+
+        assert_eq!(as_i64.expect("i64 decode failed"), Some(304));
+        assert!(
+            as_f64.is_err(),
+            "f64 decoded fine, so this is not why cold-stream sampling declines"
+        );
     }
 }

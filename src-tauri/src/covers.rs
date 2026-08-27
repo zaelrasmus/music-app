@@ -119,6 +119,17 @@ impl CoverStore {
 
         let mut removed = 0;
         for entry in entries.flatten() {
+            // Subdirectories are not covers and are not swept. `generated`
+            // holds the placeholder art the media panel falls back to, keyed
+            // by the track's text rather than by content -- nothing in the
+            // database references it, so a sweep by key would take all of it
+            // every time. This survived before only because `remove_file`
+            // happens to fail on a directory, which is not a rule anyone
+            // should have to know.
+            if entry.path().is_dir() {
+                continue;
+            }
+
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
 
@@ -663,3 +674,73 @@ mod tests {
             Some("https://i.ytimg.com/vi/x/hq.jpg".to_string())
         );
     }}
+
+/// That a sweep does not take the media panel's placeholder art with it.
+///
+/// The store sweeps by filename against the keys the database holds, and
+/// nothing in the database references a placeholder -- it is keyed by the
+/// track's text, not by content. So a sweep that took subdirectories would
+/// clear the panel's artwork after every scan.
+///
+/// Honest about what it catches: this passes with or without the explicit
+/// `is_dir` skip, because `remove_file` refuses a directory anyway. It guards
+/// the *outcome* against a future sweep that reaches for `remove_dir_all` or
+/// starts recursing -- both of which would pass every other test here.
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    #[test]
+    fn a_sweep_leaves_the_generated_art_alone() {
+        let dir = std::env::temp_dir().join("music-app-cover-sweep");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let store = CoverStore::new(dir.clone());
+        let kept = store.store(&tiny_jpeg()).expect("store failed");
+        let orphan = store.store(&other_jpeg()).expect("store failed");
+
+        let generated = dir.join("generated");
+        std::fs::create_dir_all(&generated).unwrap();
+        let placeholder = generated.join("deadbeef.jpg");
+        std::fs::write(&placeholder, b"not really a jpeg").unwrap();
+
+        let keep: HashSet<String> = [kept.clone()].into_iter().collect();
+        let removed = store.sweep(&keep);
+
+        assert!(store.path(&kept).is_file(), "a referenced cover was swept");
+        assert!(
+            !store.path(&orphan).is_file(),
+            "an unreferenced cover survived, so the sweep did nothing"
+        );
+        assert!(
+            placeholder.is_file(),
+            "the sweep took the media panel's placeholder art with it"
+        );
+        assert_eq!(removed, 1, "the sweep counted the directory as a removal");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two distinct, valid, tiny images -- the store re-encodes whatever it is
+    /// given, so these only have to decode.
+    fn tiny_jpeg() -> Vec<u8> {
+        encode(&[255, 0, 0])
+    }
+
+    fn other_jpeg() -> Vec<u8> {
+        encode(&[0, 0, 255])
+    }
+
+    fn encode(rgb: &[u8; 3]) -> Vec<u8> {
+        use image::codecs::jpeg::JpegEncoder;
+        use image::{ExtendedColorType, ImageEncoder};
+
+        let pixels: Vec<u8> = rgb.iter().copied().cycle().take(8 * 8 * 3).collect();
+        let mut out = Vec::new();
+        JpegEncoder::new_with_quality(&mut out, 90)
+            .write_image(&pixels, 8, 8, ExtendedColorType::Rgb8)
+            .unwrap();
+        out
+    }
+}
