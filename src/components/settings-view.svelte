@@ -5,6 +5,7 @@
     import CacheSettings from "$components/cache-settings.svelte";
     import LoudnessSettings from "$components/loudness-settings.svelte";
     import EqualizerSettings from "$components/equalizer-settings.svelte";
+    import OutputSettings from "$components/output-settings.svelte";
     import GaplessSettings from "$components/gapless-settings.svelte";
     import SilenceSettings from "$components/silence-settings.svelte";
     import ExtrasSettings from "$components/extras-settings.svelte";
@@ -279,6 +280,7 @@
 
         <DetailsSettings />
 
+        <OutputSettings />
         <LoudnessSettings />
         <EqualizerSettings />
         <GaplessSettings />

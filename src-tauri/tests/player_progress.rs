@@ -189,7 +189,7 @@ async fn progress_reaches_the_ui_while_a_track_plays() {
 
     let recorder = Recorder::default();
     // No ffmpeg: the fixture is a plain WAV, decoded natively by rodio.
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -276,6 +276,7 @@ async fn an_opus_file_plays_through_ffmpeg() {
         // No yt-dlp: this fixture is a local file.
         None,
         None,
+        Default::default(),
     );
 
     handle
@@ -350,6 +351,7 @@ async fn a_saved_youtube_track_streams() {
         ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
+        Default::default(),
     );
 
     handle
@@ -481,6 +483,7 @@ async fn a_saved_soundcloud_track_streams() {
         ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
+        Default::default(),
     );
 
     handle
@@ -562,6 +565,7 @@ async fn a_stream_can_be_seeked_and_reports_the_real_position() {
         ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
+        Default::default(),
     );
 
     handle
@@ -655,7 +659,7 @@ async fn a_local_file_still_seeks_natively() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -736,6 +740,7 @@ async fn replaying_a_stream_skips_the_resolve() {
         ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
+        Default::default(),
     );
 
     let skippable = |e: &String| {
@@ -863,6 +868,7 @@ async fn the_next_stream_is_ready_before_the_current_track_ends() {
         ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
+        Default::default(),
     );
 
     handle
@@ -986,6 +992,7 @@ async fn a_streamed_track_is_cached_and_replays_without_the_network() {
             Some(std::path::PathBuf::from("ffmpeg")),
             Some(std::path::PathBuf::from("yt-dlp")),
             Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
+            Default::default(),
         );
 
         handle
@@ -1032,6 +1039,7 @@ async fn a_streamed_track_is_cached_and_replays_without_the_network() {
         // The whole point: there is no way to resolve a stream now.
         None,
         Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
+        Default::default(),
     );
 
     let started = std::time::Instant::now();
@@ -1104,6 +1112,7 @@ async fn commands_are_answered_while_a_track_is_loading() {
         ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
+        Default::default(),
     );
 
     handle
@@ -1200,7 +1209,7 @@ async fn a_restored_track_waits_in_the_bar_then_resumes_where_it_was() {
     .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     handle
         .send(PlayerCommand::Restore {
@@ -1293,7 +1302,7 @@ async fn a_position_at_the_end_of_a_track_is_not_restored() {
     .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     // Two seconds from the end.
     handle
@@ -1349,6 +1358,7 @@ async fn a_track_left_part_way_through_is_fetched_for_offline() {
         ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
+        Default::default(),
     );
 
     handle
@@ -1453,6 +1463,7 @@ async fn the_offline_copy_guards_hold() {
         None,
         None,
         Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
+        Default::default(),
     );
 
     handle.send(PlayerCommand::SetKeepAbandoned(true)).unwrap();
@@ -1521,7 +1532,7 @@ async fn a_play_is_recorded_only_once_it_has_been_listened_to() {
     .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     // Play the short one through to its end.
     handle
@@ -1648,6 +1659,7 @@ async fn leaving_a_streamed_track_part_way_announces_the_cache_fill() {
         Some(music_app_lib::audio_cache::AudioCache::new(
             base.join("cache"),
         )),
+        Default::default(),
     );
 
     handle
@@ -1752,7 +1764,7 @@ async fn a_track_that_never_starts_still_resets_the_position() {
     let (playable, broken) = (ids[0], ids[1]);
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -1838,7 +1850,7 @@ async fn the_state_and_the_queue_agree_about_what_is_playing() {
     .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -1923,7 +1935,7 @@ async fn changing_track_leaves_nothing_of_the_previous_one_in_the_bar() {
     .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     for id in [local, online] {
         handle
@@ -2020,6 +2032,7 @@ async fn a_cache_copy_that_will_not_decode_is_thrown_away() {
         // instead of going to the network. Eviction is what is under test.
         Some(base.join("no-such-yt-dlp.exe")),
         Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
+        Default::default(),
     );
 
     handle
@@ -2111,6 +2124,7 @@ async fn a_cache_copy_ffmpeg_complains_about_does_not_survive_the_play() {
         Some(ffmpeg),
         Some(base.join("no-such-yt-dlp.exe")),
         Some(music_app_lib::audio_cache::AudioCache::new(cache_dir.clone())),
+        Default::default(),
     );
 
     handle
@@ -2192,7 +2206,7 @@ async fn a_track_that_starts_playing_is_also_described() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -2291,6 +2305,7 @@ async fn the_bar_can_name_a_streamed_track() {
         ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
+        Default::default(),
     );
 
     handle
@@ -2433,6 +2448,7 @@ async fn the_bar_can_name_a_stream_chosen_mid_listen() {
         ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
+        Default::default(),
     );
 
     handle
@@ -2593,6 +2609,7 @@ async fn the_bar_can_name_a_stream_it_advanced_into() {
         ffmpeg(),
         Some(std::path::PathBuf::from("yt-dlp")),
         None,
+        Default::default(),
     );
 
     // Both in one context, so the stream is reached by the track before it
@@ -2677,7 +2694,7 @@ async fn without_a_decoder_the_player_stops_and_says_why() {
 
     let recorder = Recorder::default();
     // The condition under test: no decoder anywhere.
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), None, None, None, Default::default());
 
     handle
         .send(PlayerCommand::PlayQueue {
@@ -2756,7 +2773,7 @@ async fn one_track_hands_over_to_the_next_without_a_gap() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     handle.send(PlayerCommand::SetGapless(true)).unwrap();
     handle
@@ -2852,7 +2869,7 @@ async fn handover_gap(name: &str, gapless: bool) -> Option<Duration> {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     handle.send(PlayerCommand::SetGapless(gapless)).unwrap();
     handle
@@ -2989,6 +3006,7 @@ async fn the_reported_tracks_hand_over_without_a_gap() {
         // No cache: this is about the handover, and a cache copy would make a
         // rerun measure something different from the first run.
         None,
+        Default::default(),
     );
 
     handle.send(PlayerCommand::SetGapless(true)).unwrap();
@@ -3098,7 +3116,7 @@ async fn two_tracks(name: &str) -> (Recorder, player::PlayerHandle, Vec<i64>, st
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     (recorder, handle, ids, base)
 }
@@ -3472,7 +3490,7 @@ async fn tail_fixture(
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
 
     (recorder, handle, ids, base)
 }
@@ -3597,7 +3615,7 @@ async fn a_short_pause_inside_a_track_does_not_end_it() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
     handle.send(PlayerCommand::SetTrimSilence(true)).unwrap();
     handle
         .send(PlayerCommand::PlayQueue {
@@ -3665,7 +3683,7 @@ async fn a_silent_track_plays_to_its_end_rather_than_being_trimmed() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
     handle.send(PlayerCommand::SetTrimSilence(true)).unwrap();
     handle
         .send(PlayerCommand::PlayQueue {
@@ -3780,7 +3798,7 @@ async fn plays_to(
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
     handle.send(PlayerCommand::SetTrimSilence(true)).unwrap();
     for command in setup {
         handle.send(command).unwrap();
@@ -3864,7 +3882,7 @@ async fn muting_part_way_through_does_not_end_the_track() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
     handle.send(PlayerCommand::SetTrimSilence(true)).unwrap();
     handle
         .send(PlayerCommand::PlayQueue {
@@ -3974,7 +3992,7 @@ async fn trimming_and_gapless_are_independent_settings() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
     handle.send(PlayerCommand::SetGapless(true)).unwrap();
     handle.send(PlayerCommand::SetTrimSilence(false)).unwrap();
     handle
@@ -4081,7 +4099,7 @@ async fn a_mixed_queue_hands_over_seamlessly_at_every_join() {
     assert!(yt_dlp.is_some(), "the staged yt-dlp sidecar is missing");
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), yt_dlp, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), yt_dlp, None, Default::default());
     handle.send(PlayerCommand::SetGapless(true)).unwrap();
     handle.send(PlayerCommand::SetTrimSilence(true)).unwrap();
     handle
@@ -4196,7 +4214,7 @@ async fn seeking_backwards_never_reports_the_old_position_again() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
     handle
         .send(PlayerCommand::PlayQueue {
             track_ids: vec![id],
@@ -4279,7 +4297,7 @@ async fn an_ab_loop_returns_to_its_start_on_time() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
     handle.send(PlayerCommand::SetTrimSilence(false)).unwrap();
     handle
         .send(PlayerCommand::PlayQueue {
@@ -4378,7 +4396,7 @@ async fn the_sleep_timer_pauses_where_it_was() {
         .unwrap();
 
     let recorder = Recorder::default();
-    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None);
+    let handle = player::spawn(recorder.clone(), db.pool.clone(), ffmpeg(), None, None, Default::default());
     handle.send(PlayerCommand::SetTrimSilence(false)).unwrap();
     handle
         .send(PlayerCommand::PlayQueue {

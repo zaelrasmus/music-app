@@ -371,6 +371,13 @@ pub enum PlayerCommand {
     SetTargetLufs(f32),
     /// Whether to correct each track towards a common loudness.
     SetNormalize(bool),
+    /// Play through the output device with this id, or follow the system.
+    ///
+    /// The id is cpal's, stored by the frontend the same way volume is, and
+    /// passed to the engine without being checked against the devices present.
+    /// A saved choice for something that is not plugged in right now is the
+    /// case the engine is built to hold on to, not one to throw away.
+    SetOutputDevice(Option<String>),
     SetGapless(bool),
     SetTrimSilence(bool),
     /// Pause after a delay, or at the end of the track. `None` cancels.
@@ -651,9 +658,10 @@ pub fn spawn<E: PlayerEvents>(
     ffmpeg: Option<std::path::PathBuf>,
     yt_dlp: Option<std::path::PathBuf>,
     audio_cache: Option<AudioCache>,
+    active_output: crate::device_watch::ActiveOutput,
 ) -> PlayerHandle {
     let (engine_tx, engine_rx) = mpsc::unbounded_channel();
-    let engine = engine::spawn(engine_tx, ffmpeg.clone());
+    let engine = engine::spawn(engine_tx, ffmpeg.clone(), active_output);
 
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (loads_tx, loads_rx) = mpsc::unbounded_channel();
@@ -992,6 +1000,17 @@ impl<E: PlayerEvents> Coordinator<E> {
                     self.track_gain_db = self.track_gain_for(track_id).await;
                 }
                 self.apply_track_gain();
+            }
+
+            PlayerCommand::SetOutputDevice(id) => {
+                // Nothing else to do here. The engine answers through
+                // `EngineEvent::Output`, which lands in `handle_output_change`
+                // -- the same path a device being unplugged takes, and the
+                // place the prepared decode is already dropped for being built
+                // at the old device's rate.
+                if let Err(e) = self.engine.set_output_device(id) {
+                    self.events.error(e);
+                }
             }
 
             // Straight through to the shared atomics the audio thread reads.
@@ -3014,6 +3033,57 @@ pub async fn set_volume_ceiling(
 #[tauri::command]
 pub async fn set_normalize(on: bool, player: State<'_, PlayerHandle>) -> Result<(), String> {
     player.send(PlayerCommand::SetNormalize(on))
+}
+
+/// Every output that can be chosen, and the one sound is coming out of.
+///
+/// Both together because they are read together and can disagree: a chosen
+/// device that is not plugged in is absent from `devices` while `active` names
+/// whatever the engine fell back to. Two commands would let the picker render
+/// one half of a moment and the other half of the next.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputStatus {
+    pub devices: Vec<crate::device_watch::OutputDevice>,
+    /// The id of the device audio is actually playing through.
+    ///
+    /// Reported rather than worked out in the frontend. "The chosen device
+    /// when it is connected, the system default when it is not" is a rule the
+    /// engine owns, and a copy of it in the UI would be a second one that can
+    /// disagree -- telling somebody their music is coming out of a device it
+    /// is not.
+    pub active_id: Option<String>,
+    /// What to call it, for a device that is playing but not in the list.
+    pub active_name: Option<String>,
+}
+
+/// What the picker shows.
+///
+/// Enumerates on every call rather than caching: it is measured at 8.3 ms, it
+/// only runs when the settings page is open, and a cached list is exactly the
+/// thing that would still show headphones five seconds after they came out.
+#[tauri::command]
+pub async fn output_status(active: State<'_, crate::device_watch::ActiveOutput>) -> Result<OutputStatus, String> {
+    let playing = active.get();
+
+    Ok(OutputStatus {
+        devices: crate::device_watch::output_devices(),
+        active_id: playing.as_ref().and_then(|open| open.id.clone()),
+        active_name: playing.map(|open| open.name),
+    })
+}
+
+/// Sends playback to a particular device, or back to whatever the system uses.
+///
+/// `None` is "follow the system", which is the default and is not the same as
+/// naming the device that happens to be the default today -- one tracks the
+/// system's choice from then on and the other pins this endpoint.
+#[tauri::command]
+pub async fn set_output_device(
+    id: Option<String>,
+    player: State<'_, PlayerHandle>,
+) -> Result<(), String> {
+    player.send(PlayerCommand::SetOutputDevice(id))
 }
 
 /// Turns gapless handover on or off.

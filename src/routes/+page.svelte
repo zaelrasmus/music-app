@@ -19,6 +19,7 @@
     import { downloads } from "$lib/downloads.svelte";
     import { extras } from "$lib/extras.svelte";
     import { waveform } from "$lib/waveform.svelte";
+    import { devices } from "$lib/devices.svelte";
 
     import LibraryView from "$components/library-view.svelte";
     import ProviderSearch from "$components/provider-search.svelte";
@@ -49,7 +50,12 @@
         ytDlp.refresh();
         downloads.refresh();
         extras.restore().then(() => waveform.reload(player.trackId));
-        player.restorePreferences().then(() => player.restorePlayback());
+        // Both before playback is restored, and for the same reason: a track
+        // that starts before its device and volume are set is a track that
+        // gets rebuilt a moment later, which is an audible gap at launch.
+        Promise.all([player.restorePreferences(), devices.restore()]).then(() =>
+            player.restorePlayback(),
+        );
         equalizer.restore();
 
         const scans = trackStore.listenForScans();

@@ -2,7 +2,7 @@ pub mod audio_cache;
 mod collections;
 mod covers;
 pub mod db;
-mod device_watch;
+pub mod device_watch;
 mod placeholder_art;
 mod download;
 mod downloads;
@@ -239,9 +239,23 @@ pub fn run() {
             // Two spawns rather than one over a boxed trait object: the sink
             // is a generic parameter, and the whole point of that is that the
             // coordinator calls it without a vtable on every progress tick.
+            // Written by the audio thread with whatever it actually opened,
+            // and read by the settings picker. Managed as well as handed over
+            // so the picker can ask without going through the coordinator --
+            // it is a fact to look up, not a playback decision to make.
+            let active_output = device_watch::ActiveOutput::default();
+            app.manage(active_output.clone());
+
             match events {
                 Some(events) => {
-                    app.manage(player::spawn(events, pool, ffmpeg, yt_dlp, Some(audio_cache)));
+                    app.manage(player::spawn(
+                        events,
+                        pool,
+                        ffmpeg,
+                        yt_dlp,
+                        Some(audio_cache),
+                        active_output,
+                    ));
                 }
                 None => {
                     app.manage(player::spawn(
@@ -250,6 +264,7 @@ pub fn run() {
                         ffmpeg,
                         yt_dlp,
                         Some(audio_cache),
+                        active_output,
                     ));
                 }
             }
@@ -361,6 +376,8 @@ pub fn run() {
             player::set_loop_queue,
             player::set_volume_ceiling,
             player::set_normalize,
+            player::output_status,
+            player::set_output_device,
             player::set_gapless,
             player::set_trim_silence,
             player::set_sleep_timer,

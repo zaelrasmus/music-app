@@ -207,6 +207,13 @@ enum Command {
         track_gain: f32,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Play through the device with this id, or `None` to follow the system.
+    ///
+    /// A command rather than shared state, unlike the equaliser: acting on it
+    /// means tearing down the stream and rebuilding the decode, which only the
+    /// audio thread may do, and it happens once when somebody clicks rather
+    /// than forty-eight thousand times a second.
+    SetOutputDevice(Option<String>),
 }
 
 /// What the device watcher last saw, sent only when it changed.
@@ -223,6 +230,27 @@ enum Command {
 /// on a tick that was going to happen anyway -- which matters because that
 /// poll is what decides how quickly one track hands over to the next.
 type DeviceReport = Option<crate::device_watch::DeviceIdentity>;
+
+/// The cells the audio thread shares with the rest of the app.
+///
+/// One struct rather than four parameters threaded side by side: they are
+/// built together in [`spawn`], moved together onto the thread, and every new
+/// one would otherwise widen the same signature again. `Chain` exists one
+/// level down for exactly this reason.
+///
+/// All of them are read or written *without* going through the command
+/// channel, which is the point: a slider drag, a silence count and a device
+/// name have no business interrupting the 50 ms poll that decides how quickly
+/// one track hands over to the next.
+struct Shared {
+    /// The rate the device runs at, so every decoder can be built to match.
+    output_rate: Arc<AtomicU32>,
+    eq: Arc<EqSettings>,
+    /// Consecutive silent frames at the output.
+    silence: Arc<AtomicU32>,
+    /// Where sound is actually coming out, for the settings picker.
+    active: crate::device_watch::ActiveOutput,
+}
 
 /// Handle to the audio thread.
 ///
@@ -383,6 +411,16 @@ impl AudioEngine {
         self.send(Command::SetTrackGain(linear))
     }
 
+    /// Sends playback to a particular output device, or back to the system's.
+    ///
+    /// Fire and forget. The reopen takes as long as opening a stream takes and
+    /// the result is announced through `EngineEvent::Output` regardless --
+    /// waiting for it here would block the caller on the audio thread for a
+    /// setting whose success is audible.
+    pub fn set_output_device(&self, id: Option<String>) -> Result<(), String> {
+        self.send(Command::SetOutputDevice(id))
+    }
+
     /// Jumps to `position` in the current track.
     ///
     /// `try_seek` blocks until the audio callback acknowledges, which is why
@@ -426,7 +464,16 @@ async fn await_reply(
     }
 }
 
-pub fn spawn(events: UnboundedSender<EngineEvent>, ffmpeg: Option<PathBuf>) -> AudioEngine {
+/// Starts the audio thread.
+///
+/// `active` is written by that thread with whatever it actually opened, so the
+/// settings picker can say where sound is going without recomputing the rule
+/// that decided it.
+pub fn spawn(
+    events: UnboundedSender<EngineEvent>,
+    ffmpeg: Option<PathBuf>,
+    active: crate::device_watch::ActiveOutput,
+) -> AudioEngine {
     let (tx, rx) = mpsc::channel();
     let output_rate = Arc::new(AtomicU32::new(crate::transcode::DEFAULT_OUTPUT_RATE));
     let published = Arc::clone(&output_rate);
@@ -446,7 +493,20 @@ pub fn spawn(events: UnboundedSender<EngineEvent>, ffmpeg: Option<PathBuf>) -> A
 
     std::thread::Builder::new()
         .name("audio".to_string())
-        .spawn(move || run(rx, device_rx, events, ffmpeg, published, audio_eq, audio_silence))
+        .spawn(move || {
+            run(
+                rx,
+                device_rx,
+                events,
+                ffmpeg,
+                Shared {
+                    output_rate: published,
+                    eq: audio_eq,
+                    silence: audio_silence,
+                    active,
+                },
+            );
+        })
         .expect("audio thread should spawn");
 
     AudioEngine {
@@ -508,7 +568,52 @@ impl Output {
     }
 }
 
-/// Opens the default output, with a callback that reports a dying stream.
+/// Opens the output the listener should be hearing.
+///
+/// `preferred` is the id of a device they chose in settings, or `None` for
+/// "follow the system". A chosen device that is not connected, or that will
+/// not open, falls through to the default rather than failing: unplugging a
+/// USB interface should mean the music comes out of the speakers, not that it
+/// stops. [`reopen_reason`] is what notices the fallback and moves back the
+/// moment the device returns.
+fn open_output(preferred: Option<&str>) -> Result<Output, String> {
+    if let Some(chosen) = preferred
+        .and_then(crate::device_watch::find)
+        .and_then(open_device)
+    {
+        return Ok(chosen);
+    }
+
+    open_default()
+}
+
+/// Opens one named device, with a callback that reports a dying stream.
+///
+/// `open_sink_or_fallback` only tries other *configurations of this same
+/// device*, never another device -- which is exactly right for a chosen one.
+/// Anything broader would quietly move the music somewhere nobody picked.
+fn open_device(device: rodio::cpal::Device) -> Option<Output> {
+    // Read from the device in hand rather than probed separately, so the
+    // identity cannot describe something other than what is being opened.
+    let identity = crate::device_watch::identify(&device);
+    let failed = Arc::new(AtomicBool::new(false));
+
+    let watched = Arc::clone(&failed);
+    let mut sink = DeviceSinkBuilder::from_device(device)
+        .ok()?
+        .with_error_callback(move |_| watched.store(true, Ordering::Relaxed))
+        .open_sink_or_fallback()
+        .ok()?;
+    sink.log_on_drop(false);
+
+    Some(Output {
+        sink,
+        identity,
+        failed,
+    })
+}
+
+/// Opens whatever the system considers the default output.
 ///
 /// Not `DeviceSinkBuilder::open_default_sink`, which is what this used to be:
 /// that is an associated function with no way to attach an error callback, and
@@ -519,7 +624,7 @@ impl Output {
 /// fall back to a *non-default* device, which is the only thing that works on
 /// a system reporting no default at all. A stream with no failure signal beats
 /// no stream.
-fn open_output() -> Result<Output, String> {
+fn open_default() -> Result<Output, String> {
     // Read before opening, so the identity describes the device this stream is
     // about to be built on rather than whatever is default a moment later.
     let identity = crate::device_watch::current_default();
@@ -566,6 +671,19 @@ enum OutputState<'a> {
     },
 }
 
+/// Tells the rest of the app where sound is actually coming out.
+///
+/// Derived from the output the engine is holding rather than from what a
+/// reopen *intended*, so a fallback is reported as the device it landed on.
+fn publish(active: &crate::device_watch::ActiveOutput, device: &Result<Output, String>) {
+    active.set(
+        device
+            .as_ref()
+            .ok()
+            .and_then(|output| output.identity.clone()),
+    );
+}
+
 /// Why the engine would reopen its output, if at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reopen {
@@ -578,26 +696,112 @@ enum Reopen {
     /// because the ordinary reason for this is that the machine has no audio
     /// device and asking every 50 ms would achieve nothing but the asking.
     Absent,
+    /// Sound is playing, but not through the device the listener chose.
+    ///
+    /// The ordinary reason is that it is unplugged, so this is a *standing*
+    /// state rather than an event: it persists until the device comes back.
+    /// Retried on the same timer as `Absent`, and the caller checks that the
+    /// device is actually connected before acting -- reopening to land on the
+    /// same fallback would tear the track down every two seconds for nothing.
+    Missing,
+}
+
+/// Whether the open output is the one that was asked for.
+///
+/// The id is the whole comparison. Name, rate and channels all belong to
+/// `DeviceIdentity` because a *change* in any of them needs a new stream, but
+/// the question here is which endpoint this is, and only the id answers that
+/// -- measured on this machine, all three outputs are called "Speakers".
+///
+/// A preference for a device that cannot report an id can never be satisfied,
+/// which is why one is never offered: see `device_watch::OutputDevice`.
+fn honours(
+    identity: Option<&crate::device_watch::DeviceIdentity>,
+    preferred: Option<&str>,
+) -> bool {
+    match preferred {
+        // Nothing was asked for, so whatever is open is right by definition.
+        None => true,
+        Some(wanted) => identity.and_then(|open| open.id.as_deref()) == Some(wanted),
+    }
+}
+
+/// Which device's reading [`reopen_reason`] should be judged against.
+///
+/// The watcher reports the *system default*, which is the device that matters
+/// only while nothing has been chosen. Once something is, the default is
+/// beside the point -- plugging in a monitor changes it and must change
+/// nothing here -- and the question becomes what the **chosen** device looks
+/// like now. So the reading is substituted, and one rule serves both cases.
+///
+/// `look_up` is how a chosen device is read, injected so the substitution can
+/// be tested without hardware: it is the whole of the pinning design, and a
+/// mistake in it is silent in both directions.
+///
+/// It is consulted only on a tick the watcher spoke on, which is what keeps
+/// this affordable -- a lookup measured at 2.2 ms when an endpoint actually
+/// changed, and nothing at all on the other twenty ticks a second.
+fn device_to_watch<F>(
+    preferred: Option<&str>,
+    reported: Option<&DeviceReport>,
+    look_up: F,
+) -> Option<crate::device_watch::DeviceIdentity>
+where
+    F: FnOnce(&str) -> Option<crate::device_watch::DeviceIdentity>,
+{
+    match (preferred, reported) {
+        // Something changed and a device was chosen: go and look at that one.
+        (Some(id), Some(_)) => look_up(id),
+        // Nothing changed, so there is nothing to compare against. Not the
+        // same as "the device is gone" -- `reopen_reason` reads `None` as no
+        // new information, which is exactly right here.
+        (Some(_), None) => None,
+        // The ordinary case: follow the system, and the watcher already said
+        // what the system is doing.
+        (None, reading) => reading.and_then(Clone::clone),
+    }
 }
 
 /// Decides whether the output needs reopening.
 ///
-/// `seen` is the latest probe of the system default, or `None` when the probe
-/// found no device.
+/// `seen` is the latest reading of **the device that matters** -- the system
+/// default when nothing was chosen, and the chosen device itself when
+/// something was. That substitution is the caller's, and it is what lets one
+/// rule serve both: the question is always "does what I have open still match
+/// what I should be on", and only the answer to "which device is that" moves.
+///
+/// `None` means nothing was read this tick, which is the ordinary case: the
+/// watcher speaks only when something changed.
 fn reopen_reason(
     state: OutputState<'_>,
     seen: Option<&crate::device_watch::DeviceIdentity>,
+    preferred: Option<&str>,
 ) -> Reopen {
     match state {
         OutputState::None => Reopen::Absent,
-        // Checked before the identity: a dead stream needs replacing whether
-        // or not the device it was opened on is still the default one.
+        // Checked before everything else: a dead stream needs replacing
+        // whether or not the device it was opened on is still the right one.
         OutputState::Open { failed: true, .. } => Reopen::Broken,
-        // A probe that found nothing is not evidence that the device went
+        // Playing somewhere other than where it was asked to. What the
+        // *system default* is has no bearing on this: plugging in a monitor
+        // with speakers makes it the default on Windows, and moving the music
+        // onto it would undo the choice this setting exists to express.
+        OutputState::Open { identity, .. }
+            if preferred.is_some() && !honours(identity, preferred) =>
+        {
+            Reopen::Missing
+        }
+        // A reading that found nothing is not evidence that the device went
         // away. Enumeration can fail transiently, and tearing down a working
         // stream over that would turn a hiccup into silence. A device that
         // really vanished leaves a dead stream, which `failed` reports.
         OutputState::Open { .. } if seen.is_none() => Reopen::No,
+        // The device is the right one and its *configuration* moved -- 48 kHz
+        // to 44.1 in the Sound control panel. Reached by a chosen device as
+        // much as by the default one, which is the whole reason `seen` is
+        // resolved against the preference rather than fixed to the default:
+        // missing it here is not silence, it is every later decode built for
+        // a rate the device no longer runs at.
         OutputState::Open { identity, .. } if identity != seen => Reopen::Switched,
         OutputState::Open { .. } => Reopen::No,
     }
@@ -625,6 +829,22 @@ fn still_matches(prepared: Option<BuiltSource>, device_rate: u32) -> Option<Buil
     prepared.filter(|ready| ready.decoded.sample_rate().get() == device_rate)
 }
 
+/// What a reopen ended up doing.
+///
+/// Both halves can be populated at once, which is the whole reason this is not
+/// a `Result`: the output can change *and* the track on it fail to rebuild.
+/// While this was `Result<Option<String>, String>` the name was dropped on
+/// exactly that path, so the coordinator's "switched to X, but playback could
+/// not resume" message could never be produced -- every failure arrived
+/// nameless and read as "lost the audio output device".
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Reopened {
+    /// What audio now plays through, when an output was opened at all.
+    name: Option<String>,
+    /// `None` on a clean reopen.
+    error: Option<String>,
+}
+
 /// Reopens the output and puts the current track back where it was.
 ///
 /// The resume is the same manoeuvre [`seek`] performs, for the same reason: a
@@ -632,10 +852,6 @@ fn still_matches(prepared: Option<BuiltSource>, device_rate: u32) -> Option<Buil
 /// rebuilding it rather than redirecting it. Position and paused state are
 /// carried across, so the audible result of switching headphones mid-song is a
 /// short gap and then the same song.
-///
-/// Returns the name of the device now in use. An `Err` means either that no
-/// output could be opened at all, or that one was but the track on it could
-/// not be rebuilt -- in both cases the caller has something to tell the user.
 fn reopen(
     device: &mut Result<Output, String>,
     player: &mut Option<Player>,
@@ -643,7 +859,8 @@ fn reopen(
     output_rate: &AtomicU32,
     chain: &Chain,
     ffmpeg: Option<&Path>,
-) -> Result<Option<String>, String> {
+    preferred: Option<&str>,
+) -> Reopened {
     let position = position_of(player, loaded);
     let was_paused = player.as_ref().is_some_and(|p| p.is_paused());
 
@@ -654,11 +871,14 @@ fn reopen(
     *player = None;
     *device = Err("Reopening the audio output.".to_string());
 
-    let output = match open_output() {
+    let output = match open_output(preferred) {
         Ok(output) => output,
         Err(e) => {
             *device = Err(e.clone());
-            return Err(e);
+            return Reopened {
+                name: None,
+                error: Some(e),
+            };
         }
     };
 
@@ -675,7 +895,7 @@ fn reopen(
 
     let resumed = match loaded.as_mut() {
         // Nothing was playing, so there is nothing to put back.
-        None => Ok(()),
+        None => None,
         Some(current) => match build_source(&current.source, ffmpeg, rate, position) {
             Ok(built) => {
                 let replacement = start(&output.sink, built.decoded, chain, &current.gain);
@@ -686,17 +906,20 @@ fn reopen(
                 *player = Some(replacement);
                 current.offset = position;
                 current.starved = built.starved;
-                Ok(())
+                None
             }
             // The device is fine, this track could not be rebuilt on it. Left
             // loaded on purpose: a later seek or replay can try again, which
             // is better than forgetting what was playing.
-            Err(e) => Err(e),
+            Err(e) => Some(e),
         },
     };
 
     *device = Ok(output);
-    resumed.map(|()| name)
+    Reopened {
+        name,
+        error: resumed,
+    }
 }
 
 fn run(
@@ -704,19 +927,42 @@ fn run(
     device_rx: Receiver<DeviceReport>,
     events: UnboundedSender<EngineEvent>,
     ffmpeg: Option<PathBuf>,
-    output_rate: Arc<AtomicU32>,
-    eq: Arc<EqSettings>,
-    silence: Arc<AtomicU32>,
+    shared: Shared,
 ) {
+    let Shared {
+        output_rate,
+        eq,
+        silence,
+        active,
+    } = shared;
+
+    // The device the listener chose, by id, or "follow the system".
+    //
+    // Starts unset even when one is saved: the frontend restores it a moment
+    // after launch, through `SetOutputDevice`, the same way it restores volume
+    // and repeat. Reading it here would mean the audio thread waiting on the
+    // settings file before it could open anything.
+    let mut preferred: Option<String> = None;
+
     // If there is no device we keep the error and fail every play with it,
     // rather than killing the thread and making every later command report
     // "not running". Unlike before, this is no longer the only chance: the
     // device watcher and the retry below both lead back here.
-    let mut device = open_output();
+    let mut device = open_output(preferred.as_deref());
     if let Ok(output) = &device {
         // Told to everyone who builds a decoder, before anything can.
         output_rate.store(output.rate(), Ordering::Release);
     }
+    publish(&active, &device);
+
+    // The last thing said about the output.
+    //
+    // A `Missing` device is a standing state, not an event, so the decision to
+    // reopen is retaken every couple of seconds for as long as it lasts. Any
+    // of those attempts that lands somewhere it has already reported has
+    // nothing new to say, and saying it anyway would put a toast on screen
+    // every two seconds until the listener plugged something back in.
+    let mut announced: Option<Reopened> = None;
 
     // When an absent output may be retried. In the past, so the first
     // opportunity is taken.
@@ -761,57 +1007,75 @@ fn run(
     loop {
         // --- the output device ------------------------------------------
         //
-        // Checked before every command and on every poll, which costs a
-        // `try_recv` on an empty channel and one relaxed atomic load. No
-        // device is enumerated here: the probe runs on the watcher's thread,
-        // and `reopen` does the only other one, immediately before it opens
-        // something.
+        // Checked before every command and on every poll. On a quiet tick --
+        // the overwhelming majority -- that is a `try_recv` on an empty
+        // channel, one relaxed atomic load and a comparison: `device_to_watch`
+        // reads nothing without a report to act on, and `reopen` does the only
+        // other enumeration, immediately before it opens something.
+        //
+        // A tick with nothing reported still goes through the same rule rather
+        // than short-circuiting to `No`, because two of the states it can find
+        // are invisible to any reading of a device: a stream that died while
+        // its endpoint stayed put -- a Bluetooth headset that dropped out and
+        // came back under the same name -- and an output that was never opened
+        // because the machine had no sound card at launch. A third joins them
+        // now: an interface chosen in settings that is still unplugged.
         //
         // `.last()` collapses a burst. Connecting a dock can report several
         // times in a row and only the newest says where sound goes now.
         let reported = device_rx.try_iter().last();
         let state = device.as_ref().map_or(OutputState::None, Output::state);
 
-        let reason = match reported {
-            Some(seen) => reopen_reason(state, seen.as_ref()),
-            // Nothing new to report and a stream that is fine. The overwhelming
-            // majority of ticks.
-            None if matches!(state, OutputState::Open { failed: false, .. }) => Reopen::No,
-            // Nothing reported, and either there is no output at all or its
-            // stream has died. These are exactly the two failures a probe of
-            // the *default device* cannot see, because in both of them the
-            // default is unchanged -- a Bluetooth headset that dropped out and
-            // came back under the same name, or a machine that had no sound
-            // card when the engine started.
-            None => reopen_reason(state, None),
-        };
+        let want = preferred.as_deref();
+        let seen = device_to_watch(want, reported.as_ref(), |id| {
+            crate::device_watch::find(id).and_then(|found| crate::device_watch::identify(&found))
+        });
+        let reason = reopen_reason(state, seen.as_ref(), want);
 
         if reason != Reopen::No {
             let now = std::time::Instant::now();
 
             // A switch is acted on at once; the user is standing there waiting
-            // to hear something. An output that is absent or broken is retried
-            // on a timer, because the ordinary reason for it is that there is
-            // no device to open and asking twenty times a second would achieve
-            // nothing but the asking.
+            // to hear something. Everything else is retried on a timer,
+            // because the ordinary reason for it is that there is no device to
+            // open and asking twenty times a second would achieve nothing but
+            // the asking.
             if reason == Reopen::Switched || now >= retry_output_at {
                 retry_output_at = now + REOPEN_RETRY;
-                // The reopen rebuilds the player from the current position,
-                // and an appended track cannot survive that.
-                queued = None;
 
-                let outcome = reopen(
-                    &mut device,
-                    &mut player,
-                    &mut loaded,
-                    &output_rate,
-                    &chain,
-                    ffmpeg.as_deref(),
-                );
-                let _ = events.send(EngineEvent::Output {
-                    name: outcome.as_ref().ok().cloned().flatten(),
-                    error: outcome.err(),
-                });
+                // The one reason worth checking before acting on. Sound *is*
+                // playing, just not where it was asked to; tearing the track
+                // down only to land on the same fallback would interrupt it
+                // every two seconds for as long as the device stayed away.
+                // Measured at 2.2 ms against 8.3 ms to enumerate the lot, so
+                // the id is looked up rather than the list rebuilt.
+                let worthwhile = reason != Reopen::Missing
+                    || want.and_then(crate::device_watch::find).is_some();
+
+                if worthwhile {
+                    // The reopen rebuilds the player from the current
+                    // position, and an appended track cannot survive that.
+                    queued = None;
+
+                    let outcome = reopen(
+                        &mut device,
+                        &mut player,
+                        &mut loaded,
+                        &output_rate,
+                        &chain,
+                        ffmpeg.as_deref(),
+                        want,
+                    );
+                    publish(&active, &device);
+
+                    if announced.as_ref() != Some(&outcome) {
+                        announced = Some(outcome.clone());
+                        let _ = events.send(EngineEvent::Output {
+                            name: outcome.name,
+                            error: outcome.error,
+                        });
+                    }
+                }
             }
         }
 
@@ -928,6 +1192,27 @@ fn run(
                 // means nothing to correct.
                 if let Some(current) = &loaded {
                     current.gain.store(linear.to_bits(), Ordering::Relaxed);
+                }
+            }
+
+            Ok(Command::SetOutputDevice(id)) => {
+                // Recorded and nothing else. Every rule about what to open,
+                // when to fall back and when to move back lives at the top of
+                // this loop, and the next tick is 50 ms away -- close enough
+                // that acting here as well would only be a second copy of the
+                // same decision, able to disagree with the first.
+                //
+                // `announced` is cleared because the listener just asked for
+                // something: even an outcome identical to the last one is news
+                // now, and suppressing it would leave a click with no answer.
+                if preferred != id {
+                    preferred = id;
+                    announced = None;
+                    // Due now rather than whenever the retry timer next comes
+                    // round. Choosing a device is somebody clicking and then
+                    // listening for the change; up to two seconds of nothing
+                    // reads as a control that did not work.
+                    retry_output_at = std::time::Instant::now();
                 }
             }
 
@@ -1852,7 +2137,7 @@ mod tests {
             ffmpeg.is_some(),
             "no staged ffmpeg -- see src-tauri/binaries/README.md",
         );
-        let engine = spawn(tx, ffmpeg);
+        let engine = spawn(tx, ffmpeg, crate::device_watch::ActiveOutput::default());
 
         let played = engine
             .play(PlayableSource::LocalFile(wav), None, Duration::ZERO, 1, 1.0)
@@ -2963,7 +3248,7 @@ mod loopback_probe {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let ffmpeg = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg);
         assert!(ffmpeg.is_some(), "the staged ffmpeg sidecar is missing");
-        let engine = spawn(tx, ffmpeg);
+        let engine = spawn(tx, ffmpeg, crate::device_watch::ActiveOutput::default());
         // Linear amplitude, not a slider position: the point of the probe is to
         // drive the endpoint at a chosen level, and levels are what the chain
         // after this app turns out to be sensitive to.
@@ -3250,7 +3535,7 @@ mod device_tests {
         let device = identity("wasapi:a", 48_000);
 
         assert_eq!(
-            reopen_reason(open(Some(&device), false), Some(&device.clone())),
+            reopen_reason(open(Some(&device), false), Some(&device.clone()), None),
             Reopen::No
         );
     }
@@ -3262,7 +3547,7 @@ mod device_tests {
         let now = identity("wasapi:b", 48_000);
 
         assert_eq!(
-            reopen_reason(open(Some(&open_on), false), Some(&now)),
+            reopen_reason(open(Some(&open_on), false), Some(&now), None),
             Reopen::Switched
         );
     }
@@ -3275,7 +3560,7 @@ mod device_tests {
         let now = identity("wasapi:a", 44_100);
 
         assert_eq!(
-            reopen_reason(open(Some(&open_on), false), Some(&now)),
+            reopen_reason(open(Some(&open_on), false), Some(&now), None),
             Reopen::Switched
         );
     }
@@ -3288,7 +3573,7 @@ mod device_tests {
         let device = identity("wasapi:a", 48_000);
 
         assert_eq!(
-            reopen_reason(open(Some(&device), true), Some(&device.clone())),
+            reopen_reason(open(Some(&device), true), Some(&device.clone()), None),
             Reopen::Broken
         );
     }
@@ -3301,16 +3586,16 @@ mod device_tests {
     fn a_probe_that_found_nothing_does_not_tear_down_a_working_stream() {
         let device = identity("wasapi:a", 48_000);
 
-        assert_eq!(reopen_reason(open(Some(&device), false), None), Reopen::No);
+        assert_eq!(reopen_reason(open(Some(&device), false), None, None), Reopen::No);
     }
 
     /// Launched with no sound card, or an earlier reopen failed. Retried on a
     /// timer, which is why it is its own reason rather than a `Switched`.
     #[test]
     fn having_no_output_is_retried_rather_than_left() {
-        assert_eq!(reopen_reason(OutputState::None, None), Reopen::Absent);
+        assert_eq!(reopen_reason(OutputState::None, None, None), Reopen::Absent);
         assert_eq!(
-            reopen_reason(OutputState::None, Some(&identity("wasapi:a", 48_000))),
+            reopen_reason(OutputState::None, Some(&identity("wasapi:a", 48_000)), None),
             Reopen::Absent
         );
     }
@@ -3323,15 +3608,206 @@ mod device_tests {
         device.id = None;
 
         assert_eq!(
-            reopen_reason(open(Some(&device), false), Some(&device.clone())),
+            reopen_reason(open(Some(&device), false), Some(&device.clone()), None),
             Reopen::No
         );
 
         let mut reconfigured = device.clone();
         reconfigured.sample_rate = 44_100;
         assert_eq!(
-            reopen_reason(open(Some(&device), false), Some(&reconfigured)),
+            reopen_reason(open(Some(&device), false), Some(&reconfigured), None),
             Reopen::Switched
+        );
+    }
+
+    /// The rule the picker exists for, and the one an unmodified engine gets
+    /// backwards.
+    ///
+    /// With a device chosen, `seen` is that device -- the caller resolves it
+    /// that way -- so the system default is not an input to this decision at
+    /// all. That is the point: plugging in a monitor makes it the default
+    /// output on Windows, and without the substitution the music would move
+    /// onto the monitor's speakers, undoing the choice this setting exists to
+    /// express.
+    #[test]
+    fn a_chosen_device_that_is_still_there_is_left_alone() {
+        let chosen = identity("wasapi:a", 48_000);
+
+        assert_eq!(
+            reopen_reason(
+                open(Some(&chosen), false),
+                Some(&chosen.clone()),
+                Some("wasapi:a"),
+            ),
+            Reopen::No
+        );
+    }
+
+    /// A chosen device that is connected but not the one playing.
+    ///
+    /// How the engine gets *back* after a fallback: it came up while the
+    /// interface was unplugged, opened the default, and the interface has
+    /// since returned. Without this the choice would hold only until the first
+    /// time the device was missing at launch.
+    #[test]
+    fn a_chosen_device_that_is_not_the_one_playing_is_missing() {
+        let fallback = identity("wasapi:b", 48_000);
+        let chosen = identity("wasapi:a", 48_000);
+
+        assert_eq!(
+            reopen_reason(open(Some(&fallback), false), Some(&chosen), Some("wasapi:a")),
+            Reopen::Missing
+        );
+    }
+
+    /// And the unplugged case, where the chosen device cannot be read at all.
+    ///
+    /// `Missing` rather than `No`, which is the difference between a choice
+    /// that survives its device being away and one that is silently forgotten
+    /// the moment the cable comes out. Checked *before* the "found nothing is
+    /// not evidence" rule, because here it is: the lookup was for one named
+    /// device, not an enumeration that might have failed transiently.
+    #[test]
+    fn a_chosen_device_that_cannot_be_found_is_still_missing() {
+        let fallback = identity("wasapi:b", 48_000);
+
+        assert_eq!(
+            reopen_reason(open(Some(&fallback), false), None, Some("wasapi:a")),
+            Reopen::Missing
+        );
+    }
+
+    /// A dead stream is still a dead stream. Checked before the preference,
+    /// because a chosen device that stopped working has to be reopened even
+    /// though it is exactly the device that was asked for.
+    #[test]
+    fn a_failed_stream_outranks_being_on_the_chosen_device() {
+        let chosen = identity("wasapi:a", 48_000);
+
+        assert_eq!(
+            reopen_reason(open(Some(&chosen), true), Some(&chosen.clone()), Some("wasapi:a")),
+            Reopen::Broken
+        );
+    }
+
+    /// The chosen device, reconfigured from 48 kHz to 44.1 in the Sound
+    /// control panel.
+    ///
+    /// The quiet failure, and the one pinning a device could easily have
+    /// reintroduced: the id still matches, so the choice is honoured, and a
+    /// rule that stopped there would answer `No` and leave every later decode
+    /// built for a rate the device no longer runs at. `seen` being the
+    /// *chosen* device rather than the default is what makes this reachable.
+    #[test]
+    fn a_chosen_device_that_is_reconfigured_is_still_a_switch() {
+        let chosen = identity("wasapi:a", 48_000);
+        let now = identity("wasapi:a", 44_100);
+
+        assert!(
+            honours(Some(&now), Some("wasapi:a")),
+            "the choice is still honoured -- which is exactly why this case is \
+             easy to miss"
+        );
+        assert_eq!(
+            reopen_reason(open(Some(&chosen), false), Some(&now), Some("wasapi:a")),
+            Reopen::Switched
+        );
+    }
+
+    /// Going back to "follow the system" from a device that is not the
+    /// default. The preference is gone, so the ordinary rule applies again and
+    /// the mismatch reads as a switch -- immediately, not on the retry timer.
+    #[test]
+    fn clearing_the_choice_switches_back_to_the_default() {
+        let chosen = identity("wasapi:a", 48_000);
+        let default = identity("wasapi:b", 48_000);
+
+        assert_eq!(
+            reopen_reason(open(Some(&chosen), false), Some(&default), None),
+            Reopen::Switched
+        );
+    }
+
+    /// With nothing chosen, the watcher's reading is used as it stands.
+    #[test]
+    fn following_the_system_watches_what_the_watcher_reported() {
+        let default = identity("wasapi:a", 48_000);
+
+        assert_eq!(
+            device_to_watch(None, Some(&Some(default.clone())), |_| panic!(
+                "nothing was chosen, so no device should have been looked up"
+            )),
+            Some(default)
+        );
+    }
+
+    /// The substitution, and the reason the whole pinned design works: what is
+    /// compared is the *chosen* device, never the default. Without this the
+    /// engine would compare a pinned interface against the laptop speakers,
+    /// find them different, and reopen on every report for ever.
+    #[test]
+    fn a_chosen_device_is_watched_instead_of_the_default() {
+        let default = identity("wasapi:b", 48_000);
+        let chosen = identity("wasapi:a", 44_100);
+
+        let watched = device_to_watch(Some("wasapi:a"), Some(&Some(default)), |id| {
+            assert_eq!(id, "wasapi:a", "the wrong device was looked up");
+            Some(chosen.clone())
+        });
+
+        assert_eq!(watched, Some(chosen));
+    }
+
+    /// A chosen device is looked up even when the watcher found no default at
+    /// all -- which is what unplugging the only other output looks like.
+    #[test]
+    fn a_chosen_device_is_looked_up_even_with_no_default() {
+        let chosen = identity("wasapi:a", 48_000);
+
+        assert_eq!(
+            device_to_watch(Some("wasapi:a"), Some(&None), |_| Some(chosen.clone())),
+            Some(chosen)
+        );
+    }
+
+    /// Nothing reported means no lookup at all. This is the twenty-ticks-a-
+    /// second case, and doing 2.2 ms of enumeration on it would put a device
+    /// probe inside the loop that decides how quickly one track hands over to
+    /// the next.
+    #[test]
+    fn a_tick_with_no_report_reads_no_device() {
+        assert_eq!(
+            device_to_watch(Some("wasapi:a"), None, |_| panic!(
+                "a quiet tick must not enumerate audio endpoints"
+            )),
+            None
+        );
+        assert_eq!(
+            device_to_watch(None, None, |_| panic!("nor with nothing chosen")),
+            None
+        );
+    }
+
+    /// `honours` compares ids and nothing else, because on this machine all
+    /// three outputs are called "Speakers" -- see `device_watch::describe`.
+    #[test]
+    fn only_the_id_decides_whether_a_choice_was_honoured() {
+        let a = identity("wasapi:a", 48_000);
+
+        assert!(honours(Some(&a), None), "nothing chosen is always honoured");
+        assert!(honours(Some(&a), Some("wasapi:a")));
+        assert!(!honours(Some(&a), Some("wasapi:b")));
+        assert!(
+            !honours(None, Some("wasapi:a")),
+            "an output with no identity cannot be shown to be the chosen one"
+        );
+
+        let mut nameless = a.clone();
+        nameless.id = None;
+        assert!(
+            !honours(Some(&nameless), Some("wasapi:a")),
+            "a device that cannot report an id can never satisfy a preference, \
+             which is why the picker never offers one"
         );
     }
 
@@ -3432,7 +3908,7 @@ mod reopen_device_tests {
         let wav = dir.join("tone.wav");
         write_wav(&wav);
 
-        let device = open_output().expect("there is no output device to test against");
+        let device = open_output(None).expect("there is no output device to test against");
         let output_rate = Arc::new(AtomicU32::new(device.rate()));
 
         let chain = Chain {
@@ -3478,17 +3954,17 @@ mod reopen_device_tests {
             "the fixture did not start playing ({before:?}), so this proves nothing"
         );
 
-        let name = reopen(
+        let outcome = reopen(
             &mut device,
             &mut player,
             &mut loaded,
             &output_rate,
             &chain,
             Some(&ffmpeg),
-        )
-        .expect("reopening the default device failed");
+            None,
+        );
 
-        eprintln!("reopened on {name:?}");
+        eprintln!("reopened on {:?}", outcome.name);
         assert!(device.is_ok(), "the output was not reopened");
         assert!(player.is_some(), "the track was not put back on the device");
 
@@ -3521,8 +3997,8 @@ mod reopen_device_tests {
             &output_rate,
             &chain,
             Some(&ffmpeg),
-        )
-        .expect("reopening the default device failed");
+            None,
+        );
 
         assert!(
             player.as_ref().expect("nothing is loaded").is_paused(),
@@ -3549,8 +4025,8 @@ mod reopen_device_tests {
             &output_rate,
             &chain,
             Some(&ffmpeg),
-        )
-        .expect("reopening the default device failed");
+            None,
+        );
 
         let published = output_rate.load(Ordering::Acquire);
         assert_eq!(
@@ -3561,13 +4037,124 @@ mod reopen_device_tests {
         eprintln!("republished {published} Hz");
     }
 
+    /// That a chosen id opens the endpoint it names.
+    ///
+    /// The one claim no pure test can make. Everything in `device_tests`
+    /// checks the *decision* to switch; this checks the doing, and it is the
+    /// half that talks to WASAPI.
+    ///
+    /// A **non-default** device is picked wherever the machine has one,
+    /// because opening the default by id would pass just as well if the id
+    /// were being thrown away -- which is exactly the bug worth catching.
+    #[test]
+    #[ignore = "needs a real output device"]
+    fn a_chosen_device_is_the_one_that_opens() {
+        let devices = crate::device_watch::output_devices();
+        assert!(!devices.is_empty(), "no output device to test against");
+
+        let target = devices
+            .iter()
+            .find(|device| !device.is_default)
+            .unwrap_or(&devices[0]);
+        if target.is_default {
+            eprintln!(
+                "only one output device on this machine, so this cannot tell \
+                 an honoured id from an ignored one"
+            );
+        }
+
+        let output = open_output(Some(&target.id)).expect("the chosen device would not open");
+        let opened = output.identity.as_ref().and_then(|open| open.id.clone());
+
+        eprintln!("asked for {} -- opened {:?}", target.name, output.identity);
+        assert_eq!(
+            opened.as_deref(),
+            Some(target.id.as_str()),
+            "sound would come out of a device nobody picked"
+        );
+    }
+
+    /// A saved choice for a device that is not plugged in.
+    ///
+    /// Falling back is the whole reason the setting can be trusted: unplugging
+    /// an interface means the music moves to the speakers, not that it stops.
+    /// An `Err` here would be silence.
+    #[test]
+    #[ignore = "needs a real output device"]
+    fn a_device_that_is_not_here_falls_back_to_the_default() {
+        let output = open_output(Some("wasapi:{00000000-0000-0000-0000-000000000000}"))
+            .expect("an absent device must fall back, not fail -- that is silence");
+
+        let opened = output.identity.as_ref().and_then(|open| open.id.clone());
+        let default = crate::device_watch::current_default().and_then(|open| open.id);
+
+        eprintln!("fell back to {:?}", output.identity);
+        assert_eq!(opened, default, "the fallback did not land on the default");
+    }
+
+    /// End to end, on real hardware: the track carries on, on the chosen
+    /// device.
+    ///
+    /// `reopening_puts_the_track_back_where_it_was` proves the resume; this
+    /// proves the resume happens *somewhere in particular*, which is what a
+    /// picker is for.
+    #[test]
+    #[ignore = "needs a real output device and runs in real time"]
+    fn switching_to_a_chosen_device_keeps_the_track_playing() {
+        let devices = crate::device_watch::output_devices();
+        assert!(!devices.is_empty(), "no output device to test against");
+        let target = devices
+            .iter()
+            .find(|device| !device.is_default)
+            .unwrap_or(&devices[0]);
+
+        let (mut device, mut player, mut loaded, chain, ffmpeg, output_rate) = playing("chosen");
+
+        std::thread::sleep(Duration::from_millis(600));
+        let before = position_of(&player, &loaded);
+        assert!(
+            before >= Duration::from_millis(300),
+            "the fixture did not start playing ({before:?}), so this proves nothing"
+        );
+
+        let outcome = reopen(
+            &mut device,
+            &mut player,
+            &mut loaded,
+            &output_rate,
+            &chain,
+            Some(&ffmpeg),
+            Some(&target.id),
+        );
+
+        eprintln!("moved to {:?}", outcome.name);
+        assert_eq!(outcome.error, None, "the track could not be rebuilt");
+        assert_eq!(
+            device
+                .as_ref()
+                .ok()
+                .and_then(|open| open.identity.as_ref())
+                .and_then(|open| open.id.as_deref()),
+            Some(target.id.as_str()),
+            "the reopen did not land on the chosen device"
+        );
+        assert!(player.is_some(), "the track was not put back on the device");
+
+        let after = position_of(&player, &loaded);
+        assert!(
+            after >= before,
+            "the track restarted at {after:?} having reached {before:?} -- \
+             choosing a device must not rewind the song"
+        );
+    }
+
     /// Nothing playing is an ordinary state, not a special case -- the device
     /// still has to be reopened so the *next* track has somewhere to go.
     #[test]
     #[ignore = "needs a real output device"]
     fn reopening_with_nothing_playing_still_opens_the_device() {
         let ffmpeg = crate::sidecar::staged_for_tests(crate::sidecar::Tool::Ffmpeg);
-        let mut device = open_output();
+        let mut device = open_output(None);
         let mut player = None;
         let mut loaded = None;
         let chain = Chain {
@@ -3584,8 +4171,8 @@ mod reopen_device_tests {
             &output_rate,
             &chain,
             ffmpeg.as_deref(),
-        )
-        .expect("reopening with nothing playing failed");
+            None,
+        );
 
         assert!(device.is_ok());
         assert!(player.is_none());
@@ -3611,7 +4198,7 @@ mod shutdown_tests {
     #[tokio::test]
     async fn dropping_the_engine_ends_the_audio_thread() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = spawn(tx, None);
+        let engine = spawn(tx, None, crate::device_watch::ActiveOutput::default());
 
         drop(engine);
 
@@ -3849,7 +4436,7 @@ mod reopen_audio_tests {
         let wav = tone_file("settings", 0.0);
         let source = PlayableSource::LocalFile(wav);
 
-        let mut device = Ok(open_output().expect("there is no output device to test against"));
+        let mut device = Ok(open_output(None).expect("there is no output device to test against"));
         let output_rate = Arc::new(AtomicU32::new(device.as_ref().unwrap().rate()));
 
         // Distinctive on purpose: a reset would be flat and unity.
@@ -3886,8 +4473,8 @@ mod reopen_audio_tests {
             &output_rate,
             &chain,
             Some(&ffmpeg),
-        )
-        .expect("reopening the default device failed");
+            None,
+        );
 
         assert!(
             Arc::strong_count(&chain.eq) > 1,
@@ -3922,7 +4509,7 @@ mod reopen_audio_tests {
         let wav = tone_file("seek", 0.0);
         let source = PlayableSource::LocalFile(wav);
 
-        let mut device = Ok(open_output().expect("there is no output device to test against"));
+        let mut device = Ok(open_output(None).expect("there is no output device to test against"));
         let output_rate = Arc::new(AtomicU32::new(device.as_ref().unwrap().rate()));
         let chain = Chain {
             volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
@@ -3956,8 +4543,8 @@ mod reopen_audio_tests {
             &output_rate,
             &chain,
             Some(&ffmpeg),
-        )
-        .expect("reopening the default device failed");
+            None,
+        );
 
         // A brand-new player must not read as an ended track, or the poll that
         // watches for the end would advance to the next song the instant
@@ -4044,7 +4631,7 @@ mod steady_state_tests {
         write_silence(&wav, 120);
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = spawn(tx, ffmpeg);
+        let engine = spawn(tx, ffmpeg, crate::device_watch::ActiveOutput::default());
 
         engine
             .play(PlayableSource::LocalFile(wav), None, Duration::ZERO, 1, 1.0)
@@ -4226,7 +4813,7 @@ mod output_quality_tests {
         stream.play().expect("could not start capture");
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = spawn(tx, ffmpeg);
+        let engine = spawn(tx, ffmpeg, crate::device_watch::ActiveOutput::default());
         engine.set_volume(1.0).expect("set volume");
         engine
             .play(PlayableSource::LocalFile(wav), None, Duration::ZERO, 1, 1.0)
@@ -4496,7 +5083,7 @@ mod gapless_tests {
         let second = PlayableSource::LocalFile(fixture("second", 5.0));
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = spawn(tx, Some(ffmpeg.clone()));
+        let engine = spawn(tx, Some(ffmpeg.clone()), crate::device_watch::ActiveOutput::default());
         engine
             .play(first, None, Duration::ZERO, 1, 1.0)
             .await
@@ -4557,7 +5144,7 @@ mod gapless_tests {
         let third = PlayableSource::LocalFile(fixture("three", 5.0));
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = spawn(tx, Some(ffmpeg.clone()));
+        let engine = spawn(tx, Some(ffmpeg.clone()), crate::device_watch::ActiveOutput::default());
         engine
             .play(first, None, Duration::ZERO, 1, 1.0)
             .await
@@ -4592,7 +5179,7 @@ mod gapless_tests {
         let source = PlayableSource::LocalFile(fixture("alone", 3.0));
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = spawn(tx, Some(ffmpeg.clone()));
+        let engine = spawn(tx, Some(ffmpeg.clone()), crate::device_watch::ActiveOutput::default());
 
         let rate = engine.output_rate();
         let built = tokio::task::spawn_blocking({
@@ -4625,7 +5212,7 @@ mod gapless_tests {
         let third = PlayableSource::LocalFile(fixture("c", 5.0));
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = spawn(tx, Some(ffmpeg.clone()));
+        let engine = spawn(tx, Some(ffmpeg.clone()), crate::device_watch::ActiveOutput::default());
         engine
             .play(first, None, Duration::ZERO, 1, 1.0)
             .await
@@ -4695,7 +5282,7 @@ mod gapless_tests {
         let second = PlayableSource::LocalFile(fixture("seek-b", 5.0));
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = spawn(tx, Some(ffmpeg.clone()));
+        let engine = spawn(tx, Some(ffmpeg.clone()), crate::device_watch::ActiveOutput::default());
         engine
             .play(first, None, Duration::ZERO, 1, 1.0)
             .await
@@ -4764,7 +5351,7 @@ mod gapless_tests {
         let second = PlayableSource::LocalFile(fixture("cancel-b", 5.0));
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = spawn(tx, Some(ffmpeg.clone()));
+        let engine = spawn(tx, Some(ffmpeg.clone()), crate::device_watch::ActiveOutput::default());
         engine
             .play(first, None, Duration::ZERO, 1, 1.0)
             .await
@@ -4839,7 +5426,7 @@ mod gapless_tests {
         let only = PlayableSource::LocalFile(fixture("cancel-none", 10.0));
 
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = spawn(tx, Some(ffmpeg.clone()));
+        let engine = spawn(tx, Some(ffmpeg.clone()), crate::device_watch::ActiveOutput::default());
         engine
             .play(only, None, Duration::ZERO, 1, 1.0)
             .await

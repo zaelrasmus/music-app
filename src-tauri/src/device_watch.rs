@@ -93,22 +93,152 @@ pub struct DeviceIdentity {
 /// engine that compared its stream's negotiated config against this probe
 /// would see a difference on every poll and reopen forever.
 pub fn current_default() -> Option<DeviceIdentity> {
-    let device = rodio::cpal::default_host().default_output_device()?;
+    identify(&rodio::cpal::default_host().default_output_device()?)
+}
+
+/// Fingerprints one device, default or not.
+///
+/// `None` when the device will not describe its configuration, which on
+/// WASAPI is what a disabled or half-removed endpoint does. Treated as "not
+/// usable" rather than as an error: the engine's answer either way is to open
+/// something else.
+pub fn identify(device: &rodio::cpal::Device) -> Option<DeviceIdentity> {
     let config = device.default_output_config().ok()?;
 
     Some(DeviceIdentity {
         id: device.id().ok().map(|id| id.to_string()),
-        // `description()` rather than the deprecated `name()`, which is a
-        // thin wrapper over it. Only the name is taken: the rest is
-        // manufacturer and connection detail that a person picking a device
-        // would want and an equality check would only make noisier.
-        name: device.description().map_or_else(
-            |_| "the audio device".to_string(),
-            |described| described.name().to_string(),
-        ),
+        name: describe(device),
         sample_rate: config.sample_rate(),
         channels: config.channels(),
     })
+}
+
+/// What to call a device on screen.
+///
+/// The name alone is not enough, which is not obvious until it is measured.
+/// On this machine `description().name()` returns **"Speakers" for all three**
+/// outputs -- the built-in Realtek, a Razer headset and a virtual THX Spatial
+/// endpoint. A picker built on it would offer three identical rows.
+///
+/// What separates them is `driver()`, and `"Speakers (Razer BlackShark V2
+/// Pro)"` is the string Windows itself shows in the volume flyout, so
+/// appending it costs nothing to learn and matches what people already read.
+///
+/// The rest of `DeviceDescription` is deliberately left out: `manufacturer`
+/// and `address` were empty on all three, and `interface_type` claimed S/PDIF
+/// for a Bluetooth headset -- a label that is wrong is worse than none.
+fn describe(device: &rodio::cpal::Device) -> String {
+    let Ok(described) = device.description() else {
+        return "the audio device".to_string();
+    };
+
+    let name = described.name();
+    match described.driver() {
+        // The guards are for a backend where the two coincide. "Speakers
+        // (Speakers)" would be a worse label than "Speakers".
+        Some(driver) if !driver.is_empty() && driver != name => format!("{name} ({driver})"),
+        _ => name.to_string(),
+    }
+}
+
+/// An output the listener can choose between.
+///
+/// Only devices cpal can both identify and describe a configuration for appear
+/// here. A device with no id cannot be *stored* as a preference, and a choice
+/// that forgets itself on the next launch is worse than one that was never
+/// offered; a device that will not report a config is one [`identify`] has
+/// already judged unusable.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputDevice {
+    pub id: String,
+    pub name: String,
+    /// Whether this is what the system would pick on its own.
+    ///
+    /// Shown, never acted on. It is what "Follow the system" resolves to at
+    /// this moment, and the only way for someone to tell which entry they get
+    /// by choosing nothing.
+    pub is_default: bool,
+}
+
+/// Every output that can be chosen, in whatever order the host enumerates.
+///
+/// Deliberately not sorted. The order a host reports endpoints in is the order
+/// the operating system's own volume flyout shows them, and re-sorting
+/// alphabetically would put this list out of step with the one people already
+/// know.
+///
+/// An empty vector is the honest answer for a machine with no sound card, and
+/// for a host that will not enumerate at all -- neither is a failure the
+/// listener can do anything about, and both mean the same thing to a picker.
+pub fn output_devices() -> Vec<OutputDevice> {
+    let host = rodio::cpal::default_host();
+
+    // Read first, so the flag describes the same moment as the list. Asking
+    // per device would let the default change halfway down and mark two.
+    let default = host
+        .default_output_device()
+        .and_then(|device| device.id().ok())
+        .map(|id| id.to_string());
+
+    let Ok(devices) = host.output_devices() else {
+        return Vec::new();
+    };
+
+    devices
+        .filter_map(|device| {
+            let id = device.id().ok()?.to_string();
+            // Not for the fingerprint -- for the refusal inside it. A device
+            // that cannot describe a config cannot be opened either, and
+            // offering it would be offering silence.
+            identify(&device)?;
+
+            Some(OutputDevice {
+                is_default: default.as_deref() == Some(id.as_str()),
+                name: describe(&device),
+                id,
+            })
+        })
+        .collect()
+}
+
+/// The device an id names, if it is connected.
+///
+/// `None` covers both "no such device" and "the host will not enumerate", and
+/// the caller treats them alike: whatever was chosen is not available, so
+/// something else has to play.
+pub fn find(id: &str) -> Option<rodio::cpal::Device> {
+    rodio::cpal::default_host()
+        .output_devices()
+        .ok()?
+        .find(|device| device.id().is_ok_and(|found| found.to_string() == id))
+}
+
+/// Where sound is actually coming out, published for anyone who asks.
+///
+/// Written by the audio thread, which is the only thing that may touch a
+/// device, and read by the settings command -- the same arrangement as
+/// `AudioEngine::output_rate` and for the same reason.
+///
+/// It exists because the engine's rule (the chosen device when it is
+/// connected, the system default when it is not) is a *policy*, and a picker
+/// that recomputed that policy to label itself would be a second copy of it
+/// that can disagree. Better to say what actually happened.
+#[derive(Debug, Clone, Default)]
+pub struct ActiveOutput(std::sync::Arc<std::sync::Mutex<Option<DeviceIdentity>>>);
+
+impl ActiveOutput {
+    /// `None` when there is no working output at all, which is what a machine
+    /// with nothing plugged in looks like.
+    pub fn get(&self) -> Option<DeviceIdentity> {
+        self.0.lock().ok().and_then(|held| held.clone())
+    }
+
+    pub fn set(&self, identity: Option<DeviceIdentity>) {
+        if let Ok(mut held) = self.0.lock() {
+            *held = identity;
+        }
+    }
 }
 
 /// Watches the default output and reports every change to `report`.
@@ -370,10 +500,18 @@ mod notify {
                 last.clone()
             };
 
-            if woken && seen == last {
-                continue;
-            }
-
+            // Deliberately *not* suppressed when it matches what was last
+            // said, which is where this parts company with `poll_loop`.
+            //
+            // The two wake for different reasons. A poll wakes on a timer, so
+            // the only news it can carry is a difference. A notification wakes
+            // because an endpoint genuinely changed, so the wake *is* the
+            // news -- and what changed is not always visible in the default:
+            // reconfiguring a device the listener chose in settings, while
+            // some other device is the system default, moves nothing here at
+            // all. Reporting anyway lets the engine go and look at the device
+            // it actually cares about. It answers "no difference" for the
+            // ones that turn out not to concern it, which costs a comparison.
             last = seen.clone();
             if !report(seen) {
                 break;
@@ -613,6 +751,60 @@ mod tests {
         assert_eq!(identity("wasapi:a", 48_000), identity("wasapi:a", 48_000));
     }
 
+    /// What the picker would offer on this machine, and what enumerating costs.
+    ///
+    /// The cost is the number that matters: a chosen device that is *not*
+    /// connected has the engine enumerate once every `REOPEN_RETRY` to see
+    /// whether it came back, and that is only defensible if it is cheap.
+    ///
+    /// `cargo test --lib output_device_list -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs a real output device"]
+    fn output_device_list() {
+        const RUNS: u32 = 20;
+
+        // Warm: the first call on a thread initialises COM on Windows, which
+        // is not what a repeat check pays.
+        let devices = output_devices();
+
+        let start = std::time::Instant::now();
+        for _ in 0..RUNS {
+            let _ = output_devices();
+        }
+        let each = start.elapsed() / RUNS;
+
+        eprintln!("{} device(s), {each:?} to enumerate", devices.len());
+        for device in &devices {
+            eprintln!(
+                "  {}{}\n      id: {}",
+                device.name,
+                if device.is_default { "  [default]" } else { "" },
+                device.id,
+            );
+        }
+
+        let lookup = std::time::Instant::now();
+        let found = devices.first().map(|first| find(&first.id).is_some());
+        eprintln!("find() by id: {found:?} in {:?}", lookup.elapsed());
+
+        assert!(
+            !devices.is_empty(),
+            "no output device could be offered, so the picker would be empty \
+             on a machine that plays sound"
+        );
+        assert_eq!(
+            found,
+            Some(true),
+            "a device the enumeration just listed could not be found by its \
+             own id, so choosing it would silently do nothing"
+        );
+        assert_eq!(
+            devices.iter().filter(|device| device.is_default).count(),
+            1,
+            "exactly one device should be marked as the system default"
+        );
+    }
+
     /// What the probe costs, on a real machine.
     ///
     /// Ignored because it needs an audio device. Run with
@@ -707,3 +899,4 @@ mod tests {
         );
     }
 }
+
