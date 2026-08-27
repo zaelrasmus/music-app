@@ -37,6 +37,35 @@ use crate::youtube::SearchResult;
 /// someone who has just pressed a key.
 const TIMEOUT: Duration = Duration::from_secs(12);
 
+/// How much of a bundle to read before resorting to all of it.
+///
+/// The key is written into the player's configuration, which minifiers put at
+/// the front. Measured: in the 2.97 MB bundle that carries it, `client_id`
+/// sits at **byte 992** — so the old code downloaded three megabytes to read
+/// the first kilobyte of them, nine times over.
+///
+/// A ranged request for this much costs **1.5 seconds** against 14 to 56 for
+/// the whole file, and the full download is still there behind it for the day
+/// the key moves. 256 KB is far past any plausible configuration preamble
+/// while still being a rounding error next to the bundle.
+const HEAD_BYTES: u64 = 256 * 1024;
+
+/// How long to wait on the leading slice of a bundle.
+///
+/// A quarter-megabyte over a connection that managed 2.97 MB in 14 seconds is
+/// a second or two, so this is generous without being an invitation to hang.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long to wait when a whole bundle really is needed.
+///
+/// Only reached if the key has moved past [`HEAD_BYTES`]. Sized from
+/// measurement rather than taste: the bundles range from 1.5 KB to 2.97 MB,
+/// and fetching all nine at once took 59 seconds on a link that did the
+/// biggest one alone in 14. The old value applied to this was [`TIMEOUT`] —
+/// twelve seconds — which the key's own bundle could not meet, so discovery
+/// failed on a download that was merely slow.
+const ASSET_TIMEOUT: Duration = Duration::from_secs(75);
+
 /// The `client_id` in use, once one has been found.
 ///
 /// Cached for the life of the process rather than refetched per search:
@@ -609,20 +638,140 @@ async fn discover_client_id(client: &reqwest::Client) -> Result<String, String> 
         .await
         .map_err(|e| format!("Could not read SoundCloud's home page: {e}"))?;
 
-    for src in script_urls(&home) {
-        let Ok(response) = client.get(&src).send().await else {
-            continue;
-        };
-        let Ok(script) = response.text().await else {
-            continue;
-        };
+    let candidates = script_urls(&home);
+    if candidates.is_empty() {
+        return Err(NO_BUNDLES.to_string());
+    }
 
-        if let Some(found) = client_id_in(&script) {
-            return Ok(found);
+    // All at once, first answer wins.
+    //
+    // Sequentially, the total is the *sum* of nine downloads, and one bundle
+    // measured at 50 seconds for under a megabyte — so a scan could outlast
+    // any timeout worth having before ever reaching the bundle with the key.
+    // Fetched together, the wait is the slowest one that matters instead, and
+    // a bundle being throttled no longer hides the eight beside it.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(candidates.len());
+    let total = candidates.len();
+    let mut running = Vec::with_capacity(total);
+
+    for src in candidates {
+        let client = client.clone();
+        let tx = tx.clone();
+        running.push(tauri::async_runtime::spawn(async move {
+            let _ = tx.send(client_id_from(&client, &src).await).await;
+        }));
+    }
+    // The loop below ends when every sender is gone, so this one has to go now.
+    drop(tx);
+
+    let mut failures = Vec::new();
+    let mut found = None;
+
+    while let Some(outcome) = rx.recv().await {
+        match outcome {
+            Ok(Some(id)) => {
+                found = Some(id);
+                break;
+            }
+            Ok(None) => {}
+            Err(why) => failures.push(why),
         }
     }
 
-    Err("Could not find SoundCloud's search key. Searching for tracks still works.".to_string())
+    // Whatever is still downloading is now megabytes nobody will read.
+    for task in running {
+        task.abort();
+    }
+
+    found.ok_or_else(|| discovery_error(total, &failures))
+}
+
+/// Whether one bundle carries a key.
+///
+/// `Ok(None)` is "this one does not have it", `Err` is "this one could not be
+/// read". Those were the same thing before, and collapsing them is what made
+/// the failure impossible to diagnose from the message.
+///
+/// Reads the front of the bundle first and only pays for the rest if that
+/// comes up empty — see [`HEAD_BYTES`]. The whole-file path is not dead code
+/// waiting to rot: it is what keeps this working on the day SoundCloud's
+/// minifier moves the configuration, at the cost of being slow that day
+/// instead of broken.
+async fn client_id_from(client: &reqwest::Client, src: &str) -> Result<Option<String>, String> {
+    let (head, partial) = fetch_script(client, src, Some(HEAD_BYTES), HEAD_TIMEOUT).await?;
+
+    if let Some(found) = client_id_in(&head) {
+        return Ok(Some(found));
+    }
+    // The server ignored the range and sent everything, so there is nothing
+    // left to ask for.
+    if !partial {
+        return Ok(None);
+    }
+
+    let (whole, _) = fetch_script(client, src, None, ASSET_TIMEOUT).await?;
+    Ok(client_id_in(&whole))
+}
+
+/// Fetches a bundle, or as much of one as asked for.
+///
+/// The flag says whether what came back is a *slice* — a `206`. A server that
+/// ignores `Range` answers `200` with the whole file, and treating that as a
+/// slice would mean a pointless second download of something already in hand.
+///
+/// Cutting at a byte boundary can split a multi-byte character; `text()`
+/// replaces it rather than failing, and a mangled character at the very end
+/// cannot affect a key found earlier in the buffer. A key that straddles the
+/// boundary is simply not found here, and the caller falls through to the
+/// whole file.
+async fn fetch_script(
+    client: &reqwest::Client,
+    src: &str,
+    limit: Option<u64>,
+    timeout: Duration,
+) -> Result<(String, bool), String> {
+    let mut request = client.get(src).timeout(timeout);
+    if let Some(bytes) = limit {
+        request = request.header("Range", format!("bytes=0-{}", bytes - 1));
+    }
+
+    let response = request.send().await.map_err(|e| format!("{src}: {e}"))?;
+
+    let partial = response.status().as_u16() == 206;
+    let script = response.text().await.map_err(|e| format!("{src}: {e}"))?;
+
+    Ok((script, partial))
+}
+
+const NO_BUNDLES: &str =
+    "SoundCloud's home page listed no player code. Searching for tracks still works.";
+
+/// Says which of the two failures happened.
+///
+/// The distinction is the whole point of the rewrite. "Every bundle failed to
+/// download" is a network problem that will pass; "all nine downloaded and
+/// none had a key" means SoundCloud changed where it keeps one, and somebody
+/// has to go and look. One message for both is what turned a twelve-second
+/// timeout into a mystery.
+fn discovery_error(total: usize, failures: &[String]) -> String {
+    if failures.len() == total {
+        return format!(
+            "Could not download SoundCloud's player code ({total} attempts failed). \
+             Searching for tracks still works."
+        );
+    }
+    if failures.is_empty() {
+        return format!(
+            "SoundCloud's player code no longer carries a search key \
+             ({total} bundles checked). Searching for tracks still works."
+        );
+    }
+    format!(
+        "Could not find SoundCloud's search key: {} of {total} bundles had no key, \
+         {} could not be downloaded. Searching for tracks still works.",
+        total - failures.len(),
+        failures.len()
+    )
 }
 
 /// The script bundles a page loads from SoundCloud's asset host.
@@ -875,17 +1024,116 @@ mod tests {
 mod network_tests {
     use super::*;
 
+    /// The two failures the old code could not tell apart.
+    ///
+    /// It reported one sentence whichever happened, so a bundle that was
+    /// merely slow read exactly like SoundCloud having moved the key — and the
+    /// real cause (a 2.97 MB download against a 12-second timeout) stayed
+    /// invisible for as long as it took somebody to time the requests by hand.
+    #[test]
+    fn a_slow_download_does_not_read_as_a_missing_key() {
+        let all_failed = discovery_error(9, &vec!["timed out".to_string(); 9]);
+        assert!(
+            all_failed.contains("download"),
+            "nine failed downloads should say so: {all_failed}"
+        );
+
+        let none_had_it = discovery_error(9, &[]);
+        assert!(
+            none_had_it.contains("no longer carries"),
+            "nine clean misses mean SoundCloud moved it: {none_had_it}"
+        );
+
+        assert_ne!(all_failed, none_had_it);
+
+        // And the mixed case names both, rather than picking a side.
+        let mixed = discovery_error(9, &vec!["timed out".to_string(); 4]);
+        assert!(mixed.contains('5') && mixed.contains('4'), "got: {mixed}");
+    }
+
     #[tokio::test]
     async fn a_client_id_can_still_be_found() {
         let client = client().expect("an HTTPS client");
 
+        let started = std::time::Instant::now();
         let id = discover_client_id(&client)
             .await
             .expect("SoundCloud's web player should still carry a key");
 
         assert_eq!(id.len(), 32, "got: {id}");
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "got: {id}");
-        eprintln!("found a {}-character key", id.len());
+
+        // Reported, not asserted. How long this takes is a fact about the
+        // connection it ran on, and the test below pins the thing that is
+        // actually ours to get right.
+        eprintln!("found a {}-character key in {:.1?}", id.len(), started.elapsed());
+    }
+
+    /// The assumption the whole speed-up rests on.
+    ///
+    /// `client_id` sat at byte 992 of a 2.97 MB bundle when this was written,
+    /// so a ranged request for the first [`HEAD_BYTES`] finds it in about a
+    /// second where the full download took 14 to 56. If SoundCloud's minifier
+    /// ever moves the configuration past that slice, discovery keeps working
+    /// — the whole-bundle fallback sees to that — but silently starts paying
+    /// three megabytes a bundle again.
+    ///
+    /// Asserted directly rather than by timing the search, because a clock
+    /// reading here measures the network far more than it measures the code:
+    /// with the range removed entirely this same scan finished in 11 seconds
+    /// on a good link and would have passed any threshold loose enough not to
+    /// be flaky on a bad one.
+    #[tokio::test]
+    async fn the_key_sits_in_the_leading_slice_of_a_bundle() {
+        let client = client().expect("an HTTPS client");
+
+        let home = client
+            .get("https://soundcloud.com/")
+            .send()
+            .await
+            .expect("SoundCloud's home page")
+            .text()
+            .await
+            .expect("readable home page");
+
+        let urls = script_urls(&home);
+        assert!(!urls.is_empty(), "the home page listed no player code");
+
+        let mut honoured_range = 0;
+        let mut carrying_key = 0;
+
+        for src in &urls {
+            let Ok((head, partial)) =
+                fetch_script(&client, src, Some(HEAD_BYTES), HEAD_TIMEOUT).await
+            else {
+                continue;
+            };
+            if partial {
+                honoured_range += 1;
+            }
+            if client_id_in(&head).is_some() {
+                carrying_key += 1;
+            }
+        }
+
+        eprintln!(
+            "{} bundles, {honoured_range} answered a range request, \
+             {carrying_key} carried a key in their first {} KB",
+            urls.len(),
+            HEAD_BYTES / 1024
+        );
+
+        assert!(
+            honoured_range > 0,
+            "the asset host stopped answering range requests, so every \
+             discovery now downloads whole bundles"
+        );
+        assert!(
+            carrying_key > 0,
+            "no bundle carries the key in its first {} KB any more — discovery \
+             still works, but only via the whole-bundle fallback",
+            HEAD_BYTES / 1024
+        );
     }
 
     #[tokio::test]

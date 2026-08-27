@@ -8,7 +8,9 @@
     import { trackStore, type Track } from "$lib/tracks.svelte";
     import { invoke } from "@tauri-apps/api/core";
     import { cacheStore } from "$lib/cache.svelte";
+    import { lyricsStore } from "$lib/lyrics.svelte";
     import ListMusicIcon from "@lucide/svelte/icons/list-music";
+    import Mic2Icon from "@lucide/svelte/icons/mic-2";
     import PlayIcon from "@lucide/svelte/icons/play";
     import PauseIcon from "@lucide/svelte/icons/pause";
     import SkipBackIcon from "@lucide/svelte/icons/skip-back";
@@ -384,6 +386,18 @@
             onScrub={(v) => player.previewVolume(v)}
             onCommit={(v) => player.setVolume(v)}
         />
+
+        <button
+            type="button"
+            class="{ghost} {lyricsStore.open ? on : off}"
+            aria-label="Lyrics"
+            title="Lyrics  (Ctrl+L)"
+            aria-pressed={lyricsStore.open}
+            disabled={player.trackId === null}
+            onclick={() => lyricsStore.toggle()}
+        >
+            <Mic2Icon class="size-4" />
+        </button>
 
         <div class="ml-2 flex shrink-0 items-center gap-1">
             <button

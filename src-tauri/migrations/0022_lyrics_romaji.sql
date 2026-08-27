@@ -1,0 +1,19 @@
+-- Timed romanisation, where a provider has one.
+--
+-- NetEase returns three parallel tracks for a song -- the original `lrc`, a
+-- `tlyric` translation and a `romalrc` romanisation -- all sharing one set of
+-- timestamps. lrclib has no equivalent, and that single column is the concrete
+-- reason a second provider is worth having on this library rather than a
+-- vaguer "more coverage":
+--
+--   [00:00.620] 教えて教えてよ その仕組みを
+--   [00:00.620] o shi e te o shi e te yo so no shi ku mi wo
+--
+-- Stored as LRC source like `synced`, and parsed on the way out, so a fix to
+-- the parser repairs existing rows instead of needing a refetch.
+--
+-- DELIBERATELY NOT STORED: `tlyric`. It is a *Chinese* translation, which is
+-- the wrong language for this library, and carrying it would buy a third mode
+-- in the reader for an audience of nobody. The column can be added the day
+-- that stops being true.
+ALTER TABLE lyrics ADD COLUMN romaji TEXT;

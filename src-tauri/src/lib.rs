@@ -14,9 +14,12 @@ mod equalizer;
 #[cfg(test)]
 mod eq_bench;
 mod media_controls;
+mod netease;
 mod now_playing;
 mod library;
 mod loudness;
+mod lrclib;
+mod lyrics;
 mod loudness_sample;
 #[cfg(test)]
 mod loudness_window;
@@ -325,6 +328,11 @@ pub fn run() {
             downloads::cancel_download,
             downloads::clear_finished_downloads,
             download::delete_download,
+            lyrics::track_lyrics,
+            lyrics::fetch_track_lyrics,
+            lyrics::search_lyrics,
+            lyrics::pick_lyrics,
+            lyrics::set_lyrics_offset,
             player::play_queue,
             player::play_next,
             player::add_to_queue,
