@@ -30,6 +30,25 @@
          * `getItemKey` in `virtualRows`.
          */
         key?: (row: Row, index: number) => string | number;
+        /**
+         * What makes this a *different* list rather than the same one changed.
+         *
+         * When it changes the list goes back to the top. Pass whatever decides
+         * the contents — a search box, the chosen filters, the sort order.
+         *
+         * This exists because scroll position and row count are independent,
+         * and nothing puts them back in step. Search a library of a thousand
+         * songs while scrolled to row 800 and the list is still at 51,000px
+         * while the results are 400 rows long: the browser pins you to the
+         * bottom of them, and the best match — the one you typed — is at the
+         * top, off screen. It reads as "the search found nothing".
+         *
+         * Deliberately not "whenever `rows` changes". A rescan, a cover
+         * arriving, a track being renamed all replace the array with the same
+         * list, and yanking someone back to the top for those would be its own
+         * bug. Only the caller knows which is which.
+         */
+        resetKey?: unknown;
         /** Extra classes for the list element. */
         class?: string;
         row: Snippet<[Row, number]>;
@@ -40,6 +59,7 @@
         estimateSize,
         scrollElement = undefined,
         key = undefined,
+        resetKey = undefined,
         class: className = "",
         row,
     }: Props = $props();
@@ -62,6 +82,61 @@
         scrollElement: () => scrollElement ?? fromContext?.element,
         estimateSize,
         getItemKey: key ? (index) => key(rows[index], index) : undefined,
+    });
+
+    /**
+     * Back to the top when the caller says this is a different list.
+     *
+     * Declared after `virtualRows` so it runs after the effect that tells the
+     * virtualizer the new row count — scrolling to the top of a list whose
+     * length is still the old one would be corrected straight back.
+     *
+     * The first run is skipped. Mounting *is* a change of contents by this
+     * measure, and a list that scrolls itself on mount would undo any position
+     * restored for it.
+     */
+    /**
+     * The items to render — never more of them than there are rows to fill.
+     *
+     * `virtualizer.items` is republished from an `$effect`, and effects run
+     * *after* the DOM has been updated. So when a list shrinks there is one
+     * render in which the old item indexes are read against the new, shorter
+     * `rows`, and `rows[item.index]` is `undefined`.
+     *
+     * Row components dereference what they are handed — `TrackRow` reads
+     * `track.state` in a `$derived` — so that render throws, and a throw part
+     * way through an update leaves everything after it in the flush unapplied.
+     * The visible symptom is not a missing row: it is the *rest of the screen*
+     * freezing mid-change, which is how a list stuck at its dimmed "loading"
+     * opacity happens. Typing quickly hits it because every keystroke is
+     * another chance for the list to shrink.
+     *
+     * Dropped here rather than guarded inside the snippet: a row this
+     * component invented is not one the caller should have to null-check.
+     */
+    const visible = $derived(
+        virtualizer.items.filter((item) => item.index < rows.length),
+    );
+
+    let mounted = false;
+    let previous: unknown = undefined;
+
+    $effect(() => {
+        const key = resetKey;
+
+        if (!mounted) {
+            mounted = true;
+            previous = key;
+            return;
+        }
+        // Compared rather than merely depended on, so an effect that re-runs
+        // for some other reason does not throw the list back to the top. Keys
+        // are strings for this reason -- an array or object would be a new
+        // value every render and never compare equal.
+        if (key === previous) return;
+
+        previous = key;
+        virtualizer.scrollToTop();
     });
 </script>
 
@@ -94,7 +169,7 @@
     style="height: {virtualizer.totalSize}px"
     data-scrolling={virtualizer.scrolling ? "true" : undefined}
 >
-    {#each virtualizer.items as item (item.key)}
+    {#each visible as item (item.key)}
         <li
             class="absolute top-0 left-0 w-full"
             style="transform: translateY({item.start}px)"

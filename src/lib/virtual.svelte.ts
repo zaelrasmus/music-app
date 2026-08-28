@@ -55,6 +55,17 @@ export type RowVirtualizer = {
    */
   measure: (node: HTMLElement) => void;
   scrollToIndex: (index: number, options?: { align?: "start" | "center" | "end" | "auto" }) => void;
+  /**
+   * Back to the first row.
+   *
+   * Through the virtualizer rather than by assigning `scrollTop`, because it
+   * keeps bookkeeping the raw property would leave stale: the offset it
+   * *intended* to land on, and `scrollAdjustments` — the running correction
+   * built up from rows measuring taller than their estimate. Left behind, that
+   * correction is re-applied by the next row that measures and quietly scrolls
+   * the list away from the top again.
+   */
+  scrollToTop: () => void;
 };
 
 export function virtualRows(config: {
@@ -116,6 +127,16 @@ export function virtualRows(config: {
       // second effect exists to avoid. The count is kept current there.
       count: untrack(config.count),
       getScrollElement: () => element,
+      // Seeded from the element, because the core does not do it itself: its
+      // offset observer only registers listeners, so a virtualizer built onto
+      // an element that is *already* scrolled believes it is at the top until
+      // something scrolls. It then renders the first rows while the viewport
+      // is showing the middle of the list -- which looks like an empty list.
+      //
+      // Reached whenever a list is unmounted and remounted under a scroller
+      // that keeps its position: switching a view away and back, or a filter
+      // that empties the list and then fills it again.
+      initialOffset: () => element.scrollTop,
       estimateSize: (index) =>
         typeof config.estimateSize === "function"
           ? config.estimateSize(index)
@@ -164,6 +185,7 @@ export function virtualRows(config: {
     },
     measure: (node: HTMLElement) => instance?.measureElement(node),
     scrollToIndex: (index, options) => instance?.scrollToIndex(index, options),
+    scrollToTop: () => instance?.scrollToOffset(0),
   };
 }
 

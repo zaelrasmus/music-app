@@ -699,10 +699,16 @@
                 }}
             />
 
+            <!--
+              Opening another playlist, filtering this one, or re-sorting it
+              are all "a different list". Reordering by drag is not: the whole
+              point of that is watching a row land where you put it.
+            -->
             <VirtualList
                 rows={detail.tracks}
                 estimateSize={ROW_HEIGHT}
                 key={(track) => track.id}
+                resetKey="{detail.playlist.id} {playlistStore.query} {playlistStore.sort} {playlistStore.direction}"
             >
                 {#snippet row(track, index)}
                     <TrackRow

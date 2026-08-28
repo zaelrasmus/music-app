@@ -278,10 +278,19 @@
         <div class:opacity-60={libraryView.loading}>
             <SelectionBar order={flatIds} />
 
+            <!--
+              Everything that decides *which* tracks are listed, and nothing
+              that decides how one of them looks. A rescan or an arriving
+              cover replaces the array without changing the answer to "what am
+              I looking at", and must not move the list.
+            -->
             <VirtualList
                 rows={libraryView.results}
                 estimateSize={ROW_HEIGHT}
                 key={(track) => track.id}
+                resetKey="{libraryView.query} {libraryView.selectedTagIds.join(
+                    ',',
+                )} {libraryView.mode} {libraryView.sort} {libraryView.direction}"
             >
                 {#snippet row(track, index)}
                     <TrackRow

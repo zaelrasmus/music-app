@@ -306,7 +306,11 @@
                     {/if}
                 </div>
 
-                <VirtualList rows={opened.tracks} estimateSize={SEARCH_ROW_HEIGHT}>
+                <VirtualList
+                    rows={opened.tracks}
+                    estimateSize={SEARCH_ROW_HEIGHT}
+                    resetKey={opened.collection.url}
+                >
                     {#snippet row(result)}
                         {@render resultRow(result)}
                     {/snippet}
@@ -397,7 +401,11 @@
                 Opening… this takes a few seconds for a long playlist.
             </p>
         {:else}
-            <VirtualList rows={opened.tracks} estimateSize={SEARCH_ROW_HEIGHT}>
+            <VirtualList
+                    rows={opened.tracks}
+                    estimateSize={SEARCH_ROW_HEIGHT}
+                    resetKey={opened.collection.url}
+                >
                 {#snippet row(result)}
                     {@render resultRow(result)}
                 {/snippet}
@@ -448,9 +456,16 @@
         />
     {:else}
         <div class:opacity-60={providerSearch.searching}>
+            <!--
+              A new search, or the same words sent to another service, is a
+              new list — and results here are ordered by relevance, so being
+              left at the bottom of the previous one hides exactly the rows
+              worth seeing.
+            -->
             <VirtualList
                 rows={providerSearch.results}
                 estimateSize={SEARCH_ROW_HEIGHT}
+                resetKey="{providerSearch.source} {providerSearch.kind} {providerSearch.query}"
             >
                 {#snippet row(result)}
                     {@render resultRow(result)}

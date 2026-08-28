@@ -3788,6 +3788,46 @@ mod device_tests {
         );
     }
 
+    /// What reaches a device with more channels than the music has.
+    ///
+    /// Newly easy to reach: this machine's third output, `Speakers (THX
+    /// Spatial)`, advertises **8 channels** where the other two advertise 2,
+    /// and `DeviceSinkBuilder::from_device` opens every device at its own
+    /// default config. ffmpeg is hardcoded to `-ac 2`
+    /// (`transcode::OUTPUT_CHANNELS`), so the mixer has to widen 2 into 8.
+    ///
+    /// The thing worth pinning is that widening is not *processing*: the left
+    /// and right samples arrive unaltered and the extra channels are filled
+    /// with silence. If rodio ever started folding or duplicating instead, the
+    /// audio would be altered on one device and not the others -- and it would
+    /// be attributed to the picker, which is the last place anyone would look.
+    #[test]
+    fn a_stereo_track_reaches_an_eight_channel_device_unaltered() {
+        use rodio::conversions::ChannelCountConverter;
+
+        // Two frames of asymmetric stereo. Asymmetric on purpose: equal
+        // channels would pass a converter that had swapped them.
+        let stereo = [0.25f32, -0.5, 0.75, -1.0];
+
+        let widened: Vec<f32> = ChannelCountConverter::new(
+            stereo.into_iter(),
+            rodio::ChannelCount::new(2).unwrap(),
+            rodio::ChannelCount::new(8).unwrap(),
+        )
+        .collect();
+
+        assert_eq!(
+            widened,
+            vec![
+                0.25, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+                0.75, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            "the front pair must carry the music untouched and the rest must be \
+             silent -- anything else is the app altering the audio on one \
+             device and not the others"
+        );
+    }
+
     /// `honours` compares ids and nothing else, because on this machine all
     /// three outputs are called "Speakers" -- see `device_watch::describe`.
     #[test]
@@ -4117,6 +4157,10 @@ mod reopen_device_tests {
             "the fixture did not start playing ({before:?}), so this proves nothing"
         );
 
+        // Timed, because this is the one part of a device change that is not
+        // seamless: the stream is torn down and the decode rebuilt from where
+        // the track had reached, so there is a real break to put a number on.
+        let started = std::time::Instant::now();
         let outcome = reopen(
             &mut device,
             &mut player,
@@ -4126,8 +4170,9 @@ mod reopen_device_tests {
             Some(&ffmpeg),
             Some(&target.id),
         );
+        let took = started.elapsed();
 
-        eprintln!("moved to {:?}", outcome.name);
+        eprintln!("moved to {:?} in {took:?}", outcome.name);
         assert_eq!(outcome.error, None, "the track could not be rebuilt");
         assert_eq!(
             device
@@ -4146,6 +4191,19 @@ mod reopen_device_tests {
             "the track restarted at {after:?} having reached {before:?} -- \
              choosing a device must not rewind the song"
         );
+
+        // The rate is the invariant that actually protects the audio: every
+        // decode is built for whatever the device runs at, so rodio's
+        // resampler stays a pass-through. A switch is precisely when the
+        // answer can change, and this is the moment it has to be right.
+        let opened = device.as_ref().expect("no output").rate();
+        assert_eq!(
+            output_rate.load(Ordering::Acquire),
+            opened,
+            "the published rate does not match the device just opened, so the \
+             next decode would be resampled for its whole length"
+        );
+        eprintln!("published {opened} Hz for the new device");
     }
 
     /// Nothing playing is an ordinary state, not a special case -- the device
